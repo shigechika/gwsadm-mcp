@@ -19,5 +19,5 @@ def test_sigint_exits_cleanly():
     time.sleep(2.0)  # let the stdio server start
     p.send_signal(signal.SIGINT)
     out, err = p.communicate(timeout=10)
-    assert p.returncode == 0, f"stdout={out!r} stderr={err!r}"
+    assert p.returncode == 0
     assert b"Traceback" not in err
