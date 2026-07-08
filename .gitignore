@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+.ruff_cache/
+.pytest_cache/
+*.pyc
+config.ini
+categories.ini

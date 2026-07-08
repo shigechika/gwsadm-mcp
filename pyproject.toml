@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gwsadm-mcp"
+dynamic = ["version"]
+description = "MCP server for Google Workspace security auditing — login audit, external sharing, daily brief"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "AIKAWA Shigechika"},
+]
+keywords = ["google-workspace", "mcp", "model-context-protocol", "security", "audit"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+dependencies = [
+    "mcp>=1.2",
+    "google-api-python-client>=2.100",
+    "google-auth>=2.23",
+]
+
+[project.scripts]
+gwsadm-mcp = "gwsadm_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/shigechika/gwsadm-mcp"
+Repository = "https://github.com/shigechika/gwsadm-mcp"
+Issues = "https://github.com/shigechika/gwsadm-mcp/issues"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools]
+packages = ["gwsadm_mcp"]
+
+[tool.setuptools.dynamic]
+version = {attr = "gwsadm_mcp.__version__"}
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

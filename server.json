@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.shigechika/gwsadm-mcp",
+  "title": "Google Workspace Admin Security-Audit MCP",
+  "description": "MCP server for Google Workspace security auditing — login audit, external sharing, daily brief",
+  "repository": {
+    "url": "https://github.com/shigechika/gwsadm-mcp",
+    "source": "github"
+  },
+  "version": "0.2.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "gwsadm-mcp",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
