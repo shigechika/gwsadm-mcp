@@ -5,7 +5,10 @@ import subprocess
 import sys
 import time
 
+import pytest
 
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGINT semantics differ on Windows")
 def test_sigint_exits_cleanly():
     p = subprocess.Popen(
         [sys.executable, "-m", "gwsadm_mcp"],
