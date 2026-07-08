@@ -6,7 +6,10 @@ external-sharing exposure) to AI assistants over **stdio transport**. Built
 on the official `mcp` Python SDK's `FastMCP` (`gwsadm_mcp/server.py`), with
 `DomainClient` (`gwsadm_mcp/client.py`) wrapping the Admin SDK Reports API
 via a service account + domain-wide delegation (DWD) credential. Read-only:
-the only API call issued anywhere in this package is `activities().list`.
+the only Admin SDK Reports API method called anywhere in this package is
+`activities().list` (the underlying `googleapiclient.discovery.build()`
+setup call also fetches Google's discovery document over HTTP, separately
+from this read-only guarantee).
 
 See `CLAUDE.md` for the authoritative command list and architecture notes —
 read it before reviewing changes to `client.py` or `server.py`.
@@ -32,10 +35,11 @@ lint and test are real CI gates here.
 
 Any `print()` or library logging that writes to stdout (instead of stderr)
 corrupts the protocol stream for the connected client. Currently every
-`print()` in `__main__.py` lives inside `_check()`, reached only via the
-`--check` branch (`sys.exit(_check())`) — never concurrent with the live
-`mcp.run()` server. Flag any new code path that adds a `print()` or a
-logger without an explicit stderr handler that could execute while
+`print()` in `__main__.py` lives in a branch that returns/exits before
+`mcp.run()` is reached — `--version` (prints then returns) and `_check()`
+(reached only via `--check`, `sys.exit(_check())`) — never concurrent with
+the live `mcp.run()` server. Flag any new code path that adds a `print()`
+or a logger without an explicit stderr handler that could execute while
 `mcp.run()` is active.
 
 ## 2. FastMCP already wraps tool returns — don't ask for manual envelope code
@@ -134,7 +138,7 @@ bar of evidence as the existing exclusions, not a green-light copy-paste.
 
 # Out of scope for review comments
 
-- `release-please.yml`'s use of `secrets.RELEASE_PLEASE_TOKEN` instead of
+- `.github/workflows/release-please.yml`'s use of `secrets.RELEASE_PLEASE_TOKEN` instead of
   `GITHUB_TOKEN` is intentional (a `GITHUB_TOKEN`-authored release doesn't
   trigger the downstream `release` workflow); it falls back to
   `GITHUB_TOKEN` when the secret is unset so PR CI still passes on forks —

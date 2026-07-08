@@ -7,8 +7,10 @@ Exposes `login_audit` (Google-side account locks, suspicious logins),
 `drive_external_sharing` (ACL grants to external targets, new link/public
 exposure), and a `daily_brief` combining both, to AI assistants via STDIO
 transport, built on the official `mcp` Python SDK's `FastMCP`. Read-only:
-the only API call issued anywhere in this package is `activities().list`
-(Admin SDK Reports API).
+the only Admin SDK Reports API method called anywhere in this package is
+`activities().list` (the underlying `googleapiclient.discovery.build()`
+setup call also fetches Google's discovery document over HTTP, separately
+from this read-only guarantee).
 
 ## Commands
 
