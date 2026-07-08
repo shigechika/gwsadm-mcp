@@ -1,5 +1,6 @@
 """Entry point: ``gwsadm-mcp`` (stdio server) / ``gwsadm-mcp --check`` / ``--version``."""
 
+import asyncio
 import os
 import sys
 
@@ -44,9 +45,13 @@ def main() -> None:
         from gwsadm_mcp.server import mcp
 
         mcp.run()
-    except KeyboardInterrupt:
-        # Clean ^C exit when run interactively by mistake: skip the anyio
-        # teardown traceback (same convention as the sibling MCP servers).
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # anyio's teardown on SIGINT dumps a 20-80 line traceback. What it
+        # raises out of mcp.run() is Python-version-dependent: a bare
+        # KeyboardInterrupt on 3.12/3.13, but asyncio.CancelledError on 3.10
+        # (asyncio.Runner.run() re-raises CancelledError instead of letting
+        # KeyboardInterrupt propagate). Catch both and exit clean, same
+        # convention as the sibling fleet MCP servers.
         os._exit(0)
 
 
