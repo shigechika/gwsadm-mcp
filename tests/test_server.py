@@ -26,14 +26,20 @@ class FakeDomainClient:
         return {"domain": self.domain, "auth": self._auth}
 
 
-def _item(email, event_name, params=None, time="2026-07-01T00:00:00.000Z"):
+def _item(email, event_name, params=None, time="2026-07-01T00:00:00.000Z", ip=None, profile_id=None):
     ev = {"name": event_name}
     if params:
         plist = []
         for k, v in params.items():
             plist.append({"name": k, "multiValue": v} if isinstance(v, list) else {"name": k, "value": v})
         ev["parameters"] = plist
-    return {"id": {"time": time}, "actor": {"email": email}, "events": [ev]}
+    actor = {"email": email}
+    if profile_id is not None:
+        actor["profileId"] = profile_id
+    item = {"id": {"time": time}, "actor": actor, "events": [ev]}
+    if ip is not None:
+        item["ipAddress"] = ip
+    return item
 
 
 @pytest.fixture
@@ -65,6 +71,39 @@ def test_login_audit_collects_disabled_and_failures(inject):
     assert dom["login_failures"]["total"] == 4
     assert dom["login_failures"]["capped"] is True
     assert dom["login_failures"]["top"][0] == {"user": "u@example.edu", "count": 3}
+
+
+def test_login_audit_entry_surfaces_ip_and_falls_back_to_profile_id(inject):
+    # suspicious_login events can omit actor.email entirely (observed in
+    # production); ipAddress and actor.profileId are far more reliably
+    # populated and must still make the entry investigable.
+    with_email = _item("s1@students.example.edu", "suspicious_login", ip="203.0.113.5", profile_id="1234567890")
+    no_email = {
+        "id": {"time": "2026-07-01T00:00:00.000Z"},
+        "actor": {"profileId": "999888777"},
+        "ipAddress": "198.51.100.9",
+        "events": [{"name": "suspicious_login"}],
+    }
+    no_email_no_profile = {
+        "id": {"time": "2026-07-01T00:00:00.000Z"},
+        "actor": {},
+        "ipAddress": "198.51.100.42",
+        "events": [{"name": "suspicious_login"}],
+    }
+    canned = {
+        ("login", "suspicious_login"): ([with_email, no_email, no_email_no_profile], False),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    entries = server.login_audit(hours=24)["domains"]["example.edu"]["suspicious_logins"]["entries"]
+
+    assert entries[0]["user"] == "s1@students.example.edu"
+    assert entries[0]["ip"] == "203.0.113.5"
+
+    assert entries[1]["user"] == "999888777"  # falls back to profileId
+    assert entries[1]["ip"] == "198.51.100.9"
+
+    assert entries[2]["user"] is None  # neither email nor profileId available
+    assert entries[2]["ip"] == "198.51.100.42"  # IP still recoverable
 
 
 def test_login_audit_capped_probe_yields_no_phantom_entries(inject):
