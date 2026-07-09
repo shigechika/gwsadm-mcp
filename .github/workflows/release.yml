@@ -13,7 +13,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Fail loudly if the version files disagree with the tag (e.g. a hand-cut
       # tag, or a release-please updater that silently missed a file) rather than
       # shipping a mismatched version to PyPI / the MCP Registry.
@@ -33,7 +33,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -82,7 +82,7 @@ jobs:
       id-token: write   # mcp-publisher login github-oidc
       contents: read    # actions/checkout (a job-level permissions block drops the default, so re-grant it)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # server.json is already at the released version on the tagged commit
       # (release-please updates it in the release PR; the verify job guards it).
       - name: Install mcp-publisher
