@@ -115,9 +115,16 @@ def _window(hours: int) -> datetime.datetime:
 
 
 def _entry(item: dict, event: dict) -> dict:
+    actor = item.get("actor", {})
     return {
         "time": item.get("id", {}).get("time"),
-        "user": item.get("actor", {}).get("email"),
+        # profileId is a numeric fallback: some restricted/system-initiated
+        # events (observed on suspicious_login) omit actor.email entirely.
+        "user": actor.get("email") or actor.get("profileId"),
+        # ipAddress lives on the activity item itself, not under actor, and
+        # is populated far more reliably than actor.email — keep it even
+        # when user is unresolvable so the entry is still investigable.
+        "ip": item.get("ipAddress"),
         "event": event.get("name"),
     }
 
