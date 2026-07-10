@@ -641,23 +641,30 @@ def daily_brief(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
 # cap) so a long-running single-user stdio server can't leak finished jobs.
 _JOBS: dict[str, dict] = {}
 _JOBS_LOCK = threading.Lock()
-_JOB_TTL_SECONDS = 600  # reap a finished job this long after it was created
+_JOB_TTL_SECONDS = 600  # retain a finished job this long AFTER it finishes (see _reap_jobs_locked)
 _JOBS_MAX = 32  # hard cap on retained jobs (backstop; a single user has ~1 in flight)
 
 
 def _reap_jobs_locked() -> None:
-    """Drop finished jobs older than the TTL. Caller must hold ``_JOBS_LOCK``."""
+    """Drop finished jobs whose result has been retained past the TTL. Caller holds ``_JOBS_LOCK``.
+
+    The TTL is measured from ``finished`` (completion), NOT ``created`` (start): a brief that
+    itself ran longer than the TTL must still be retrievable for a full TTL window afterward —
+    a long run is the whole reason ``daily_brief_start`` exists. Running jobs are never reaped.
+    """
     now = time.monotonic()
-    for jid in [j for j, v in _JOBS.items() if v["status"] != "running" and now - v["created"] > _JOB_TTL_SECONDS]:
+    expired = [j for j, v in _JOBS.items() if v.get("finished") is not None and now - v["finished"] > _JOB_TTL_SECONDS]
+    for jid in expired:
         del _JOBS[jid]
 
 
 def _finish_job(job_id: str, payload: dict) -> None:
-    """Record a job's terminal state (may have been reaped/evicted meanwhile)."""
+    """Record a job's terminal state + completion time (may have been reaped/evicted meanwhile)."""
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         if job is not None:
             job.update(payload)
+            job["finished"] = time.monotonic()  # the TTL retention window starts now, at completion
 
 
 def _run_brief_job(job_id: str, hours: int, max_pages: int, samples: int) -> None:
@@ -692,9 +699,17 @@ def daily_brief_start(hours: int = 24, max_pages: int = 5, samples: int = 10) ->
         if len(_JOBS) >= _JOBS_MAX:
             return {"status": "rejected", "error": f"too many active brief jobs (>= {_JOBS_MAX}); retry shortly"}
         _JOBS[job_id] = {"status": "running", "created": time.monotonic()}
-    threading.Thread(
+    thread = threading.Thread(
         target=_run_brief_job, args=(job_id, hours, max_pages, samples), name=f"daily_brief-{job_id}", daemon=True
-    ).start()
+    )
+    try:
+        thread.start()
+    except RuntimeError as e:
+        # e.g. the OS thread limit is hit: the worker never runs, so it would never finish and
+        # never be reaped — drop the just-inserted "running" entry instead of leaking a zombie.
+        with _JOBS_LOCK:
+            _JOBS.pop(job_id, None)
+        return {"status": "error", "error": type(e).__name__}
     return {"job_id": job_id, "status": "running", "poll_with": "daily_brief_result", "poll_after_seconds": 5}
 
 
@@ -703,7 +718,8 @@ def daily_brief_result(job_id: str) -> dict:
     """Fetch a ``daily_brief_start`` job by id.
 
     ``status`` is ``running`` (keep polling), ``done`` (``result`` holds the full daily_brief
-    payload), ``error`` (``error`` holds the message), or ``unknown`` (bad/expired id).
+    payload), ``error`` (``error`` holds the exception type name — the message is omitted to
+    avoid leaking internal detail), or ``unknown`` (bad/expired id).
     """
     with _JOBS_LOCK:
         # Reap here too, not only in start(): a client that only polls (or never starts

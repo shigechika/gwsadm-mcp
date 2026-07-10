@@ -1131,19 +1131,63 @@ def test_daily_brief_job_captures_worker_error(inject, monkeypatch):
 def test_daily_brief_result_reaps_expired_job(inject):
     server._JOBS.clear()
     inject([FakeDomainClient("e.edu", {})], {"e.edu"})
-    # A finished job older than the TTL must be reaped on poll (not only on the next start),
-    # so its result payload is freed and an expired id resolves to "unknown".
+    # A job whose result has been retained past the TTL (finished long ago) is reaped on poll
+    # (not only on the next start), so its payload is freed and an expired id resolves to "unknown".
     import time
 
+    now = time.monotonic()
     with server._JOBS_LOCK:
         server._JOBS["stale"] = {
             "status": "done",
             "result": {"big": "x"},
-            "created": time.monotonic() - server._JOB_TTL_SECONDS - 1,
+            "created": now - 999,
+            "finished": now - server._JOB_TTL_SECONDS - 1,  # retained past the TTL
         }
     out = server.daily_brief_result("stale")
     assert out == {"job_id": "stale", "status": "unknown"}
     assert "stale" not in server._JOBS  # reaped, memory freed
+
+
+def test_daily_brief_long_run_result_is_retained(inject):
+    """The TTL is measured from completion, not start: a brief that itself ran longer than the
+    TTL must still be retrievable for a full TTL window afterward (the regression from the
+    start-time-anchored reap that lost long-brief results)."""
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+    import time
+
+    now = time.monotonic()
+    with server._JOBS_LOCK:
+        server._JOBS["long"] = {
+            "status": "done",
+            "result": {"window_hours": 24},
+            "created": now - 10_000,  # started ages ago (a very long run)
+            "finished": now - 1,  # but only just finished
+        }
+    out = server.daily_brief_result("long")
+    assert out["status"] == "done"  # NOT reaped despite a huge created-age
+    assert out["result"] == {"window_hours": 24}
+    assert "long" in server._JOBS
+
+
+def test_daily_brief_start_thread_failure_leaves_no_zombie(inject, monkeypatch):
+    """If the worker thread can't start, the just-inserted 'running' entry must not leak as an
+    unreapable zombie (running jobs are never reaped)."""
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+
+    class _NoStartThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(server.threading, "Thread", _NoStartThread)
+    out = server.daily_brief_start()
+    assert out["status"] == "error" and out["error"] == "RuntimeError"
+    assert out == {"status": "error", "error": "RuntimeError"}
+    assert server._JOBS == {}  # no leftover running job
 
 
 def test_daily_brief_start_rejects_when_over_cap(inject, monkeypatch):
