@@ -14,7 +14,7 @@ class _Req:
     def __init__(self, resp, exc=None):
         self._resp, self._exc = resp, exc
 
-    def execute(self):
+    def execute(self, http=None):
         if self._exc:
             raise self._exc
         return self._resp
@@ -146,3 +146,84 @@ def test_event_parameters_flattens_value_kinds():
     }
     p = event_parameters(ev)
     assert p == {"doc_title": "Plan", "billable": True, "old_visibility": ["private"]}
+
+
+# --- thread-safety + rate-limit retry (parallel-fetch foundation) ---
+
+
+def test_new_http_is_none_without_real_creds():
+    c, _ = _client([])  # injected mock service -> no credentials built
+    assert c._new_http() is None  # execute() falls back to the request transport
+
+
+def test_new_http_is_authorized_when_creds_present():
+    import google_auth_httplib2
+
+    c, _ = _client([])
+    c._creds = object()  # sentinel: AuthorizedHttp only stores it, never calls it here
+    assert isinstance(c._new_http(), google_auth_httplib2.AuthorizedHttp)
+
+
+def test_is_retryable_classification():
+    from gwsadm_mcp.client import _is_retryable
+
+    def err(status, body=b"{}"):
+        return HttpError(httplib2.Response({"status": str(status)}), body)
+
+    assert _is_retryable(err(429)) is True
+    assert _is_retryable(err(500)) is True
+    assert _is_retryable(err(503)) is True
+    assert _is_retryable(err(404)) is False
+    assert _is_retryable(err(403, b'{"error":"forbidden"}')) is False  # permission -> fail fast
+    assert _is_retryable(err(403, b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}')) is True
+
+
+def test_rate_limit_is_retried_with_backoff(monkeypatch):
+    import datetime
+
+    slept: list = []
+    monkeypatch.setattr("gwsadm_mcp.client.time.sleep", lambda s: slept.append(s))
+    err429 = HttpError(httplib2.Response({"status": "429"}), b"{}")
+
+    class _Seq:
+        def __init__(self, results):
+            self.results, self.i = results, 0
+
+        def execute(self, http=None):
+            r = self.results[self.i]
+            self.i += 1
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+    class _Acts:
+        def __init__(self, seq):
+            self._seq = seq
+
+        def list(self, **kw):
+            return self._seq
+
+    class _Rep:
+        def __init__(self, seq):
+            self._acts = _Acts(seq)
+
+        def activities(self):
+            return self._acts
+
+    seq = _Seq([err429, {"items": [{"id": {"time": "t"}}]}])  # 429 once, then a page
+    c = DomainClient(CFG, reports_service=_Rep(seq))
+    items, capped = c.fetch_activities("login", start=datetime.datetime.now(datetime.timezone.utc))
+    assert len(items) == 1 and capped is False
+    assert len(slept) == 1 and 1.0 <= slept[0] <= 2.0  # one jittered backoff (base 1.0 + [0,1))
+
+
+def test_permission_403_is_not_retried(monkeypatch):
+    import datetime
+
+    slept: list = []
+    monkeypatch.setattr("gwsadm_mcp.client.time.sleep", lambda s: slept.append(s))
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _client([], exc=err)
+    with pytest.raises(GwsError):
+        c.fetch_activities("login", start=datetime.datetime.now(datetime.timezone.utc))
+    assert slept == []  # no backoff for a permanent permission error
