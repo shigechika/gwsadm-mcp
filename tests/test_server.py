@@ -1114,12 +1114,36 @@ def test_daily_brief_start_config_error(monkeypatch):
 def test_daily_brief_job_captures_worker_error(inject, monkeypatch):
     server._JOBS.clear()
     inject([FakeDomainClient("e.edu", {})], {"e.edu"})
-    # A crash inside the background worker must surface as the job's error, not vanish.
-    monkeypatch.setattr(server, "_login_audit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("kaboom")))
+
+    # A crash inside the background worker must surface as the job's error, not vanish —
+    # and only the exception TYPE, never its (potentially sensitive/large) message.
+    def _boom(*a, **k):
+        raise RuntimeError("secret /etc/key path")
+
+    monkeypatch.setattr(server, "_login_audit", _boom)
     start = server.daily_brief_start()
     res = _await_job(start["job_id"])
     assert res["status"] == "error"
-    assert "kaboom" in res["error"] and "RuntimeError" in res["error"]
+    assert res["error"] == "RuntimeError"  # type only; the message must not leak
+    assert "secret" not in res["error"] and "/etc/" not in res["error"]
+
+
+def test_daily_brief_result_reaps_expired_job(inject):
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+    # A finished job older than the TTL must be reaped on poll (not only on the next start),
+    # so its result payload is freed and an expired id resolves to "unknown".
+    import time
+
+    with server._JOBS_LOCK:
+        server._JOBS["stale"] = {
+            "status": "done",
+            "result": {"big": "x"},
+            "created": time.monotonic() - server._JOB_TTL_SECONDS - 1,
+        }
+    out = server.daily_brief_result("stale")
+    assert out == {"job_id": "stale", "status": "unknown"}
+    assert "stale" not in server._JOBS  # reaped, memory freed
 
 
 def test_daily_brief_start_rejects_when_over_cap(inject, monkeypatch):

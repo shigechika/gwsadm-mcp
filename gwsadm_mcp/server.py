@@ -664,8 +664,11 @@ def _run_brief_job(job_id: str, hours: int, max_pages: int, samples: int) -> Non
     try:
         result = _daily_brief_impl(hours, max_pages, samples)
         _finish_job(job_id, {"status": "done", "result": result})
-    except Exception as e:  # never let a worker thread die silently — capture it as the job's error
-        _finish_job(job_id, {"status": "error", "error": f"{type(e).__name__}: {e}"})
+    except Exception as e:
+        # Never let a worker thread die silently. Surface only the exception TYPE, not its
+        # message: an unexpected error's text can embed internal paths/state (same reason
+        # client.py omits it from GwsAuthError) and could be unbounded in size.
+        _finish_job(job_id, {"status": "error", "error": type(e).__name__})
 
 
 @mcp.tool()
@@ -703,6 +706,10 @@ def daily_brief_result(job_id: str) -> dict:
     payload), ``error`` (``error`` holds the message), or ``unknown`` (bad/expired id).
     """
     with _JOBS_LOCK:
+        # Reap here too, not only in start(): a client that only polls (or never starts
+        # another job) must still have finished jobs — and their result payloads — bounded,
+        # and an expired id must resolve to "unknown" as documented.
+        _reap_jobs_locked()
         job = _JOBS.get(job_id)
         if job is None:
             return {"job_id": job_id, "status": "unknown"}
