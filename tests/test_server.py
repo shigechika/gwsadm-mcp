@@ -986,7 +986,27 @@ def test_timeout_probe_steps_and_reports_missing_token(monkeypatch):
 
     monkeypatch.setattr(server.asyncio, "sleep", _noop)
     out = asyncio.run(server.timeout_probe(seconds=12, emit_progress=False, ctx=None))
+    assert out["requested_seconds"] == 12
     assert out["slept_seconds"] == 12
     assert out["steps"] == 3  # 5 + 5 + 2
     assert out["emit_progress"] is False
     assert out["progress_token_present"] is False  # no ctx -> no progressToken
+
+
+def test_timeout_probe_clamps_adversarial_seconds(monkeypatch):
+    """An LLM-driven `seconds` can't tie up the server: clamped to 0..600, raw echoed."""
+    import asyncio
+
+    async def _noop(_):
+        return None
+
+    monkeypatch.setattr(server.asyncio, "sleep", _noop)
+
+    big = asyncio.run(server.timeout_probe(seconds=100_000, emit_progress=False, ctx=None))
+    assert big["requested_seconds"] == 100_000
+    assert big["slept_seconds"] == server._PROBE_MAX_SECONDS  # clamped down to 600
+    assert big["steps"] == server._PROBE_MAX_SECONDS // server._PROBE_STEP_SECONDS  # 120
+
+    neg = asyncio.run(server.timeout_probe(seconds=-5, emit_progress=False, ctx=None))
+    assert neg["requested_seconds"] == -5
+    assert neg["slept_seconds"] == 0 and neg["steps"] == 0  # negative clamped to 0, no sleeping

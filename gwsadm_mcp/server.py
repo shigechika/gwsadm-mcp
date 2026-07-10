@@ -628,6 +628,10 @@ def daily_brief(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
 # emitting MCP progress notifications keeps a >60s call alive through the gateway
 # before we commit to a job+poll rewrite of daily_brief.
 _PROBE_STEP_SECONDS = 5
+# Bound the diagnostic: tool inputs are LLM-driven (adversarial) even when the probe is
+# enabled, so a caller can't tie the server up unboundedly. 600s is well above any gateway
+# timeout the experiment probes (60/120/300s).
+_PROBE_MAX_SECONDS = 600
 
 
 async def timeout_probe(seconds: int = 90, emit_progress: bool = True, ctx: Context | None = None) -> dict:
@@ -638,7 +642,13 @@ async def timeout_probe(seconds: int = 90, emit_progress: bool = True, ctx: Cont
     otherwise time out. ``ctx.report_progress`` is a no-op unless the client sent a ``progressToken``
     in the request ``_meta``, so ``progress_token_present`` reports whether one arrived end-to-end
     (if false, progress cannot possibly help regardless of ``emit_progress``).
+
+    ``seconds`` is clamped to ``0..600``; ``requested_seconds`` echoes the raw input so a clamp is
+    visible rather than surprising.
     """
+    requested = seconds
+    seconds = max(0, min(_PROBE_MAX_SECONDS, seconds))
+
     progress_token = None
     if ctx is not None and ctx.request_context.meta is not None:
         progress_token = ctx.request_context.meta.progressToken
@@ -655,6 +665,7 @@ async def timeout_probe(seconds: int = 90, emit_progress: bool = True, ctx: Cont
             await ctx.report_progress(progress=elapsed, total=seconds, message=f"timeout_probe: {elapsed}/{seconds}s")
 
     return {
+        "requested_seconds": requested,
         "slept_seconds": elapsed,
         "steps": steps,
         "emit_progress": emit_progress,
