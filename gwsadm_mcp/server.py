@@ -30,7 +30,21 @@ mcp = FastMCP("gwsadm-mcp")
 # (domain x eventName) activity fetches; running them serially blows past a
 # gateway's request timeout. Bounded to stay within the Admin SDK Reports rate
 # budget (~10 QPS); the client retries any rate-limit error with backoff.
-_MAX_WORKERS = max(1, int(os.environ.get("GWSADM_MAX_WORKERS", "8")))
+_DEFAULT_MAX_WORKERS = 8
+_MAX_WORKERS_CAP = 32
+
+
+def _max_workers() -> int:
+    """Worker count for the parallel fan-out, from ``GWSADM_MAX_WORKERS``.
+
+    Clamped to 1..32. A non-integer / empty value falls back to the default
+    rather than raising: this is a documented tuning knob, so a typo must not
+    crash the stdio server at startup.
+    """
+    try:
+        return max(1, min(_MAX_WORKERS_CAP, int(os.environ.get("GWSADM_MAX_WORKERS", str(_DEFAULT_MAX_WORKERS)))))
+    except ValueError:
+        return _DEFAULT_MAX_WORKERS
 
 
 def _parallel_fetch(tasks: list[tuple], start: datetime.datetime) -> dict:
@@ -49,7 +63,7 @@ def _parallel_fetch(tasks: list[tuple], start: datetime.datetime) -> dict:
     def _one(c, app, name, mp):
         return c.fetch_activities(app, start=start, event_name=name, max_pages=mp)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(tasks))) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(tasks))) as ex:
         futs = {ex.submit(_one, c, app, name, mp): (c.domain, app, name) for (c, app, name, mp) in tasks}
         for fut in concurrent.futures.as_completed(futs):
             key = futs[fut]

@@ -941,3 +941,34 @@ def test_daily_brief_auth_error_degrades_domain_summary(inject):
     inject([FakeDomainClient("e.edu", canned)], {"e.edu"})
     out = server.daily_brief(hours=24)
     assert out["summary"]["e.edu"] == {"error": "[e.edu] auth failed"}
+
+
+# --- GWSADM_MAX_WORKERS parsing: a documented tuning knob must never crash startup ---
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, 8),  # unset -> default
+        ("", 8),  # empty -> default (not a crash)
+        ("foo", 8),  # non-integer -> default (not a crash)
+        ("1", 1),
+        ("16", 16),
+        ("0", 1),  # clamped up
+        ("-3", 1),  # clamped up
+        ("999", 32),  # clamped down
+    ],
+)
+def test_max_workers_parsing_is_robust(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("GWSADM_MAX_WORKERS", raising=False)
+    else:
+        monkeypatch.setenv("GWSADM_MAX_WORKERS", value)
+    assert server._max_workers() == expected
+
+
+def test_server_imports_with_bad_max_workers(monkeypatch):
+    """A garbage GWSADM_MAX_WORKERS must not take the stdio server down at startup."""
+    monkeypatch.setenv("GWSADM_MAX_WORKERS", "not-a-number")
+    # _max_workers() is what _parallel_fetch calls; it must degrade to the default.
+    assert server._max_workers() == 8
