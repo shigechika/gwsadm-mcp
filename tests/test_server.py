@@ -853,3 +853,122 @@ def test_health_check_config_error(monkeypatch):
     monkeypatch.setattr(server, "load_config", lambda: (_ for _ in ()).throw(server.ConfigError("boom")))
     out = server.health_check()
     assert out["status"] == "error" and "boom" in out["detail"]
+
+
+# --- parallel fetch (thread pool) behavior ---
+
+
+def test_parallel_fetch_captures_exceptions_per_task():
+    import datetime
+
+    from gwsadm_mcp.server import _parallel_fetch
+
+    boom = GwsError("nope")
+    ok = FakeDomainClient(
+        "ok.edu", {("drive", "change_user_access"): ([_item("o@ok.edu", "change_user_access")], False)}
+    )
+    bad = FakeDomainClient("bad.edu", {("drive", "change_user_access"): boom})
+    res = _parallel_fetch(
+        [
+            (ok, "drive", "change_user_access", 5),
+            (bad, "drive", "change_user_access", 5),
+        ],
+        datetime.datetime.now(datetime.timezone.utc),
+    )
+    assert res[("ok.edu", "drive", "change_user_access")][0][0]["actor"]["email"] == "o@ok.edu"
+    assert isinstance(res[("bad.edu", "drive", "change_user_access")], GwsError)
+
+
+def test_login_audit_two_domains_run_in_parallel_without_cross_contamination(inject):
+    a = FakeDomainClient("a.edu", {("login", "suspicious_login"): ([_item("x@a.edu", "suspicious_login")], False)})
+    b = FakeDomainClient("b.edu", {("login", "gov_attack_warning"): ([_item("y@b.edu", "gov_attack_warning")], False)})
+    inject([a, b], {"a.edu", "b.edu"})
+    domains = server.login_audit(hours=24)["domains"]
+    a_susp = domains["a.edu"]["suspicious_logins"]["entries"]
+    b_susp = domains["b.edu"]["suspicious_logins"]["entries"]
+    assert len(a_susp) == 1 and len(b_susp) == 1
+    # each domain aggregated only its own actor — no thread cross-talk
+    assert a_susp[0]["user"] == "x@a.edu"
+    assert b_susp[0]["user"] == "y@b.edu"
+
+
+# --- error-degradation invariant under the parallel path ---
+# GwsAuthError subclasses GwsError, so whole-domain (auth) vs per-event (plain)
+# degradation is decided solely by the isinstance ordering in the aggregators.
+# These pin that ordering so a future reorder fails CI.
+
+
+def test_login_auth_error_degrades_whole_domain_and_spares_siblings(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    bad = FakeDomainClient("bad.edu", {("login", "suspicious_login"): GwsAuthError("[bad.edu] auth failed")})
+    ok = FakeDomainClient(
+        "ok.edu", {("login", "gov_attack_warning"): ([_item("y@ok.edu", "gov_attack_warning")], False)}
+    )
+    inject([bad, ok], {"bad.edu", "ok.edu"})
+    domains = server.login_audit(hours=24)["domains"]
+    assert list(domains["bad.edu"].keys()) == ["error"]  # auth is domain-wide, not one event_error
+    assert domains["ok.edu"]["suspicious_logins"]["entries"][0]["user"] == "y@ok.edu"  # sibling intact
+
+
+def test_login_plain_error_marks_only_that_event(inject):
+    canned = {
+        ("login", "suspicious_login"): GwsError("[e.edu] reports API error: HTTP 500"),
+        ("login", "gov_attack_warning"): ([_item("y@e.edu", "gov_attack_warning")], False),
+        ("login", "login_failure"): ([_item("f@e.edu", "login_failure")], False),
+    }
+    inject([FakeDomainClient("e.edu", canned)], {"e.edu"})
+    dom = server.login_audit(hours=24)["domains"]["e.edu"]
+    assert "error" not in dom  # a plain GwsError does NOT degrade the whole domain
+    assert "suspicious_login" in dom["suspicious_logins"]["event_errors"]  # only that probe marked
+    assert dom["suspicious_logins"]["entries"][0]["user"] == "y@e.edu"  # sibling event survived
+    assert dom["login_failures"]["total"] == 1  # other counters intact
+
+
+def test_drive_auth_error_degrades_whole_domain(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    canned = {("drive", "change_user_access"): GwsAuthError("[e.edu] auth failed")}
+    inject([FakeDomainClient("e.edu", canned)], {"e.edu"})
+    dom = server.drive_external_sharing(hours=24)["domains"]["e.edu"]
+    assert list(dom.keys()) == ["error"]  # one auth-failed probe fails the whole domain
+
+
+def test_daily_brief_auth_error_degrades_domain_summary(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    canned = {("login", "suspicious_login"): GwsAuthError("[e.edu] auth failed")}
+    inject([FakeDomainClient("e.edu", canned)], {"e.edu"})
+    out = server.daily_brief(hours=24)
+    assert out["summary"]["e.edu"] == {"error": "[e.edu] auth failed"}
+
+
+# --- GWSADM_MAX_WORKERS parsing: a documented tuning knob must never crash startup ---
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, 8),  # unset -> default
+        ("", 8),  # empty -> default (not a crash)
+        ("foo", 8),  # non-integer -> default (not a crash)
+        ("1", 1),
+        ("16", 16),
+        ("0", 1),  # clamped up
+        ("-3", 1),  # clamped up
+        ("999", 32),  # clamped down
+    ],
+)
+def test_max_workers_parsing_is_robust(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("GWSADM_MAX_WORKERS", raising=False)
+    else:
+        monkeypatch.setenv("GWSADM_MAX_WORKERS", value)
+    assert server._max_workers() == expected
+
+
+def test_server_imports_with_bad_max_workers(monkeypatch):
+    """A garbage GWSADM_MAX_WORKERS must not take the stdio server down at startup."""
+    monkeypatch.setenv("GWSADM_MAX_WORKERS", "not-a-number")
+    # _max_workers() is what _parallel_fetch calls; it must degrade to the default.
+    assert server._max_workers() == 8

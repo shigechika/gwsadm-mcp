@@ -14,7 +14,9 @@ window was not fully scanned, so partial coverage is never mistaken for
 """
 
 import collections
+import concurrent.futures
 import datetime
+import os
 
 from mcp.server.fastmcp import FastMCP
 
@@ -23,6 +25,54 @@ from gwsadm_mcp.client import DomainClient, GwsAuthError, GwsError, event_parame
 from gwsadm_mcp.config import ConfigError, config_path, is_external, load_config
 
 mcp = FastMCP("gwsadm-mcp")
+
+# Concurrent Reports-API fetches. Each daily_brief issues ~16 independent
+# (domain x eventName) activity fetches; running them serially blows past a
+# gateway's request timeout. Bounded to stay within the Admin SDK Reports rate
+# budget (~10 QPS); the client retries any rate-limit error with backoff.
+_DEFAULT_MAX_WORKERS = 8
+_MAX_WORKERS_CAP = 32
+
+
+def _max_workers() -> int:
+    """Worker count for the parallel fan-out, from ``GWSADM_MAX_WORKERS``.
+
+    Clamped to 1..32. A non-integer / empty value falls back to the default
+    rather than raising: this is a documented tuning knob, so a typo must not
+    crash the stdio server at startup.
+    """
+    try:
+        return max(1, min(_MAX_WORKERS_CAP, int(os.environ.get("GWSADM_MAX_WORKERS", str(_DEFAULT_MAX_WORKERS)))))
+    except ValueError:
+        return _DEFAULT_MAX_WORKERS
+
+
+def _parallel_fetch(tasks: list[tuple], start: datetime.datetime) -> dict:
+    """Fetch ``(client, application, event_name, max_pages)`` tasks concurrently.
+
+    Returns ``{(domain, application, event_name): (items, capped) | Exception}``.
+    Fetch errors are captured per task (not raised) so each caller can apply its
+    own degradation policy — a ``GwsAuthError`` fails its whole domain, a plain
+    ``GwsError`` only marks that one probe. Pagination within a single fetch is
+    still sequential (nextPageToken), so ordering within a probe is unchanged.
+    """
+    results: dict = {}
+    if not tasks:
+        return results
+
+    def _one(c, app, name, mp):
+        return c.fetch_activities(app, start=start, event_name=name, max_pages=mp)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(tasks))) as ex:
+        futs = {ex.submit(_one, c, app, name, mp): (c.domain, app, name) for (c, app, name, mp) in tasks}
+        for fut in concurrent.futures.as_completed(futs):
+            key = futs[fut]
+            try:
+                results[key] = fut.result()
+            except (GwsAuthError, GwsError) as e:
+                results[key] = e
+    return results
+
 
 # login audit log: events emitted when Google itself disables an account.
 ACCOUNT_DISABLED_EVENTS = (
@@ -183,19 +233,24 @@ def health_check() -> dict:
     return {**base, "status": status, "domains": results}
 
 
-def _probe_login_events(c: DomainClient, names: tuple, start: datetime.datetime) -> dict:
-    """Fetch a set of login event names; returns {entries, capped[, event_errors]}."""
+def _aggregate_login(fetched: dict, domain: str, names: tuple) -> dict:
+    """Aggregate pre-fetched login probes for one domain into {entries, capped[, event_errors]}.
+
+    ``fetched`` comes from :func:`_parallel_fetch`. A ``GwsAuthError`` for any
+    probe is re-raised so the caller degrades the whole domain (auth is
+    domain-wide); a plain ``GwsError`` is recorded per event and skipped.
+    """
     entries: list[dict] = []
     capped = False
     errors: dict = {}
     for name in names:
-        try:
-            items, c_capped = c.fetch_activities("login", start=start, event_name=name, max_pages=2)
-        except GwsAuthError:
-            raise  # auth is domain-wide; let the caller degrade the whole domain
-        except GwsError as e:
-            errors[name] = str(e)
+        r = fetched[(domain, "login", name)]
+        if isinstance(r, GwsAuthError):
+            raise r
+        if isinstance(r, GwsError):
+            errors[name] = str(r)
             continue
+        items, c_capped = r
         for it in items:
             for ev in it.get("events", []):
                 if ev.get("name") == name:
@@ -209,15 +264,26 @@ def _probe_login_events(c: DomainClient, names: tuple, start: datetime.datetime)
 
 def _login_audit(clients: list[DomainClient], hours: int, include_failures: bool, top: int) -> dict:
     start = _window(hours)
+    # Fan out every (domain x login-event) probe at once, then aggregate serially.
+    tasks: list[tuple] = []
+    for c in clients:
+        for name in ACCOUNT_DISABLED_EVENTS + SUSPICIOUS_LOGIN_EVENTS:
+            tasks.append((c, "login", name, 2))
+        if include_failures:
+            tasks.append((c, "login", "login_failure", 5))
+    fetched = _parallel_fetch(tasks, start)
     out: dict = {}
     for c in clients:
         try:
             dom: dict = {
-                "account_disabled": _probe_login_events(c, ACCOUNT_DISABLED_EVENTS, start),
-                "suspicious_logins": _probe_login_events(c, SUSPICIOUS_LOGIN_EVENTS, start),
+                "account_disabled": _aggregate_login(fetched, c.domain, ACCOUNT_DISABLED_EVENTS),
+                "suspicious_logins": _aggregate_login(fetched, c.domain, SUSPICIOUS_LOGIN_EVENTS),
             }
             if include_failures:
-                items, capped = c.fetch_activities("login", start=start, event_name="login_failure", max_pages=5)
+                r = fetched[(c.domain, "login", "login_failure")]
+                if isinstance(r, (GwsAuthError, GwsError)):
+                    raise r
+                items, capped = r
                 counts = collections.Counter(it.get("actor", {}).get("email") or "(unknown)" for it in items)
                 dom["login_failures"] = {
                     "total": len(items),
@@ -266,6 +332,8 @@ def _drive_external_sharing(
     clients: list[DomainClient], internal: set[str], hours: int, max_pages: int, samples: int
 ) -> dict:
     start = _window(hours)
+    # Fan out every (domain x ACL-event) drive probe at once, then aggregate serially.
+    fetched = _parallel_fetch([(c, "drive", name, max_pages) for c in clients for name in DRIVE_ACL_EVENTS], start)
     out: dict = {}
     for c in clients:
         try:
@@ -281,13 +349,13 @@ def _drive_external_sharing(
             exposure_sample: list[dict] = []
             untargeted_sample: list[dict] = []
             for name in DRIVE_ACL_EVENTS:
-                try:
-                    items, c_capped = c.fetch_activities("drive", start=start, event_name=name, max_pages=max_pages)
-                except GwsAuthError:
-                    raise
-                except GwsError as e:
-                    errors[name] = str(e)
+                r = fetched[(c.domain, "drive", name)]
+                if isinstance(r, GwsAuthError):
+                    raise r
+                if isinstance(r, GwsError):
+                    errors[name] = str(r)
                     continue
+                items, c_capped = r
                 if c_capped:
                     capped_events.append(name)
                 scanned += len(items)
