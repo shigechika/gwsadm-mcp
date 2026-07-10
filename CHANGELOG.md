@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.4.0...v0.5.0) (2026-07-10)
+
+
+### Features
+
+* daily_brief_start / daily_brief_result background job+poll ([#10](https://github.com/shigechika/gwsadm-mcp/issues/10)) ([#13](https://github.com/shigechika/gwsadm-mcp/issues/13)) ([8c34a8e](https://github.com/shigechika/gwsadm-mcp/commit/8c34a8e09473d258162f8f16676b8a3b1c4372c1))
+
 ## [0.4.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.3.0...v0.4.0) (2026-07-10)
 
 
