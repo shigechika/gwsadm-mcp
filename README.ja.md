@@ -20,6 +20,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `login_audit` | Reports API `login` — **Google により自動無効化されたアカウント**（`account_disabled_*`： 漏洩パスワード・乗っ取り・スパム送信）、不審なログイン、失敗の多い順トップN |
 | `drive_external_sharing` | Reports API `drive` — 外部アドレス/ドメインへの ACL **付与**（取り消しは別集計）、リンク公開/一般公開への可視性**遷移** |
 | `daily_brief` | 設定済み全ドメインを横断した一括サマリ |
+| `daily_brief_start` / `daily_brief_result` | `daily_brief` をバックグラウンド実行： `start` が即座に `job_id` を返し、`result(job_id)` を `done` になるまでポーリングする。同期呼び出しがクライアントの ~60秒 tool-call タイムアウトに掛かる大規模テナント向け |
 
 計画中： `dlp_events`（Reports `rules`、DLP 対応の Workspace エディションが必要）、
 `suspended_accounts`（Directory API スナップショット、

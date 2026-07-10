@@ -1060,3 +1060,147 @@ def test_timeout_probe_absent_token_still_emits(monkeypatch):
     out = asyncio.run(server.timeout_probe(seconds=5, emit_progress=True, ctx=ctx))
     assert out["progress_token_present"] is False
     assert len(ctx.calls) == 1  # still emitted; a real client without a token would just get a no-op
+
+
+# --- daily_brief background job + poll ---
+
+
+def _await_job(job_id, timeout=5.0):
+    """Poll daily_brief_result until the job leaves 'running' (jobs finish in ms with FakeDomainClient)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        r = server.daily_brief_result(job_id)
+        if r["status"] != "running":
+            return r
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not finish within {timeout}s")
+
+
+def test_daily_brief_start_and_result_completes(inject):
+    server._JOBS.clear()
+    canned = {("login", "suspicious_login"): ([_item("x@e.edu", "suspicious_login")], False)}
+    inject([FakeDomainClient("e.edu", canned)], {"e.edu"})
+
+    start = server.daily_brief_start(hours=24)
+    assert start["status"] == "running"
+    assert start["poll_with"] == "daily_brief_result"
+    assert isinstance(start.get("job_id"), str) and start["job_id"]
+
+    res = _await_job(start["job_id"])
+    assert res["status"] == "done"
+    # result is byte-for-byte the synchronous daily_brief payload
+    assert res["result"]["window_hours"] == 24
+    assert "e.edu" in res["result"]["summary"]
+    assert res["result"]["summary"]["e.edu"]["suspicious_logins"] == 1
+
+
+def test_daily_brief_result_unknown_job():
+    server._JOBS.clear()
+    out = server.daily_brief_result("deadbeef")
+    assert out == {"job_id": "deadbeef", "status": "unknown"}
+
+
+def test_daily_brief_start_config_error(monkeypatch):
+    server._JOBS.clear()
+    monkeypatch.setitem(server._state, "clients", None)  # force _clients() to re-run load_config
+    monkeypatch.setattr(server, "load_config", lambda: (_ for _ in ()).throw(server.ConfigError("boom")))
+    out = server.daily_brief_start()
+    assert "error" in out and "boom" in out["error"]
+    assert "job_id" not in out  # no job spawned on a config error
+
+
+def test_daily_brief_job_captures_worker_error(inject, monkeypatch):
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+
+    # A crash inside the background worker must surface as the job's error, not vanish —
+    # and only the exception TYPE, never its (potentially sensitive/large) message.
+    def _boom(*a, **k):
+        raise RuntimeError("secret /etc/key path")
+
+    monkeypatch.setattr(server, "_login_audit", _boom)
+    start = server.daily_brief_start()
+    res = _await_job(start["job_id"])
+    assert res["status"] == "error"
+    assert res["error"] == "RuntimeError"  # type only; the message must not leak
+    assert "secret" not in res["error"] and "/etc/" not in res["error"]
+
+
+def test_daily_brief_result_reaps_expired_job(inject):
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+    # A job whose result has been retained past the TTL (finished long ago) is reaped on poll
+    # (not only on the next start), so its payload is freed and an expired id resolves to "unknown".
+    import time
+
+    now = time.monotonic()
+    with server._JOBS_LOCK:
+        server._JOBS["stale"] = {
+            "status": "done",
+            "result": {"big": "x"},
+            "created": now - 999,
+            "finished": now - server._JOB_TTL_SECONDS - 1,  # retained past the TTL
+        }
+    out = server.daily_brief_result("stale")
+    assert out == {"job_id": "stale", "status": "unknown"}
+    assert "stale" not in server._JOBS  # reaped, memory freed
+
+
+def test_daily_brief_long_run_result_is_retained(inject):
+    """The TTL is measured from completion, not start: a brief that itself ran longer than the
+    TTL must still be retrievable for a full TTL window afterward (the regression from the
+    start-time-anchored reap that lost long-brief results)."""
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+    import time
+
+    now = time.monotonic()
+    with server._JOBS_LOCK:
+        server._JOBS["long"] = {
+            "status": "done",
+            "result": {"window_hours": 24},
+            "created": now - 10_000,  # started ages ago (a very long run)
+            "finished": now - 1,  # but only just finished
+        }
+    out = server.daily_brief_result("long")
+    assert out["status"] == "done"  # NOT reaped despite a huge created-age
+    assert out["result"] == {"window_hours": 24}
+    assert "long" in server._JOBS
+
+
+def test_daily_brief_start_thread_failure_leaves_no_zombie(inject, monkeypatch):
+    """If the worker thread can't start, the just-inserted 'running' entry must not leak as an
+    unreapable zombie (running jobs are never reaped)."""
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+
+    class _NoStartThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(server.threading, "Thread", _NoStartThread)
+    out = server.daily_brief_start()
+    assert out["status"] == "error" and out["error"] == "RuntimeError"
+    assert out == {"status": "error", "error": "RuntimeError"}
+    assert server._JOBS == {}  # no leftover running job
+
+
+def test_daily_brief_start_rejects_when_over_cap(inject, monkeypatch):
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+    # Fill the registry to the cap with in-flight jobs, then a fresh start is rejected.
+    monkeypatch.setattr(server, "_JOBS_MAX", 3)
+    import time
+
+    with server._JOBS_LOCK:
+        for i in range(3):
+            server._JOBS[f"j{i}"] = {"status": "running", "created": time.monotonic()}
+    out = server.daily_brief_start()
+    assert out["status"] == "rejected"
+    assert "job_id" not in out
+    server._JOBS.clear()

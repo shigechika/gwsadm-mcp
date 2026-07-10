@@ -27,11 +27,19 @@ to guard against stdio newline regressions).
 
 ## Architecture
 
-- `gwsadm_mcp/server.py` — FastMCP server with 4 tools: `health_check`,
-  `login_audit`, `drive_external_sharing`, `daily_brief`. Holds a
-  module-level `_state` cache (`{"clients": ..., "internal": ...}`) built
-  lazily on first tool call by `_clients()`, so `load_config()` runs once
-  per process, not per call.
+- `gwsadm_mcp/server.py` — FastMCP server with `health_check`,
+  `login_audit`, `drive_external_sharing`, `daily_brief`, and the background
+  pair `daily_brief_start` / `daily_brief_result` (plus an env-gated
+  `timeout_probe` diagnostic). Holds a module-level `_state` cache
+  (`{"clients": ..., "internal": ...}`) built lazily on first tool call by
+  `_clients()`, so `load_config()` runs once per process, not per call.
+  `daily_brief` and the job worker share `_daily_brief_impl()`;
+  `daily_brief_start` returns a `job_id` immediately and runs the work in a
+  daemon thread (so a large tenant's brief never hits a client's ~60s
+  tool-call timeout — issue #10, since clients don't extend it on progress
+  notifications), and `daily_brief_result(job_id)` is polled until `done` /
+  `error`. Jobs live in a `_JOBS` registry guarded by `_JOBS_LOCK`, bounded
+  by a TTL (`_JOB_TTL_SECONDS`) reap and a hard cap (`_JOBS_MAX`).
 - `gwsadm_mcp/client.py` — `DomainClient`: one instance per audited domain,
   wraps `googleapiclient.discovery.build("admin", "reports_v1", ...)` with a
   service-account + domain-wide-delegation (DWD) credential. `GwsError`

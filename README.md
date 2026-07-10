@@ -21,6 +21,7 @@ anything.
 | `login_audit` | Reports API `login` — accounts **auto-disabled by Google** (`account_disabled_*`: leaked password, hijacked, spamming), suspicious logins, failure top-N |
 | `drive_external_sharing` | Reports API `drive` — ACL **grants** to external addresses or domains (revocations reported separately) and visibility **transitions** into link/public exposure |
 | `daily_brief` | One-call summary across all configured domains |
+| `daily_brief_start` / `daily_brief_result` | Same as `daily_brief`, run in the background: `start` returns a `job_id` immediately, then poll `result(job_id)` until `done`. Use on large tenants where the synchronous call risks the client's ~60s tool-call timeout |
 
 Planned: `dlp_events` (Reports `rules`; requires a Workspace edition with DLP),
 `suspended_accounts` (Directory API snapshot; requires the
