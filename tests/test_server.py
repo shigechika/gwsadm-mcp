@@ -972,3 +972,21 @@ def test_server_imports_with_bad_max_workers(monkeypatch):
     monkeypatch.setenv("GWSADM_MAX_WORKERS", "not-a-number")
     # _max_workers() is what _parallel_fetch calls; it must degrade to the default.
     assert server._max_workers() == 8
+
+
+def test_timeout_probe_steps_and_reports_missing_token(monkeypatch):
+    """timeout_probe walks `seconds` in ~5s steps and reports progressToken absence.
+
+    Sleeps are stubbed so the unit test is instant; the real-time behaviour is what the
+    end-to-end connector run exercises (issue #10)."""
+    import asyncio
+
+    async def _noop(_):  # avoid real sleeping in the unit test
+        return None
+
+    monkeypatch.setattr(server.asyncio, "sleep", _noop)
+    out = asyncio.run(server.timeout_probe(seconds=12, emit_progress=False, ctx=None))
+    assert out["slept_seconds"] == 12
+    assert out["steps"] == 3  # 5 + 5 + 2
+    assert out["emit_progress"] is False
+    assert out["progress_token_present"] is False  # no ctx -> no progressToken

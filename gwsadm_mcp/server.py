@@ -13,12 +13,13 @@ window was not fully scanned, so partial coverage is never mistaken for
 (``{"error": ...}``), never the whole tool result.
 """
 
+import asyncio
 import collections
 import concurrent.futures
 import datetime
 import os
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from gwsadm_mcp import __version__
 from gwsadm_mcp.client import DomainClient, GwsAuthError, GwsError, event_parameters
@@ -618,3 +619,48 @@ def daily_brief(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
         "login_audit": logins,
         "drive_external_sharing": sharing,
     }
+
+
+# --- diagnostic: does the client extend a tool call's timeout on progress? ---
+# Registered only when GWSADM_ENABLE_TIMEOUT_PROBE is set, so it never appears in
+# tools/list on a normal deployment. Defined unconditionally so tests can call it
+# directly. See gwsadm issue #10: this exists to settle, end-to-end, whether
+# emitting MCP progress notifications keeps a >60s call alive through the gateway
+# before we commit to a job+poll rewrite of daily_brief.
+_PROBE_STEP_SECONDS = 5
+
+
+async def timeout_probe(seconds: int = 90, emit_progress: bool = True, ctx: Context | None = None) -> dict:
+    """Diagnostic: sleep ``seconds`` in ~5s steps, optionally emitting progress notifications.
+
+    Gated behind GWSADM_ENABLE_TIMEOUT_PROBE (registered only when set). Tests whether emitting
+    ``notifications/progress`` keeps a long (>60s) tool call alive through a gateway that would
+    otherwise time out. ``ctx.report_progress`` is a no-op unless the client sent a ``progressToken``
+    in the request ``_meta``, so ``progress_token_present`` reports whether one arrived end-to-end
+    (if false, progress cannot possibly help regardless of ``emit_progress``).
+    """
+    progress_token = None
+    if ctx is not None and ctx.request_context.meta is not None:
+        progress_token = ctx.request_context.meta.progressToken
+
+    elapsed = 0
+    steps = 0
+    while elapsed < seconds:
+        step = min(_PROBE_STEP_SECONDS, seconds - elapsed)
+        # asyncio.sleep (not time.sleep) so the event loop can flush progress between steps.
+        await asyncio.sleep(step)
+        elapsed += step
+        steps += 1
+        if emit_progress and ctx is not None:
+            await ctx.report_progress(progress=elapsed, total=seconds, message=f"timeout_probe: {elapsed}/{seconds}s")
+
+    return {
+        "slept_seconds": elapsed,
+        "steps": steps,
+        "emit_progress": emit_progress,
+        "progress_token_present": progress_token is not None,
+    }
+
+
+if os.environ.get("GWSADM_ENABLE_TIMEOUT_PROBE"):
+    mcp.tool()(timeout_probe)
