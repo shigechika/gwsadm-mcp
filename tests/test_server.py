@@ -1010,3 +1010,53 @@ def test_timeout_probe_clamps_adversarial_seconds(monkeypatch):
     neg = asyncio.run(server.timeout_probe(seconds=-5, emit_progress=False, ctx=None))
     assert neg["requested_seconds"] == -5
     assert neg["slept_seconds"] == 0 and neg["steps"] == 0  # negative clamped to 0, no sleeping
+
+
+def _fake_ctx(progress_token):
+    """Minimal stand-in for FastMCP's Context: exposes request_context.meta.progressToken and an
+    async report_progress that records its calls. (Real report_progress no-ops without a token, but
+    the probe calls it unconditionally — FastMCP does the gating, so the probe must not.)"""
+    import types
+
+    calls: list = []
+
+    async def _report_progress(progress, total=None, message=None):
+        calls.append({"progress": progress, "total": total, "message": message})
+
+    meta = types.SimpleNamespace(progressToken=progress_token)
+    ctx = types.SimpleNamespace(request_context=types.SimpleNamespace(meta=meta), report_progress=_report_progress)
+    ctx.calls = calls
+    return ctx
+
+
+def test_timeout_probe_emits_progress_per_step_with_token(monkeypatch):
+    """The emit path (the tool's whole reason to exist): with a progressToken, report_progress fires
+    once per step with increasing progress, and progress_token_present is True."""
+    import asyncio
+
+    async def _noop(_):
+        return None
+
+    monkeypatch.setattr(server.asyncio, "sleep", _noop)
+    ctx = _fake_ctx("tok-1")
+    out = asyncio.run(server.timeout_probe(seconds=12, emit_progress=True, ctx=ctx))
+    assert out["progress_token_present"] is True
+    assert out["steps"] == 3
+    assert len(ctx.calls) == 3  # one notification per step
+    assert [c["progress"] for c in ctx.calls] == [5, 10, 12]  # elapsed after each step, monotonic
+    assert all(c["total"] == 12 for c in ctx.calls)
+
+
+def test_timeout_probe_absent_token_still_emits(monkeypatch):
+    """A non-None ctx whose meta carries no token: progress_token_present is False, yet the probe
+    still calls report_progress (the probe never gates on the token — FastMCP no-ops it)."""
+    import asyncio
+
+    async def _noop(_):
+        return None
+
+    monkeypatch.setattr(server.asyncio, "sleep", _noop)
+    ctx = _fake_ctx(None)  # meta present, progressToken is None
+    out = asyncio.run(server.timeout_probe(seconds=5, emit_progress=True, ctx=ctx))
+    assert out["progress_token_present"] is False
+    assert len(ctx.calls) == 1  # still emitted; a real client without a token would just get a no-op
