@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.2.2...v0.3.0) (2026-07-10)
+
+
+### Features
+
+* **server:** parallelize Reports API fetches so daily_brief fits the gateway timeout ([#8](https://github.com/shigechika/gwsadm-mcp/issues/8)) ([36fd100](https://github.com/shigechika/gwsadm-mcp/commit/36fd100ef13f89f0768017f5999a299e952d6f32))
+
 ## [0.2.2](https://github.com/shigechika/gwsadm-mcp/compare/v0.2.1...v0.2.2) (2026-07-09)
 
 
