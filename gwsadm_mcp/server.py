@@ -18,6 +18,9 @@ import collections
 import concurrent.futures
 import datetime
 import os
+import secrets
+import threading
+import time
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -571,21 +574,8 @@ def drive_external_sharing(hours: int = 24, domain: str | None = None, max_pages
     }
 
 
-@mcp.tool()
-def daily_brief(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
-    """One-call security summary across all configured domains.
-
-    Aggregates login_audit (account locks, suspicious logins) and
-    drive_external_sharing (external grants, new link exposure, and
-    ``untargeted_external_transitions`` — see that tool's docstring).
-    ``max_pages`` / ``samples`` are passed through to the drive scan;
-    ``max_pages`` defaults to the same page budget as the standalone tool,
-    so both report the same counters for the same window (``samples``
-    defaults lower here and only trims the example lists). Per-domain ``capped`` in the
-    summary means at least one underlying scan was partial — treat that
-    domain's counts as lower bounds (see ``capped_events`` in the drive
-    section for which probes were cut short).
-    """
+def _daily_brief_impl(hours: int, max_pages: int, samples: int) -> dict:
+    """Compute the full daily_brief payload (shared by the sync tool and the job worker)."""
     try:
         clients, internal = _clients()
     except ConfigError as e:
@@ -619,6 +609,109 @@ def daily_brief(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
         "login_audit": logins,
         "drive_external_sharing": sharing,
     }
+
+
+@mcp.tool()
+def daily_brief(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
+    """One-call security summary across all configured domains.
+
+    Aggregates login_audit (account locks, suspicious logins) and
+    drive_external_sharing (external grants, new link exposure, and
+    ``untargeted_external_transitions`` — see that tool's docstring).
+    ``max_pages`` / ``samples`` are passed through to the drive scan;
+    ``max_pages`` defaults to the same page budget as the standalone tool,
+    so both report the same counters for the same window (``samples``
+    defaults lower here and only trims the example lists). Per-domain ``capped`` in the
+    summary means at least one underlying scan was partial — treat that
+    domain's counts as lower bounds (see ``capped_events`` in the drive
+    section for which probes were cut short).
+
+    Synchronous: on a large tenant this can exceed a client's ~60s tool-call
+    timeout. If it does, use ``daily_brief_start`` + ``daily_brief_result``
+    (same result, run in the background) or lower ``max_pages``.
+    """
+    return _daily_brief_impl(hours, max_pages, samples)
+
+
+# --- background job + poll: daily_brief without hitting a client's ~60s tool timeout ---
+# A large tenant's daily_brief can run past a gateway/client's per-call timeout, and
+# clients do not extend it on progress notifications (see issue #10). So run the work in
+# a background thread behind a fast "start" that returns a job id, and a "result" tool the
+# model polls — no single call is long-lived. The registry is bounded (TTL-reaped + a hard
+# cap) so a long-running single-user stdio server can't leak finished jobs.
+_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+_JOB_TTL_SECONDS = 600  # reap a finished job this long after it was created
+_JOBS_MAX = 32  # hard cap on retained jobs (backstop; a single user has ~1 in flight)
+
+
+def _reap_jobs_locked() -> None:
+    """Drop finished jobs older than the TTL. Caller must hold ``_JOBS_LOCK``."""
+    now = time.monotonic()
+    for jid in [j for j, v in _JOBS.items() if v["status"] != "running" and now - v["created"] > _JOB_TTL_SECONDS]:
+        del _JOBS[jid]
+
+
+def _finish_job(job_id: str, payload: dict) -> None:
+    """Record a job's terminal state (may have been reaped/evicted meanwhile)."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job.update(payload)
+
+
+def _run_brief_job(job_id: str, hours: int, max_pages: int, samples: int) -> None:
+    try:
+        result = _daily_brief_impl(hours, max_pages, samples)
+        _finish_job(job_id, {"status": "done", "result": result})
+    except Exception as e:  # never let a worker thread die silently — capture it as the job's error
+        _finish_job(job_id, {"status": "error", "error": f"{type(e).__name__}: {e}"})
+
+
+@mcp.tool()
+def daily_brief_start(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
+    """Start a daily_brief in the background; returns immediately with a ``job_id``.
+
+    Use this instead of ``daily_brief`` when the synchronous call risks the client's ~60s
+    tool-call timeout (large tenants). Args mirror ``daily_brief``. You MUST then poll
+    ``daily_brief_result(job_id)`` every few seconds until ``status`` is ``done`` (the full
+    daily_brief payload is under ``result``) or ``error``. On a config error returns
+    ``{"error": ...}``; if too many jobs are already active returns
+    ``{"status": "rejected", ...}``.
+    """
+    try:
+        _clients()  # validate config + build the client cache up front, in this (fast) call
+    except ConfigError as e:
+        return {"error": str(e)}
+    job_id = secrets.token_hex(8)
+    with _JOBS_LOCK:
+        _reap_jobs_locked()
+        if len(_JOBS) >= _JOBS_MAX:
+            return {"status": "rejected", "error": f"too many active brief jobs (>= {_JOBS_MAX}); retry shortly"}
+        _JOBS[job_id] = {"status": "running", "created": time.monotonic()}
+    threading.Thread(
+        target=_run_brief_job, args=(job_id, hours, max_pages, samples), name=f"daily_brief-{job_id}", daemon=True
+    ).start()
+    return {"job_id": job_id, "status": "running", "poll_with": "daily_brief_result", "poll_after_seconds": 5}
+
+
+@mcp.tool()
+def daily_brief_result(job_id: str) -> dict:
+    """Fetch a ``daily_brief_start`` job by id.
+
+    ``status`` is ``running`` (keep polling), ``done`` (``result`` holds the full daily_brief
+    payload), ``error`` (``error`` holds the message), or ``unknown`` (bad/expired id).
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return {"job_id": job_id, "status": "unknown"}
+        out: dict = {"job_id": job_id, "status": job["status"]}
+        if "result" in job:
+            out["result"] = job["result"]
+        if "error" in job:
+            out["error"] = job["error"]
+        return out
 
 
 # --- diagnostic: does the client extend a tool call's timeout on progress? ---

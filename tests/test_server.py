@@ -1060,3 +1060,79 @@ def test_timeout_probe_absent_token_still_emits(monkeypatch):
     out = asyncio.run(server.timeout_probe(seconds=5, emit_progress=True, ctx=ctx))
     assert out["progress_token_present"] is False
     assert len(ctx.calls) == 1  # still emitted; a real client without a token would just get a no-op
+
+
+# --- daily_brief background job + poll ---
+
+
+def _await_job(job_id, timeout=5.0):
+    """Poll daily_brief_result until the job leaves 'running' (jobs finish in ms with FakeDomainClient)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        r = server.daily_brief_result(job_id)
+        if r["status"] != "running":
+            return r
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not finish within {timeout}s")
+
+
+def test_daily_brief_start_and_result_completes(inject):
+    server._JOBS.clear()
+    canned = {("login", "suspicious_login"): ([_item("x@e.edu", "suspicious_login")], False)}
+    inject([FakeDomainClient("e.edu", canned)], {"e.edu"})
+
+    start = server.daily_brief_start(hours=24)
+    assert start["status"] == "running"
+    assert start["poll_with"] == "daily_brief_result"
+    assert isinstance(start.get("job_id"), str) and start["job_id"]
+
+    res = _await_job(start["job_id"])
+    assert res["status"] == "done"
+    # result is byte-for-byte the synchronous daily_brief payload
+    assert res["result"]["window_hours"] == 24
+    assert "e.edu" in res["result"]["summary"]
+    assert res["result"]["summary"]["e.edu"]["suspicious_logins"] == 1
+
+
+def test_daily_brief_result_unknown_job():
+    server._JOBS.clear()
+    out = server.daily_brief_result("deadbeef")
+    assert out == {"job_id": "deadbeef", "status": "unknown"}
+
+
+def test_daily_brief_start_config_error(monkeypatch):
+    server._JOBS.clear()
+    monkeypatch.setitem(server._state, "clients", None)  # force _clients() to re-run load_config
+    monkeypatch.setattr(server, "load_config", lambda: (_ for _ in ()).throw(server.ConfigError("boom")))
+    out = server.daily_brief_start()
+    assert "error" in out and "boom" in out["error"]
+    assert "job_id" not in out  # no job spawned on a config error
+
+
+def test_daily_brief_job_captures_worker_error(inject, monkeypatch):
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+    # A crash inside the background worker must surface as the job's error, not vanish.
+    monkeypatch.setattr(server, "_login_audit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("kaboom")))
+    start = server.daily_brief_start()
+    res = _await_job(start["job_id"])
+    assert res["status"] == "error"
+    assert "kaboom" in res["error"] and "RuntimeError" in res["error"]
+
+
+def test_daily_brief_start_rejects_when_over_cap(inject, monkeypatch):
+    server._JOBS.clear()
+    inject([FakeDomainClient("e.edu", {})], {"e.edu"})
+    # Fill the registry to the cap with in-flight jobs, then a fresh start is rejected.
+    monkeypatch.setattr(server, "_JOBS_MAX", 3)
+    import time
+
+    with server._JOBS_LOCK:
+        for i in range(3):
+            server._JOBS[f"j{i}"] = {"status": "running", "created": time.monotonic()}
+    out = server.daily_brief_start()
+    assert out["status"] == "rejected"
+    assert "job_id" not in out
+    server._JOBS.clear()
