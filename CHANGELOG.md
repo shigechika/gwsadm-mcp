@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.3.0...v0.4.0) (2026-07-10)
+
+
+### Features
+
+* add env-gated timeout_probe diagnostic tool (for [#10](https://github.com/shigechika/gwsadm-mcp/issues/10)) ([#11](https://github.com/shigechika/gwsadm-mcp/issues/11)) ([54651fb](https://github.com/shigechika/gwsadm-mcp/commit/54651fb56fe86c37d0e94f4d49a4a65388e25e41))
+
 ## [0.3.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.2.2...v0.3.0) (2026-07-10)
 
 
