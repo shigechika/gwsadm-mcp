@@ -63,17 +63,23 @@ this contract — flag it as a correctness bug, not a style nit.
 ## 4. `GwsAuthError` vs `GwsError` — the distinction is load-bearing
 
 `GwsAuthError` (bad key file, missing DWD scope, wrong subject) means the
-whole domain is unusable; every existing caller lets it propagate uncaught
-out of a per-event-name probe up to the domain-level `try/except` in
-`server.py`, so the domain's section becomes `{"error": ...}`. A plain
-`GwsError` from a single probe (e.g. one event name rejected by the API) is
-caught **locally** and recorded in that section's `event_errors` dict so one
-bad probe doesn't fail the whole domain's scan (see `_probe_login_events`
-and the per-`DRIVE_ACL_EVENTS`-name loop in `_drive_external_sharing`). A
-new probe that catches `GwsAuthError` locally (swallowing a domain-wide auth
-failure as if it were a per-probe error) or that lets a plain `GwsError`
-propagate all the way up (failing the whole domain for one bad event name)
-is inverting this convention — flag it.
+whole domain is unusable; a plain `GwsError` from a single probe (e.g. one
+event name rejected by the API) means only that one probe failed. Since the
+parallel-fetch refactor, `_parallel_fetch` catches **both** per task and
+stores the exception as that task's result *value* (`results[key] = e`)
+instead of raising — so seeing it catch `GwsAuthError` is correct
+collection, not a bug to flag. The domain-wide-vs-per-probe distinction is
+applied where each result is consumed: the aggregation loops
+(`_aggregate_login`, and the per-`DRIVE_ACL_EVENTS`-name loop in
+`_drive_external_sharing`) re-raise a `GwsAuthError` result via an
+`isinstance` check so it propagates to the domain-level `try/except` in
+`server.py` and the domain's section becomes `{"error": ...}`, while a
+plain `GwsError` result is recorded in that section's `event_errors` dict
+and skipped so one bad probe doesn't fail the whole domain's scan. A
+consumer that drops a `GwsAuthError` result without re-raising (swallowing a
+domain-wide auth failure as if it were a per-probe error), or that re-raises
+a plain `GwsError` (failing the whole domain for one bad event name), is
+inverting this convention — flag it.
 
 ## 5. Exception text can embed a filesystem path — check before it reaches a tool response
 
@@ -135,6 +141,34 @@ bar of evidence as the existing exclusions, not a green-light copy-paste.
   `capped=True` / `GwsError` / `GwsAuthError` path — see convention #3 and
   #4 above; a test suite gap on the capped/error paths is a real coverage
   gap for this codebase, not a nice-to-have.
+
+## 10. The Reports-API fan-out is concurrent — guard its thread-safety invariants
+
+`_parallel_fetch` runs every `(domain × eventName)` activity fetch on a
+bounded `ThreadPoolExecutor` sized by `GWSADM_MAX_WORKERS` (default 8,
+clamped 1..32; a non-integer value falls back to the default rather than
+crashing the stdio server at startup). This is the load-bearing concurrency
+surface of the codebase, so two `DomainClient` invariants keep it safe: a
+double-checked `_build_lock` serializes the lazy service/credential build so
+concurrent fetches build it at most once, and `_new_http()` hands out a
+*fresh* `AuthorizedHttp` per call because `httplib2.Http` is not thread-safe
+across `execute()`s (the googleapiclient service object may be shared, its
+underlying transport may not). Flag any new `DomainClient` mutable state
+added without the lock, or any new `execute()` path that shares one `Http`
+across threads.
+
+## 11. The client retries — 429/5xx and rate-limited 403s only, with full jitter
+
+`client.py`'s `_execute` retries an `_is_retryable` error up to
+`_MAX_RETRIES` (5) with full-jitter backoff. `_is_retryable` is true for
+429/500/503, and for a 403 **only** when its body names a rate/quota reason
+(`ratelimitexceeded` / `userratelimitexceeded` / `quotaexceeded`) — a plain
+permission 403 (e.g. DWD scope not granted) is permanent and must fail
+fast. Flag a "simplification" that retries all 403s (it turns a permanent
+missing-scope auth failure into a backoff stall multiplied across the
+parallel fan-out) or that replaces the jittered backoff with a deterministic
+one (parallel fetches throttled at the same instant would then retry in
+lockstep and re-collide).
 
 # Out of scope for review comments
 
