@@ -33,6 +33,11 @@ to guard against stdio newline regressions).
   `timeout_probe` diagnostic). Holds a module-level `_state` cache
   (`{"clients": ..., "internal": ...}`) built lazily on first tool call by
   `_clients()`, so `load_config()` runs once per process, not per call.
+  Every audit tool fans its `(domain × eventName)` Reports-API fetches out
+  through `_parallel_fetch` onto a bounded `ThreadPoolExecutor`
+  (`GWSADM_MAX_WORKERS`, default 8, clamped 1..32) — running them serially
+  would blow past a gateway's request timeout on a large tenant — then
+  aggregates the collected results serially.
   `daily_brief` and the job worker share `_daily_brief_impl()`;
   `daily_brief_start` returns a `job_id` immediately and runs the work in a
   daemon thread (so a large tenant's brief never hits a client's ~60s
@@ -49,6 +54,14 @@ to guard against stdio newline regressions).
   up to the per-domain `try/except` in `server.py`, while `GwsError` from a
   single event-name probe is caught locally and recorded per-event in
   `event_errors` so one bad probe doesn't fail the whole domain's scan.
+  Because `_parallel_fetch` calls `fetch_activities` from several threads at
+  once, a double-checked `_build_lock` guards the lazy service build and
+  `_new_http()` returns a fresh `AuthorizedHttp` per call (`httplib2.Http`
+  is not thread-safe across `execute()`s). `_execute` retries an
+  `_is_retryable` error — 429/500/503, and a 403 only when its body names a
+  rate/quota reason (a permission 403 is permanent) — up to `_MAX_RETRIES`
+  (5) with full-jitter backoff so simultaneously-throttled parallel fetches
+  don't retry in lockstep.
 - `gwsadm_mcp/config.py` — `load_config()` parses the `GWSADM_CONFIG` INI
   file into `list[DomainConfig]` + the `internal_domains` allowlist;
   `ConfigError` on a missing file, missing keys, or zero `[domain.*]`
