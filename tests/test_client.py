@@ -44,6 +44,30 @@ def _client(pages, exc=None):
     return DomainClient(CFG, reports_service=svc), svc._a
 
 
+class FakeUsers:
+    def __init__(self, pages, exc=None):
+        self.pages, self.exc, self.calls = pages, exc, []
+
+    def list(self, **kw):
+        self.calls.append(kw)
+        if self.exc:
+            return _Req(None, self.exc)
+        return _Req(self.pages[min(len(self.calls) - 1, len(self.pages) - 1)])
+
+
+class FakeDirectory:
+    def __init__(self, pages, exc=None):
+        self._u = FakeUsers(pages, exc)
+
+    def users(self):
+        return self._u
+
+
+def _dir_client(pages, exc=None):
+    svc = FakeDirectory(pages, exc)
+    return DomainClient(CFG, directory_service=svc), svc._u
+
+
 def test_fetch_activities_paginates_and_passes_params():
     import datetime
 
@@ -69,6 +93,33 @@ def test_fetch_activities_caps_pages():
     c, _ = _client([{"items": [{}], "nextPageToken": "more"}] * 5)
     items, capped = c.fetch_activities("drive", start=datetime.datetime.now(datetime.timezone.utc), max_pages=2)
     assert len(items) == 2 and capped is True  # stopped early with pages remaining
+
+
+def test_list_suspended_users_paginates_and_passes_params():
+    c, u = _dir_client(
+        [
+            {"users": [{"primaryEmail": "a@example.edu"}], "nextPageToken": "tok"},
+            {"users": [{"primaryEmail": "b@example.edu"}]},
+        ]
+    )
+    users, capped = c.list_suspended_users()
+    assert len(users) == 2 and capped is False
+    assert u.calls[0]["domain"] == "example.edu"
+    assert u.calls[0]["query"] == "isSuspended=true"
+    assert u.calls[1]["pageToken"] == "tok"
+
+
+def test_list_suspended_users_caps_pages():
+    c, _ = _dir_client([{"users": [{}], "nextPageToken": "more"}] * 5)
+    users, capped = c.list_suspended_users(max_pages=2)
+    assert len(users) == 2 and capped is True  # stopped early with pages remaining
+
+
+def test_list_suspended_users_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _dir_client([], exc=err)
+    with pytest.raises(GwsError):
+        c.list_suspended_users()
 
 
 def test_http_error_maps_to_gws_error():

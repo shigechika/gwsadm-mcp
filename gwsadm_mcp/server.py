@@ -4,8 +4,11 @@ Phase 1 tools:
 
 - ``health_check``            — fleet-standard status/service/version + per-domain auth probe
 - ``login_audit``             — Google-side auto-disabled accounts, suspicious logins, failure top-N
+- ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
 - ``drive_external_sharing``  — Drive ACL grants to external targets and new link/public exposure
-- ``daily_brief``             — one-call summary of the above across all configured domains
+- ``daily_brief``             — one-call summary of the Reports-based tools
+  (``login_audit`` + ``drive_external_sharing``) across all configured domains;
+  ``suspended_accounts`` is separate (different API/scope) and not included
 
 Coverage contract: every result section carries a ``capped`` boolean when its
 window was not fully scanned, so partial coverage is never mistaken for
@@ -315,6 +318,62 @@ def login_audit(hours: int = 24, domain: str | None = None, include_failures: bo
     except (ConfigError, GwsError) as e:
         return {"error": str(e)}
     return {"window_hours": hours, "domains": _login_audit(picked, hours, include_failures, top)}
+
+
+def _suspended_entry(u: dict) -> dict:
+    """Project a Directory user record to the fields relevant to a suspension audit."""
+    return {
+        "email": u.get("primaryEmail"),
+        "suspension_reason": u.get("suspensionReason"),
+        "last_login": u.get("lastLoginTime"),
+        "created": u.get("creationTime"),
+        "org_unit": u.get("orgUnitPath"),
+    }
+
+
+@mcp.tool()
+def suspended_accounts(domain: str | None = None, max_pages: int = 20) -> dict:
+    """Snapshot of currently suspended Google Workspace accounts, per domain.
+
+    A suspended-but-still-provisioned account is a common attack surface: an
+    account disabled in Google may remain enabled in a downstream IdP (e.g.
+    KeyCloak), where a password-spray attacker can still authenticate through
+    it. Cross-reference this list against the IdP to find and disable such gaps.
+
+    Unlike ``login_audit`` (which reports the *event* of Google disabling an
+    account within a time window), this is current *state* — every account
+    suspended right now, regardless of when. Read-only (Directory API
+    ``users().list`` with ``query=isSuspended=true``). Requires the
+    ``admin.directory.user.readonly`` DWD scope; a domain missing that grant
+    degrades to ``{"error": ...}`` for that domain only. ``capped`` is set when
+    ``max_pages`` was hit before the listing was exhausted.
+
+    Coverage is per configured domain (Directory ``domain=`` filter), unlike the
+    customer-wide Reports tools — every domain you want covered (e.g. a separate
+    student domain) must have its own ``[domain.*]`` config section, or its
+    suspended accounts are not listed.
+
+    Args:
+        domain: Restrict to one configured domain (default: all).
+        max_pages: Page cap (500 accounts/page); ``capped=true`` means more exist.
+    """
+    try:
+        clients, _ = _clients()
+        picked = _select(clients, domain)
+    except (ConfigError, GwsError) as e:
+        return {"error": str(e)}
+    out: dict = {}
+    for c in picked:
+        try:
+            users, capped = c.list_suspended_users(max_pages=max_pages)
+            out[c.domain] = {
+                "count": len(users),
+                "capped": capped,
+                "accounts": [_suspended_entry(u) for u in users],
+            }
+        except (GwsAuthError, GwsError) as e:
+            out[c.domain] = {"error": str(e)}
+    return {"domains": out}
 
 
 def _drive_sample(item: dict, event: dict, p: dict, *, target, target_domain, visibility, old_visibility) -> dict:

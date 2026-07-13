@@ -9,10 +9,11 @@ from gwsadm_mcp.client import GwsError
 
 
 class FakeDomainClient:
-    def __init__(self, domain, canned, auth="ok"):
+    def __init__(self, domain, canned, auth="ok", suspended=None):
         self.domain = domain
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
         self._auth = auth
+        self._suspended = suspended  # (users, capped) | Exception | None
         self.calls = []
 
     def fetch_activities(self, application_name, *, start, end=None, event_name=None, max_pages=5):
@@ -21,6 +22,13 @@ class FakeDomainClient:
         if isinstance(got, Exception):
             raise got
         return got
+
+    def list_suspended_users(self, *, max_pages=20):
+        if self._suspended is None:
+            return [], False
+        if isinstance(self._suspended, Exception):
+            raise self._suspended
+        return self._suspended
 
     def check(self):
         return {"domain": self.domain, "auth": self._auth}
@@ -117,6 +125,45 @@ def test_login_audit_capped_probe_yields_no_phantom_entries(inject):
 def test_login_audit_unknown_domain_is_error(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
     assert "error" in server.login_audit(domain="nope.example")
+
+
+def test_suspended_accounts_projects_and_counts(inject):
+    suspended = (
+        [
+            {
+                "primaryEmail": "old@students.example.edu",
+                "suspensionReason": "ADMIN",
+                "lastLoginTime": "2019-04-01T00:00:00.000Z",
+                "creationTime": "2011-04-06T00:00:00.000Z",
+                "orgUnitPath": "/Students",
+            }
+        ],
+        False,
+    )
+    inject([FakeDomainClient("example.edu", {}, suspended=suspended)], {"example.edu"})
+    dom = server.suspended_accounts()["domains"]["example.edu"]
+    assert dom["count"] == 1
+    assert dom["capped"] is False
+    acct = dom["accounts"][0]
+    assert acct["email"] == "old@students.example.edu"
+    assert acct["suspension_reason"] == "ADMIN"
+    assert acct["org_unit"] == "/Students"
+
+
+def test_suspended_accounts_degrades_per_domain_on_auth_error(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    ok = FakeDomainClient("a.example.edu", {}, suspended=([{"primaryEmail": "x@a.example.edu"}], False))
+    boom = FakeDomainClient("b.example.edu", {}, suspended=GwsAuthError("no directory scope"))
+    inject([ok, boom], {"a.example.edu", "b.example.edu"})
+    out = server.suspended_accounts()["domains"]
+    assert out["a.example.edu"]["count"] == 1
+    assert "error" in out["b.example.edu"]  # one domain's failure does not sink the others
+
+
+def test_suspended_accounts_unknown_domain_is_error(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    assert "error" in server.suspended_accounts(domain="nope.example")
 
 
 def test_select_normalizes_case_and_whitespace(inject):

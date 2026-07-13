@@ -18,13 +18,13 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 |------|------|
 | `health_check` | サーバーバージョン・設定パス・ドメインごとの認証確認 — セッション開始時やタイムアウト後に呼ぶ |
 | `login_audit` | Reports API `login` — **Google により自動無効化されたアカウント**（`account_disabled_*`： 漏洩パスワード・乗っ取り・スパム送信）、不審なログイン、失敗の多い順トップN |
+| `suspended_accounts` | Directory API — **停止中**アカウントの現在スナップショット（`isSuspended=true`）。下流 IdP（KeyCloak 等）と突合し、停止済みなのに IdP 側で有効なままのアカウントを洗い出す |
 | `drive_external_sharing` | Reports API `drive` — 外部アドレス/ドメインへの ACL **付与**（取り消しは別集計）、リンク公開/一般公開への可視性**遷移** |
 | `daily_brief` | 設定済み全ドメインを横断した一括サマリ |
 | `daily_brief_start` / `daily_brief_result` | `daily_brief` をバックグラウンド実行： `start` が即座に `job_id` を返し、`result(job_id)` を `done` になるまでポーリングする。同期呼び出しがクライアントの ~60秒 tool-call タイムアウトに掛かる大規模テナント向け |
 
 計画中： `dlp_events`（Reports `rules`、DLP 対応の Workspace エディションが必要）、
-`suspended_accounts`（Directory API スナップショット、
-`admin.directory.user.readonly` の DWD スコープが必要）、`token_events`、`admin_events`。
+`token_events`、`admin_events`。
 
 ## 認証方式
 
@@ -37,6 +37,17 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 ```
 https://www.googleapis.com/auth/admin.reports.audit.readonly
 ```
+
+`suspended_accounts` はさらに Directory 読み取りスコープが必要（同じクライアント ID に付与する。
+未付与の場合、そのツールだけがドメイン単位のエラーに縮退し、Reports 系ツールは動作を続ける）:
+
+```
+https://www.googleapis.com/auth/admin.directory.user.readonly
+```
+
+`suspended_accounts` は Reports 系ツール（顧客テナント全体）と異なり、設定済みドメイン単位で列挙する
+（Directory の `domain=` フィルタ）。突合したいドメイン（例：学生用の別ドメイン）はそれぞれ
+`[domain.*]` セクションを設定しないと、そのドメインの停止アカウントは列挙されない。
 
 ## セットアップ
 

@@ -4,13 +4,15 @@
 
 MCP (Model Context Protocol) server for Google Workspace security auditing.
 Exposes `login_audit` (Google-side account locks, suspicious logins),
+`suspended_accounts` (current suspended-account snapshot),
 `drive_external_sharing` (ACL grants to external targets, new link/public
-exposure), and a `daily_brief` combining both, to AI assistants via STDIO
-transport, built on the official `mcp` Python SDK's `FastMCP`. Read-only:
-the only Admin SDK Reports API method called anywhere in this package is
-`activities().list` (the underlying `googleapiclient.discovery.build()`
-setup call also fetches Google's discovery document over HTTP, separately
-from this read-only guarantee).
+exposure), and a `daily_brief` combining the Reports-based tools, to AI
+assistants via STDIO transport, built on the official `mcp` Python SDK's
+`FastMCP`. Read-only: the only Admin SDK methods called anywhere in this
+package are `activities().list` (Reports API) and `users().list` (Directory
+API, for `suspended_accounts`) — both read-only; no mutating call exists.
+The underlying `googleapiclient.discovery.build()` setup call also fetches
+Google's discovery document over HTTP, separately from this guarantee.
 
 ## Commands
 
