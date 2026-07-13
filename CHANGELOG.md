@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.5.0...v0.6.0) (2026-07-13)
+
+
+### Features
+
+* add suspended_accounts tool (Directory API snapshot) ([#17](https://github.com/shigechika/gwsadm-mcp/issues/17)) ([ff395ad](https://github.com/shigechika/gwsadm-mcp/commit/ff395ad8a7f3ab44ea35aab0688575a0f9b3b820))
+
 ## [0.5.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.4.0...v0.5.0) (2026-07-10)
 
 
