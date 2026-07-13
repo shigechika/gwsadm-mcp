@@ -19,13 +19,13 @@ anything.
 |------|-------------|
 | `health_check` | Server version, config path, and per-domain auth probe — call at session start or after a timeout |
 | `login_audit` | Reports API `login` — accounts **auto-disabled by Google** (`account_disabled_*`: leaked password, hijacked, spamming), suspicious logins, failure top-N |
+| `suspended_accounts` | Directory API — current snapshot of **suspended** accounts (`isSuspended=true`); cross-reference against a downstream IdP (e.g. KeyCloak) to find suspended-but-still-enabled accounts |
 | `drive_external_sharing` | Reports API `drive` — ACL **grants** to external addresses or domains (revocations reported separately) and visibility **transitions** into link/public exposure |
 | `daily_brief` | One-call summary across all configured domains |
 | `daily_brief_start` / `daily_brief_result` | Same as `daily_brief`, run in the background: `start` returns a `job_id` immediately, then poll `result(job_id)` until `done`. Use on large tenants where the synchronous call risks the client's ~60s tool-call timeout |
 
 Planned: `dlp_events` (Reports `rules`; requires a Workspace edition with DLP),
-`suspended_accounts` (Directory API snapshot; requires the
-`admin.directory.user.readonly` DWD scope), `token_events`, `admin_events`.
+`token_events`, `admin_events`.
 
 ## Auth model
 
@@ -38,6 +38,19 @@ Required DWD scope per service-account client ID:
 ```
 https://www.googleapis.com/auth/admin.reports.audit.readonly
 ```
+
+`suspended_accounts` additionally needs the Directory read scope (grant it on
+the same client ID; without it that tool degrades to a per-domain error while
+the Reports-based tools keep working):
+
+```
+https://www.googleapis.com/auth/admin.directory.user.readonly
+```
+
+`suspended_accounts` lists per configured domain (Directory `domain=` filter),
+unlike the customer-wide Reports tools — so every domain you want covered
+(e.g. a separate student domain) needs its own `[domain.*]` config section, or
+its suspended accounts are not listed.
 
 ## Setup
 

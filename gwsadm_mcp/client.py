@@ -4,8 +4,9 @@ One ``DomainClient`` per audited domain. Auth is a service account with
 domain-wide delegation impersonating an audit-capable admin (``subject``) —
 fully non-interactive, so the server can run unattended behind a gateway.
 
-Read-only by design: only ``activities().list`` (Admin SDK Reports API) is
-issued; no mutating call exists in this package.
+Read-only by design: only ``activities().list`` (Admin SDK Reports API) and
+``users().list`` (Directory API, for suspended-account snapshots) are issued;
+no mutating call exists in this package.
 """
 
 import datetime
@@ -23,9 +24,12 @@ from googleapiclient.errors import HttpError
 from gwsadm_mcp.config import DomainConfig
 
 SCOPE_REPORTS = "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+SCOPE_DIRECTORY = "https://www.googleapis.com/auth/admin.directory.user.readonly"
 
 # Reports API hard limit is 1000 per page.
 PAGE_SIZE = 1000
+# Directory API hard limit is 500 per page.
+DIRECTORY_PAGE_SIZE = 500
 
 # Per-request HTTP timeout (seconds).
 _HTTP_TIMEOUT = 30
@@ -67,10 +71,12 @@ def _rfc3339(dt: datetime.datetime) -> str:
 class DomainClient:
     """Audit-activities client for one Workspace domain."""
 
-    def __init__(self, cfg: DomainConfig, *, reports_service=None):
+    def __init__(self, cfg: DomainConfig, *, reports_service=None, directory_service=None):
         self.cfg = cfg
         self._reports = reports_service  # injectable for tests
+        self._directory = directory_service  # injectable for tests
         self._creds = None
+        self._directory_creds = None
         # Guards the lazy build so concurrent fetch_activities() calls (the
         # parallel daily_brief) build the service/credentials at most once.
         self._build_lock = threading.Lock()
@@ -97,18 +103,37 @@ class DomainClient:
                     self._reports = build("admin", "reports_v1", credentials=creds, cache_discovery=False)
         return self._reports
 
-    def _new_http(self):
+    def _directory_service(self):
+        if self._directory is None:
+            with self._build_lock:
+                if self._directory is None:  # re-check under lock
+                    try:
+                        creds = service_account.Credentials.from_service_account_file(
+                            self.cfg.service_account_file, scopes=[SCOPE_DIRECTORY], subject=self.cfg.subject
+                        )
+                    except (OSError, ValueError) as e:
+                        # See _reports_service: key path must not leak into tool output.
+                        raise GwsAuthError(
+                            f"[{self.domain}] cannot load service account key ({type(e).__name__})"
+                        ) from e
+                    self._directory_creds = creds
+                    self._directory = build("admin", "directory_v1", credentials=creds, cache_discovery=False)
+        return self._directory
+
+    def _new_http(self, creds=None):
         """A fresh AuthorizedHttp per call so concurrent execute()s are thread-safe.
 
         googleapiclient's service object may be shared across threads, but its
         underlying httplib2.Http is not — the supported pattern is one Http per
-        thread, passed to execute(http=...). Returns None when no real
-        credentials exist (an injected mock service in tests), which makes
-        execute() fall back to the request's own transport.
+        thread, passed to execute(http=...). ``creds`` selects the credential
+        set (reports vs directory); defaults to the reports creds. Returns None
+        when no real credentials exist (an injected mock service in tests),
+        which makes execute() fall back to the request's own transport.
         """
-        if self._creds is None:
+        creds = creds or self._creds
+        if creds is None:
             return None
-        return google_auth_httplib2.AuthorizedHttp(self._creds, http=httplib2.Http(timeout=_HTTP_TIMEOUT))
+        return google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=_HTTP_TIMEOUT))
 
     def _execute(self, make_request, http):
         """Execute a freshly-built request with backoff on rate-limit/transient errors."""
@@ -174,6 +199,45 @@ class DomainClient:
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error ({application_name}): {type(e).__name__}") from e
         return items, bool(token)
+
+    def list_suspended_users(self, *, max_pages: int = 20) -> tuple[list[dict], bool]:
+        """List currently suspended users in this domain (Directory API).
+
+        Returns ``(users, capped)``; ``capped=True`` means more pages existed
+        beyond ``max_pages`` — callers must surface this so a partial snapshot is
+        never mistaken for the full set. Read-only: only ``users().list`` is
+        issued. Requires the ``admin.directory.user.readonly`` DWD scope; a
+        missing grant surfaces as a permission error, never a silent empty list.
+        """
+        params = {
+            "domain": self.domain,
+            "query": "isSuspended=true",
+            "maxResults": DIRECTORY_PAGE_SIZE,
+            "orderBy": "email",
+            "projection": "basic",
+        }
+        users: list[dict] = []
+        token = None
+        pages = 0
+        try:
+            svc = self._directory_service()
+            http = self._new_http(self._directory_creds)
+            while True:
+                resp = self._execute(lambda tok=token: svc.users().list(pageToken=tok, **params), http)
+                users.extend(resp.get("users", []))
+                token = resp.get("nextPageToken")
+                pages += 1
+                if not token or pages >= max_pages:
+                    break
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] directory API error (users.list): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: DWD scope not granted for this client, or wrong subject.
+            raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (users.list): {type(e).__name__}") from e
+        return users, bool(token)
 
     def check(self) -> dict:
         """Cheap end-to-end probe: one 1-item login query (auth + API + DWD)."""
