@@ -20,6 +20,7 @@ anything.
 | `health_check` | Server version, config path, and per-domain auth probe — call at session start or after a timeout |
 | `login_audit` | Reports API `login` — accounts **auto-disabled by Google** (`account_disabled_*`: leaked password, hijacked, spamming), suspicious logins, failure top-N |
 | `suspended_accounts` | Directory API — current snapshot of **suspended** accounts (`isSuspended=true`); cross-reference against a downstream IdP (e.g. KeyCloak) to find suspended-but-still-enabled accounts |
+| `user_oauth_tokens` | Directory API `tokens().list` — third-party OAuth app grants for **one user**; a compromise vector `login_audit` is blind to, since a previously-granted token needs no fresh login. Domain resolved from the username's suffix |
 | `drive_external_sharing` | Reports API `drive` — ACL **grants** to external addresses or domains (revocations reported separately) and visibility **transitions** into link/public exposure |
 | `daily_brief` | One-call summary across all configured domains |
 | `daily_brief_start` / `daily_brief_result` | Same as `daily_brief`, run in the background: `start` returns a `job_id` immediately, then poll `result(job_id)` until `done`. Use on large tenants where the synchronous call risks the client's ~60s tool-call timeout |
@@ -51,6 +52,14 @@ https://www.googleapis.com/auth/admin.directory.user.readonly
 unlike the customer-wide Reports tools — so every domain you want covered
 (e.g. a separate student domain) needs its own `[domain.*]` config section, or
 its suspended accounts are not listed.
+
+`user_oauth_tokens` needs a third scope, distinct from the Directory read
+scope above (grant it on the same client ID; without it that tool degrades to
+an error while the other tools keep working):
+
+```
+https://www.googleapis.com/auth/admin.directory.user.security
+```
 
 ## Setup
 

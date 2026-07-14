@@ -9,12 +9,14 @@ from gwsadm_mcp.client import GwsError
 
 
 class FakeDomainClient:
-    def __init__(self, domain, canned, auth="ok", suspended=None):
+    def __init__(self, domain, canned, auth="ok", suspended=None, tokens=None):
         self.domain = domain
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
         self._auth = auth
         self._suspended = suspended  # (users, capped) | Exception | None
+        self._tokens = tokens  # list[dict] | Exception | None
         self.calls = []
+        self.token_calls = []
 
     def fetch_activities(self, application_name, *, start, end=None, event_name=None, max_pages=5):
         self.calls.append((application_name, event_name, max_pages))
@@ -29,6 +31,14 @@ class FakeDomainClient:
         if isinstance(self._suspended, Exception):
             raise self._suspended
         return self._suspended
+
+    def list_user_oauth_tokens(self, user_key):
+        self.token_calls.append(user_key)
+        if self._tokens is None:
+            return []
+        if isinstance(self._tokens, Exception):
+            raise self._tokens
+        return self._tokens
 
     def check(self):
         return {"domain": self.domain, "auth": self._auth}
@@ -164,6 +174,53 @@ def test_suspended_accounts_degrades_per_domain_on_auth_error(inject):
 def test_suspended_accounts_unknown_domain_is_error(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
     assert "error" in server.suspended_accounts(domain="nope.example")
+
+
+def test_user_oauth_tokens_projects_and_resolves_domain_from_username(inject):
+    tokens = [
+        {
+            "clientId": "123.apps.googleusercontent.com",
+            "displayText": "Some App",
+            "scopes": ["https://mail.google.com/"],
+            "anonymous": False,
+            "nativeApp": False,
+        }
+    ]
+    c = FakeDomainClient("example.edu", {}, tokens=tokens)
+    inject([c], {"example.edu"})
+    out = server.user_oauth_tokens("user@example.edu")
+    assert out["domain"] == "example.edu"
+    assert out["count"] == 1
+    entry = out["tokens"][0]
+    assert entry["client_id"] == "123.apps.googleusercontent.com"
+    assert entry["scopes"] == ["https://mail.google.com/"]
+    assert c.token_calls == ["user@example.edu"]  # full email passed through, not just the local part
+
+
+def test_user_oauth_tokens_no_grants_is_empty_not_error(inject):
+    inject([FakeDomainClient("example.edu", {}, tokens=[])], {"example.edu"})
+    out = server.user_oauth_tokens("user@example.edu")
+    assert out["count"] == 0
+    assert out["tokens"] == []
+
+
+def test_user_oauth_tokens_degrades_on_auth_error(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    inject([FakeDomainClient("example.edu", {}, tokens=GwsAuthError("no security scope"))], {"example.edu"})
+    out = server.user_oauth_tokens("user@example.edu")
+    assert "error" in out
+    assert out["domain"] == "example.edu"  # domain still identifiable even though the call failed
+
+
+def test_user_oauth_tokens_unresolvable_domain_is_error(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    assert "error" in server.user_oauth_tokens("user@nope.example")
+
+
+def test_user_oauth_tokens_rejects_non_email(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    assert "error" in server.user_oauth_tokens("not-an-email")
 
 
 def test_select_normalizes_case_and_whitespace(inject):
