@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.6.0...v0.7.0) (2026-07-14)
+
+
+### Features
+
+* add user_oauth_tokens tool (Directory API tokens().list) ([#23](https://github.com/shigechika/gwsadm-mcp/issues/23)) ([6d6e1fd](https://github.com/shigechika/gwsadm-mcp/commit/6d6e1fdd98e73c83f1522ae63b08772c318676d5))
+
 ## [0.6.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.5.0...v0.6.0) (2026-07-13)
 
 
