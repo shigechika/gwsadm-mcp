@@ -58,6 +58,13 @@ def load_config(path: str | None = None) -> tuple[list[DomainConfig], set[str]]:
         if not sec.startswith("domain."):
             continue
         name = sec[len("domain.") :].strip().lower()
+        # configparser section names are case-sensitive, so [domain.Example.edu]
+        # and [domain.example.edu] are distinct sections that both land here as
+        # "example.edu". Tools that pick one client per domain would silently
+        # use whichever comes first (e.g. a stale key left from a rotation), so
+        # fail loudly instead.
+        if any(d.domain == name for d in domains):
+            raise ConfigError(f"duplicate domain '{name}' in {path} (sections differing only in case?)")
         s = cp[sec]
         for key in ("service_account_file", "subject", "customer_id"):
             if not s.get(key, "").strip():

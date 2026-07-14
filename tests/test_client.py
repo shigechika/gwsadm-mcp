@@ -122,6 +122,49 @@ def test_list_suspended_users_http_error_maps_to_gws_error():
         c.list_suspended_users()
 
 
+class FakeTokens:
+    def __init__(self, resp, exc=None):
+        self.resp, self.exc, self.calls = resp, exc, []
+
+    def list(self, **kw):
+        self.calls.append(kw)
+        if self.exc:
+            return _Req(None, self.exc)
+        return _Req(self.resp)
+
+
+class FakeDirectorySecurity:
+    def __init__(self, resp, exc=None):
+        self._t = FakeTokens(resp, exc)
+
+    def tokens(self):
+        return self._t
+
+
+def _sec_client(resp, exc=None):
+    svc = FakeDirectorySecurity(resp, exc)
+    return DomainClient(CFG, directory_security_service=svc), svc._t
+
+
+def test_list_user_oauth_tokens_returns_items_and_passes_user_key():
+    c, t = _sec_client({"items": [{"clientId": "abc", "displayText": "App"}]})
+    tokens = c.list_user_oauth_tokens("user@example.edu")
+    assert tokens == [{"clientId": "abc", "displayText": "App"}]
+    assert t.calls[0]["userKey"] == "user@example.edu"
+
+
+def test_list_user_oauth_tokens_empty_items():
+    c, _ = _sec_client({})
+    assert c.list_user_oauth_tokens("user@example.edu") == []
+
+
+def test_list_user_oauth_tokens_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _sec_client(None, exc=err)
+    with pytest.raises(GwsError):
+        c.list_user_oauth_tokens("user@example.edu")
+
+
 def test_http_error_maps_to_gws_error():
     import datetime
 

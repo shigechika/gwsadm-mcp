@@ -5,6 +5,7 @@ Phase 1 tools:
 - ``health_check``            — fleet-standard status/service/version + per-domain auth probe
 - ``login_audit``             — Google-side auto-disabled accounts, suspicious logins, failure top-N
 - ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
+- ``user_oauth_tokens``       — third-party OAuth app grants for one user (Directory API)
 - ``drive_external_sharing``  — Drive ACL grants to external targets and new link/public exposure
 - ``daily_brief``             — one-call summary of the Reports-based tools
   (``login_audit`` + ``drive_external_sharing``) across all configured domains;
@@ -165,6 +166,21 @@ def _select(clients: list[DomainClient], domain: str | None) -> list[DomainClien
     if not picked:
         raise GwsError(f"unknown domain '{domain}' (configured: {[c.domain for c in clients]})")
     return picked
+
+
+def _domain_of(username: str) -> str:
+    """Return the lowercased domain of an email-shaped username, validating the shape.
+
+    Rejects anything that would reach the Directory API as a malformed
+    ``userKey`` (missing/empty local or domain part, embedded whitespace) so
+    the caller reports a clear input error instead of a misleading
+    "directory API error" from Google, or an "unknown domain ''" from
+    ``_select`` for an empty suffix.
+    """
+    local, sep, domain = username.rpartition("@")
+    if not sep or not local or not domain or any(ch.isspace() for ch in username):
+        raise GwsError(f"'{username}' is not an email address")
+    return domain.lower()
 
 
 def _window(hours: int) -> datetime.datetime:
@@ -374,6 +390,66 @@ def suspended_accounts(domain: str | None = None, max_pages: int = 20) -> dict:
         except (GwsAuthError, GwsError) as e:
             out[c.domain] = {"error": str(e)}
     return {"domains": out}
+
+
+def _token_entry(t: dict) -> dict:
+    """Project a Directory Tokens resource to the fields relevant to triage."""
+    return {
+        "client_id": t.get("clientId"),
+        "display_text": t.get("displayText"),
+        "scopes": t.get("scopes", []),
+        "anonymous": t.get("anonymous"),
+        "native_app": t.get("nativeApp"),
+    }
+
+
+@mcp.tool()
+def user_oauth_tokens(username: str, domain: str | None = None) -> dict:
+    """List third-party OAuth apps one user has granted account access to.
+
+    Account-compromise triage tool for the case ``login_audit`` and
+    ``suspended_accounts`` are both blind to: a malicious app used a
+    previously-granted OAuth token to read/delete mail or Drive files without
+    ever generating a fresh login event. Check each entry's ``scopes`` for
+    Gmail/Drive access on an unrecognized ``client_id``/``display_text`` —
+    Google's own apps (e.g. iOS/Android account sync) show up too and are
+    normal noise.
+
+    Read-only (Directory API ``tokens().list``; never ``tokens().delete()``).
+    Requires the ``admin.directory.user.security`` DWD scope — distinct from
+    ``admin.directory.user.readonly`` used by ``suspended_accounts``; a domain
+    missing that grant returns ``{"error": ...}``. No pagination: the API
+    returns a user's full grant list in one response.
+
+    Args:
+        username: Exact user email, passed through as the Directory API
+            ``userKey`` (primary or alias address both work on Google's side).
+        domain: Configured ``[domain.*]`` section to route the lookup through.
+            Default: resolved from the username's suffix. Set it explicitly
+            when the address uses an alias/secondary domain that has no
+            config section of its own (common when copying addresses from
+            mail headers or IdP logs).
+    """
+    username = username.strip()
+    try:
+        # Validate the input shape before touching config: a typo'd email on a
+        # server with a broken config should report the typo, not ConfigError.
+        suffix = _domain_of(username)
+        clients, _ = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"username": username, "error": str(e)}
+    c = picked[0]
+    try:
+        tokens = c.list_user_oauth_tokens(username)
+    except (GwsAuthError, GwsError) as e:
+        return {"domain": c.domain, "username": username, "error": str(e)}
+    return {
+        "domain": c.domain,
+        "username": username,
+        "count": len(tokens),
+        "tokens": [_token_entry(t) for t in tokens],
+    }
 
 
 def _drive_sample(item: dict, event: dict, p: dict, *, target, target_domain, visibility, old_visibility) -> dict:

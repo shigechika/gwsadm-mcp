@@ -20,6 +20,7 @@ anything.
 | `health_check` | Server version, config path, and per-domain auth probe — call at session start or after a timeout |
 | `login_audit` | Reports API `login` — accounts **auto-disabled by Google** (`account_disabled_*`: leaked password, hijacked, spamming), suspicious logins, failure top-N |
 | `suspended_accounts` | Directory API — current snapshot of **suspended** accounts (`isSuspended=true`); cross-reference against a downstream IdP (e.g. KeyCloak) to find suspended-but-still-enabled accounts |
+| `user_oauth_tokens` | Directory API `tokens().list` — third-party OAuth app grants for **one user**; a compromise vector `login_audit` is blind to, since a previously-granted token needs no fresh login. Domain resolved from the username's suffix, with an optional `domain` override for alias/secondary-domain addresses |
 | `drive_external_sharing` | Reports API `drive` — ACL **grants** to external addresses or domains (revocations reported separately) and visibility **transitions** into link/public exposure |
 | `daily_brief` | One-call summary across all configured domains |
 | `daily_brief_start` / `daily_brief_result` | Same as `daily_brief`, run in the background: `start` returns a `job_id` immediately, then poll `result(job_id)` until `done`. Use on large tenants where the synchronous call risks the client's ~60s tool-call timeout |
@@ -33,24 +34,27 @@ Service account with **domain-wide delegation (DWD)** impersonating an
 audit-capable admin. Fully non-interactive — no browser, no token refresh
 rotation — so the server runs unattended (cron, MCP gateway, CI).
 
-Required DWD scope per service-account client ID:
+Grant **all** of the following DWD scopes on the same service-account client
+ID up front, in one setup pass. Adding them one at a time as each tool gets
+built is how a scope goes missing until the one tool that needed it starts
+degrading — one place, one pass, avoids the trap:
 
-```
-https://www.googleapis.com/auth/admin.reports.audit.readonly
-```
+| Scope | Needed by | Missing it |
+|-------|-----------|------------|
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `drive_external_sharing`, `daily_brief*` | those tools degrade to a per-domain error |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts` | that tool degrades to a per-domain error; everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
 
-`suspended_accounts` additionally needs the Directory read scope (grant it on
-the same client ID; without it that tool degrades to a per-domain error while
-the Reports-based tools keep working):
+`health_check` needs no scope at all to respond: it is the tool to call when
+a grant might be missing — it probes each domain and reports the failing
+auth in a structured per-domain result instead of failing itself.
 
-```
-https://www.googleapis.com/auth/admin.directory.user.readonly
-```
-
-`suspended_accounts` lists per configured domain (Directory `domain=` filter),
-unlike the customer-wide Reports tools — so every domain you want covered
-(e.g. a separate student domain) needs its own `[domain.*]` config section, or
-its suspended accounts are not listed.
+`suspended_accounts` and `user_oauth_tokens` both operate per configured
+domain (Directory `domain=`/`userKey=`), unlike the customer-wide Reports
+tools — so every domain you want covered (e.g. a separate student domain)
+needs its own `[domain.*]` config section. Note the failure modes differ:
+`suspended_accounts` **silently omits** an unconfigured domain from its
+result, while `user_oauth_tokens` fails loudly with an unknown-domain error.
 
 ## Setup
 

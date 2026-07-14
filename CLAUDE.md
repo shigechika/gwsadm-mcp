@@ -5,12 +5,14 @@
 MCP (Model Context Protocol) server for Google Workspace security auditing.
 Exposes `login_audit` (Google-side account locks, suspicious logins),
 `suspended_accounts` (current suspended-account snapshot),
+`user_oauth_tokens` (one user's third-party OAuth app grants),
 `drive_external_sharing` (ACL grants to external targets, new link/public
 exposure), and a `daily_brief` combining the Reports-based tools, to AI
 assistants via STDIO transport, built on the official `mcp` Python SDK's
 `FastMCP`. Read-only: the only Admin SDK methods called anywhere in this
-package are `activities().list` (Reports API) and `users().list` (Directory
-API, for `suspended_accounts`) — both read-only; no mutating call exists.
+package are `activities().list` (Reports API), `users().list` (Directory
+API, for `suspended_accounts`), and `tokens().list` (Directory API, for
+`user_oauth_tokens`) — all read-only; no mutating call exists.
 The underlying `googleapiclient.discovery.build()` setup call also fetches
 Google's discovery document over HTTP, separately from this guarantee.
 
@@ -30,7 +32,8 @@ to guard against stdio newline regressions).
 ## Architecture
 
 - `gwsadm_mcp/server.py` — FastMCP server with `health_check`,
-  `login_audit`, `drive_external_sharing`, `daily_brief`, and the background
+  `login_audit`, `suspended_accounts`, `user_oauth_tokens`,
+  `drive_external_sharing`, `daily_brief`, and the background
   pair `daily_brief_start` / `daily_brief_result` (plus an env-gated
   `timeout_probe` diagnostic). Holds a module-level `_state` cache
   (`{"clients": ..., "internal": ...}`) built lazily on first tool call by

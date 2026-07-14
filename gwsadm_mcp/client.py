@@ -4,8 +4,9 @@ One ``DomainClient`` per audited domain. Auth is a service account with
 domain-wide delegation impersonating an audit-capable admin (``subject``) —
 fully non-interactive, so the server can run unattended behind a gateway.
 
-Read-only by design: only ``activities().list`` (Admin SDK Reports API) and
-``users().list`` (Directory API, for suspended-account snapshots) are issued;
+Read-only by design: only ``activities().list`` (Admin SDK Reports API),
+``users().list`` (Directory API, for suspended-account snapshots), and
+``tokens().list`` (Directory API, for per-user OAuth app grants) are issued;
 no mutating call exists in this package.
 """
 
@@ -25,6 +26,16 @@ from gwsadm_mcp.config import DomainConfig
 
 SCOPE_REPORTS = "https://www.googleapis.com/auth/admin.reports.audit.readonly"
 SCOPE_DIRECTORY = "https://www.googleapis.com/auth/admin.directory.user.readonly"
+# Tokens().list (third-party OAuth app grants) lives under the Directory API but
+# is NOT covered by admin.directory.user.readonly -- it needs this separate
+# scope (a user's security/2SV/token resource). Credentials are built PER
+# SCOPE (its own builder below, not one credentials object with all scopes)
+# because a DWD token request is all-or-nothing over its scope list: a
+# combined request fails entirely on a tenant that granted only one of the
+# scopes, which would break the per-tool degradation the README promises
+# (e.g. suspended_accounts must keep working when only the readonly grant
+# exists). Do not merge the scope lists as a cleanup.
+SCOPE_DIRECTORY_SECURITY = "https://www.googleapis.com/auth/admin.directory.user.security"
 
 # Reports API hard limit is 1000 per page.
 PAGE_SIZE = 1000
@@ -71,12 +82,21 @@ def _rfc3339(dt: datetime.datetime) -> str:
 class DomainClient:
     """Audit-activities client for one Workspace domain."""
 
-    def __init__(self, cfg: DomainConfig, *, reports_service=None, directory_service=None):
+    def __init__(
+        self,
+        cfg: DomainConfig,
+        *,
+        reports_service=None,
+        directory_service=None,
+        directory_security_service=None,
+    ):
         self.cfg = cfg
         self._reports = reports_service  # injectable for tests
         self._directory = directory_service  # injectable for tests
+        self._directory_security = directory_security_service  # injectable for tests
         self._creds = None
         self._directory_creds = None
+        self._directory_security_creds = None
         # Guards the lazy build so concurrent fetch_activities() calls (the
         # parallel daily_brief) build the service/credentials at most once.
         self._build_lock = threading.Lock()
@@ -119,6 +139,23 @@ class DomainClient:
                     self._directory_creds = creds
                     self._directory = build("admin", "directory_v1", credentials=creds, cache_discovery=False)
         return self._directory
+
+    def _directory_security_service(self):
+        if self._directory_security is None:
+            with self._build_lock:
+                if self._directory_security is None:  # re-check under lock
+                    try:
+                        creds = service_account.Credentials.from_service_account_file(
+                            self.cfg.service_account_file, scopes=[SCOPE_DIRECTORY_SECURITY], subject=self.cfg.subject
+                        )
+                    except (OSError, ValueError) as e:
+                        # See _reports_service: key path must not leak into tool output.
+                        raise GwsAuthError(
+                            f"[{self.domain}] cannot load service account key ({type(e).__name__})"
+                        ) from e
+                    self._directory_security_creds = creds
+                    self._directory_security = build("admin", "directory_v1", credentials=creds, cache_discovery=False)
+        return self._directory_security
 
     def _new_http(self, creds=None):
         """A fresh AuthorizedHttp per call so concurrent execute()s are thread-safe.
@@ -238,6 +275,29 @@ class DomainClient:
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (users.list): {type(e).__name__}") from e
         return users, bool(token)
+
+    def list_user_oauth_tokens(self, user_key: str) -> list[dict]:
+        """List third-party OAuth app grants for one user (Directory API ``tokens().list``).
+
+        Single-user lookup, no pagination (the API returns the full grant list
+        in one response). Read-only: only ``tokens().list`` is issued — never
+        ``tokens().delete()``. Requires the ``admin.directory.user.security``
+        DWD scope, distinct from ``admin.directory.user.readonly``; a missing
+        grant surfaces as a permission error, never a silent empty list.
+        """
+        try:
+            svc = self._directory_security_service()
+            http = self._new_http(self._directory_security_creds)
+            resp = self._execute(lambda: svc.tokens().list(userKey=user_key), http)
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] directory API error (tokens.list): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: DWD scope not granted for this client, or wrong subject.
+            raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (tokens.list): {type(e).__name__}") from e
+        return resp.get("items", [])
 
     def check(self) -> dict:
         """Cheap end-to-end probe: one 1-item login query (auth + API + DWD)."""
