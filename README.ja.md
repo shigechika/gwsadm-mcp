@@ -19,7 +19,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `health_check` | サーバーバージョン・設定パス・ドメインごとの認証確認 — セッション開始時やタイムアウト後に呼ぶ |
 | `login_audit` | Reports API `login` — **Google により自動無効化されたアカウント**（`account_disabled_*`： 漏洩パスワード・乗っ取り・スパム送信）、不審なログイン、失敗の多い順トップN |
 | `suspended_accounts` | Directory API — **停止中**アカウントの現在スナップショット（`isSuspended=true`）。下流 IdP（KeyCloak 等）と突合し、停止済みなのに IdP 側で有効なままのアカウントを洗い出す |
-| `user_oauth_tokens` | Directory API `tokens().list` — **特定ユーザー1名**の第三者OAuthアプリ連携一覧。既存トークンはログイン不要で使えるため `login_audit` では検知できない侵害経路。ドメインはユーザー名のサフィックスから解決 |
+| `user_oauth_tokens` | Directory API `tokens().list` — **特定ユーザー1名**の第三者OAuthアプリ連携一覧。既存トークンはログイン不要で使えるため `login_audit` では検知できない侵害経路。ドメインはユーザー名のサフィックスから解決（エイリアス/セカンダリドメインのアドレス用に `domain` で明示指定も可） |
 | `drive_external_sharing` | Reports API `drive` — 外部アドレス/ドメインへの ACL **付与**（取り消しは別集計）、リンク公開/一般公開への可視性**遷移** |
 | `daily_brief` | 設定済み全ドメインを横断した一括サマリ |
 | `daily_brief_start` / `daily_brief_result` | `daily_brief` をバックグラウンド実行： `start` が即座に `job_id` を返し、`result(job_id)` を `done` になるまでポーリングする。同期呼び出しがクライアントの ~60秒 tool-call タイムアウトに掛かる大規模テナント向け |
@@ -39,14 +39,18 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
-| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`drive_external_sharing`、`daily_brief*`、`health_check` | それらのツールが認証自体に失敗する |
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`drive_external_sharing`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
+`health_check` はスコープが一切無くても応答する。グラント漏れが疑われるときこそ呼ぶツールで、
+自身が失敗する代わりにドメインごとの認証失敗を構造化された結果として報告する。
+
 `suspended_accounts` と `user_oauth_tokens` はどちらも Reports 系ツール（顧客テナント全体）と異なり、
 設定済みドメイン単位で動作する（Directory の `domain=`/`userKey=`）。突合したいドメイン
-（例：学生用の別ドメイン）はそれぞれ `[domain.*]` セクションを設定しないと、
-そのドメインのアカウント/トークンは参照できない。
+（例：学生用の別ドメイン）はそれぞれ `[domain.*]` セクションの設定が必要。
+なお失敗の仕方が異なる点に注意：未設定ドメインを `suspended_accounts` は**黙って結果から省く**が、
+`user_oauth_tokens` は unknown-domain エラーで明示的に失敗する。
 
 ## セットアップ
 

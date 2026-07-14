@@ -55,6 +55,22 @@ def test_no_domain_sections_raises(tmp_path):
         load_config(str(p))
 
 
+def test_duplicate_domain_differing_only_in_case_raises(tmp_path):
+    # configparser section names are case-sensitive, so both sections parse
+    # and would silently yield two clients for the same lowercased domain
+    # (e.g. a stale section left behind during a key rotation).
+    p = tmp_path / "config.ini"
+    p.write_text(
+        GOOD
+        + "\n[domain.Example.edu]\n"
+        + "service_account_file = /tmp/sa-old.json\n"
+        + "subject = audit-admin@example.edu\n"
+        + "customer_id = C0abc\n"
+    )
+    with pytest.raises(ConfigError, match="duplicate domain 'example.edu'"):
+        load_config(str(p))
+
+
 def test_is_external():
     internal = {"example.edu"}
     assert not is_external("user@example.edu", internal)

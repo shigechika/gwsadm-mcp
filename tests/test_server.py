@@ -213,9 +213,11 @@ def test_user_oauth_tokens_degrades_on_auth_error(inject):
     assert out["domain"] == "example.edu"  # domain still identifiable even though the call failed
 
 
-def test_user_oauth_tokens_unresolvable_domain_is_error(inject):
+def test_user_oauth_tokens_unresolvable_domain_error_carries_username(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
-    assert "error" in server.user_oauth_tokens("user@nope.example")
+    out = server.user_oauth_tokens("user@nope.example")
+    assert "error" in out
+    assert out["username"] == "user@nope.example"  # errors always identify the request
 
 
 def test_user_oauth_tokens_strips_whitespace(inject):
@@ -226,9 +228,41 @@ def test_user_oauth_tokens_strips_whitespace(inject):
     assert c.token_calls == ["user@example.edu"]  # not the untrimmed value
 
 
-def test_user_oauth_tokens_rejects_non_email(inject):
-    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
-    assert "error" in server.user_oauth_tokens("not-an-email")
+def test_user_oauth_tokens_explicit_domain_routes_alias_address(inject):
+    # An alias/secondary-domain address has no [domain.*] section of its own;
+    # the explicit domain param routes the lookup through the configured
+    # section while the alias address passes through as userKey untouched.
+    c = FakeDomainClient("example.edu", {}, tokens=[])
+    inject([c], {"example.edu"})
+    out = server.user_oauth_tokens("user@alias.edu", domain="example.edu")
+    assert "error" not in out
+    assert out["domain"] == "example.edu"
+    assert c.token_calls == ["user@alias.edu"]
+
+
+def test_user_oauth_tokens_rejects_non_email():
+    # Validation fires before _clients(), so no client injection is needed —
+    # a malformed input must never surface as a config error.
+    out = server.user_oauth_tokens("not-an-email")
+    assert "not an email address" in out["error"]
+
+
+def test_user_oauth_tokens_rejects_empty_domain_part():
+    # "user@" has an "@" but no domain; must be rejected as a malformed email,
+    # not misdiagnosed as "unknown domain ''".
+    out = server.user_oauth_tokens("user@")
+    assert "not an email address" in out["error"]
+
+
+def test_user_oauth_tokens_rejects_internal_whitespace(inject):
+    # "user@ example.edu": the domain suffix would match config after a strip,
+    # but the raw string is an invalid userKey — reject it instead of sending
+    # it to the API and reporting a misleading "directory API error".
+    c = FakeDomainClient("example.edu", {}, tokens=[])
+    inject([c], {"example.edu"})
+    out = server.user_oauth_tokens("user@ example.edu")
+    assert "not an email address" in out["error"]
+    assert c.token_calls == []  # never reached the API
 
 
 def test_select_normalizes_case_and_whitespace(inject):

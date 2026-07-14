@@ -169,9 +169,18 @@ def _select(clients: list[DomainClient], domain: str | None) -> list[DomainClien
 
 
 def _domain_of(username: str) -> str:
-    if "@" not in username:
+    """Return the lowercased domain of an email-shaped username, validating the shape.
+
+    Rejects anything that would reach the Directory API as a malformed
+    ``userKey`` (missing/empty local or domain part, embedded whitespace) so
+    the caller reports a clear input error instead of a misleading
+    "directory API error" from Google, or an "unknown domain ''" from
+    ``_select`` for an empty suffix.
+    """
+    local, sep, domain = username.rpartition("@")
+    if not sep or not local or not domain or any(ch.isspace() for ch in username):
         raise GwsError(f"'{username}' is not an email address")
-    return username.rsplit("@", 1)[1].strip().lower()
+    return domain.lower()
 
 
 def _window(hours: int) -> datetime.datetime:
@@ -395,7 +404,7 @@ def _token_entry(t: dict) -> dict:
 
 
 @mcp.tool()
-def user_oauth_tokens(username: str) -> dict:
+def user_oauth_tokens(username: str, domain: str | None = None) -> dict:
     """List third-party OAuth apps one user has granted account access to.
 
     Account-compromise triage tool for the case ``login_audit`` and
@@ -413,16 +422,23 @@ def user_oauth_tokens(username: str) -> dict:
     returns a user's full grant list in one response.
 
     Args:
-        username: Exact user email; the domain is resolved from its suffix
-            and must match one of the configured ``[domain.*]`` sections.
+        username: Exact user email, passed through as the Directory API
+            ``userKey`` (primary or alias address both work on Google's side).
+        domain: Configured ``[domain.*]`` section to route the lookup through.
+            Default: resolved from the username's suffix. Set it explicitly
+            when the address uses an alias/secondary domain that has no
+            config section of its own (common when copying addresses from
+            mail headers or IdP logs).
     """
     username = username.strip()
     try:
+        # Validate the input shape before touching config: a typo'd email on a
+        # server with a broken config should report the typo, not ConfigError.
+        suffix = _domain_of(username)
         clients, _ = _clients()
-        domain = _domain_of(username)
-        picked = _select(clients, domain)
+        picked = _select(clients, domain if domain is not None else suffix)
     except (ConfigError, GwsError) as e:
-        return {"error": str(e)}
+        return {"username": username, "error": str(e)}
     c = picked[0]
     try:
         tokens = c.list_user_oauth_tokens(username)

@@ -27,9 +27,14 @@ from gwsadm_mcp.config import DomainConfig
 SCOPE_REPORTS = "https://www.googleapis.com/auth/admin.reports.audit.readonly"
 SCOPE_DIRECTORY = "https://www.googleapis.com/auth/admin.directory.user.readonly"
 # Tokens().list (third-party OAuth app grants) lives under the Directory API but
-# is NOT covered by admin.directory.user.readonly -- it needs this separate,
-# more sensitive scope (a user's security/2SV/token resource), hence its own
-# credentials and service builder below rather than reusing _directory_service.
+# is NOT covered by admin.directory.user.readonly -- it needs this separate
+# scope (a user's security/2SV/token resource). Credentials are built PER
+# SCOPE (its own builder below, not one credentials object with all scopes)
+# because a DWD token request is all-or-nothing over its scope list: a
+# combined request fails entirely on a tenant that granted only one of the
+# scopes, which would break the per-tool degradation the README promises
+# (e.g. suspended_accounts must keep working when only the readonly grant
+# exists). Do not merge the scope lists as a cleanup.
 SCOPE_DIRECTORY_SECURITY = "https://www.googleapis.com/auth/admin.directory.user.security"
 
 # Reports API hard limit is 1000 per page.
