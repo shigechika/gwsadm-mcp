@@ -34,32 +34,22 @@ Service account with **domain-wide delegation (DWD)** impersonating an
 audit-capable admin. Fully non-interactive — no browser, no token refresh
 rotation — so the server runs unattended (cron, MCP gateway, CI).
 
-Required DWD scope per service-account client ID:
+Grant **all** of the following DWD scopes on the same service-account client
+ID up front, in one setup pass. Adding them one at a time as each tool gets
+built is how a scope goes missing until the one tool that needed it starts
+degrading — one place, one pass, avoids the trap:
 
-```
-https://www.googleapis.com/auth/admin.reports.audit.readonly
-```
+| Scope | Needed by | Missing it |
+|-------|-----------|------------|
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `drive_external_sharing`, `daily_brief*`, `health_check` | those tools fail to authenticate at all |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts` | that tool degrades to a per-domain error; everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
 
-`suspended_accounts` additionally needs the Directory read scope (grant it on
-the same client ID; without it that tool degrades to a per-domain error while
-the Reports-based tools keep working):
-
-```
-https://www.googleapis.com/auth/admin.directory.user.readonly
-```
-
-`suspended_accounts` lists per configured domain (Directory `domain=` filter),
-unlike the customer-wide Reports tools — so every domain you want covered
-(e.g. a separate student domain) needs its own `[domain.*]` config section, or
-its suspended accounts are not listed.
-
-`user_oauth_tokens` needs a third scope, distinct from the Directory read
-scope above (grant it on the same client ID; without it that tool degrades to
-an error while the other tools keep working):
-
-```
-https://www.googleapis.com/auth/admin.directory.user.security
-```
+`suspended_accounts` and `user_oauth_tokens` both operate per configured
+domain (Directory `domain=`/`userKey=`), unlike the customer-wide Reports
+tools — so every domain you want covered (e.g. a separate student domain)
+needs its own `[domain.*]` config section, or its accounts/tokens are not
+reachable.
 
 ## Setup
 

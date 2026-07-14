@@ -33,29 +33,20 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 完全に非対話式 — ブラウザ操作もトークンのリフレッシュローテーションも不要なので、
 無人実行できる（cron・MCP ゲートウェイ・CI）。
 
-サービスアカウントのクライアント ID ごとに必要な DWD スコープ:
+サービスアカウントのクライアント ID には、以下の DWD スコープを**最初にまとめて全部**付与すること。
+ツールを作るたびに1つずつ追加していくと、そのツールが実際に動くまでスコープ不足に気づかない
+（今回がまさにそれだった）。1箇所・1回で済ませることでこの罠を避ける:
 
-```
-https://www.googleapis.com/auth/admin.reports.audit.readonly
-```
+| スコープ | 必要とするツール | 未付与の場合 |
+|------|------|------|
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`drive_external_sharing`、`daily_brief*`、`health_check` | それらのツールが認証自体に失敗する |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
+| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
-`suspended_accounts` はさらに Directory 読み取りスコープが必要（同じクライアント ID に付与する。
-未付与の場合、そのツールだけがドメイン単位のエラーに縮退し、Reports 系ツールは動作を続ける）:
-
-```
-https://www.googleapis.com/auth/admin.directory.user.readonly
-```
-
-`suspended_accounts` は Reports 系ツール（顧客テナント全体）と異なり、設定済みドメイン単位で列挙する
-（Directory の `domain=` フィルタ）。突合したいドメイン（例：学生用の別ドメイン）はそれぞれ
-`[domain.*]` セクションを設定しないと、そのドメインの停止アカウントは列挙されない。
-
-`user_oauth_tokens` は上記の Directory 読み取りスコープとは別に、3つ目のスコープが必要
-（同じクライアント ID に付与する。未付与の場合、そのツールだけがエラーに縮退し、他のツールは動作を続ける）:
-
-```
-https://www.googleapis.com/auth/admin.directory.user.security
-```
+`suspended_accounts` と `user_oauth_tokens` はどちらも Reports 系ツール（顧客テナント全体）と異なり、
+設定済みドメイン単位で動作する（Directory の `domain=`/`userKey=`）。突合したいドメイン
+（例：学生用の別ドメイン）はそれぞれ `[domain.*]` セクションを設定しないと、
+そのドメインのアカウント/トークンは参照できない。
 
 ## セットアップ
 
