@@ -218,6 +218,14 @@ def test_user_oauth_tokens_unresolvable_domain_is_error(inject):
     assert "error" in server.user_oauth_tokens("user@nope.example")
 
 
+def test_user_oauth_tokens_strips_whitespace(inject):
+    c = FakeDomainClient("example.edu", {}, tokens=[])
+    inject([c], {"example.edu"})
+    out = server.user_oauth_tokens("  user@example.edu  ")
+    assert out["username"] == "user@example.edu"
+    assert c.token_calls == ["user@example.edu"]  # not the untrimmed value
+
+
 def test_user_oauth_tokens_rejects_non_email(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
     assert "error" in server.user_oauth_tokens("not-an-email")

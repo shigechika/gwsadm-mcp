@@ -416,6 +416,7 @@ def user_oauth_tokens(username: str) -> dict:
         username: Exact user email; the domain is resolved from its suffix
             and must match one of the configured ``[domain.*]`` sections.
     """
+    username = username.strip()
     try:
         clients, _ = _clients()
         domain = _domain_of(username)
