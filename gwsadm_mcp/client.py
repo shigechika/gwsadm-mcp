@@ -196,12 +196,16 @@ class DomainClient:
         start: datetime.datetime,
         end: datetime.datetime | None = None,
         event_name: str | None = None,
+        filters: str | None = None,
         max_pages: int = 5,
     ) -> tuple[list[dict], bool]:
         """Fetch audit activities (newest first). Returns ``(items, capped)``.
 
         ``capped=True`` means more pages existed beyond ``max_pages`` — callers
         must surface this so a partial window is never mistaken for full coverage.
+        ``filters`` is passed through as the Reports API ``filters`` expression
+        (e.g. ``"doc_id==<id>"``); callers own validating any interpolated value
+        because the expression is an operator language, not a plain string.
         """
         params = {
             "userKey": "all",
@@ -214,6 +218,8 @@ class DomainClient:
             params["endTime"] = _rfc3339(end)
         if event_name:
             params["eventName"] = event_name
+        if filters:
+            params["filters"] = filters
         items: list[dict] = []
         token = None
         pages = 0

@@ -18,9 +18,10 @@ class FakeDomainClient:
         self.calls = []
         self.token_calls = []
 
-    def fetch_activities(self, application_name, *, start, end=None, event_name=None, max_pages=5):
-        self.calls.append((application_name, event_name, max_pages))
-        got = self._canned.get((application_name, event_name), ([], False))
+    def fetch_activities(self, application_name, *, start, end=None, event_name=None, filters=None, max_pages=5):
+        self.calls.append((application_name, event_name, max_pages, filters))
+        # Filtered (doc-scoped) fetches are canned under (application, filters).
+        got = self._canned.get((application_name, filters if filters else event_name), ([], False))
         if isinstance(got, Exception):
             raise got
         return got
@@ -618,7 +619,7 @@ def test_daily_brief_passes_max_pages_and_samples_to_drive_scan(inject):
     client = FakeDomainClient("example.edu", {("drive", "change_user_access"): (items, False)})
     inject([client], {"example.edu"})
     out = server.daily_brief(hours=24, max_pages=9, samples=3)
-    drive_pages = {mp for app, _, mp in client.calls if app == "drive"}
+    drive_pages = {mp for app, _, mp, _f in client.calls if app == "drive"}
     assert drive_pages == {9}
     dom = out["drive_external_sharing"]["example.edu"]
     assert dom["external_targets_total"] == 5  # counters see everything
@@ -632,7 +633,7 @@ def test_daily_brief_default_page_budget_matches_standalone_tool(inject):
     inject([client], {"example.edu"})
     server.daily_brief(hours=24)
     standalone = inspect.signature(server.drive_external_sharing).parameters["max_pages"].default
-    drive_pages = {mp for app, _, mp in client.calls if app == "drive"}
+    drive_pages = {mp for app, _, mp, _f in client.calls if app == "drive"}
     assert drive_pages == {standalone}
 
 
@@ -1350,3 +1351,152 @@ def test_daily_brief_start_rejects_when_over_cap(inject, monkeypatch):
     assert out["status"] == "rejected"
     assert "job_id" not in out
     server._JOBS.clear()
+
+
+# --- drive_doc_activity ---
+
+DOC = "1AbCdEfGhIjKlMnOpQrStUvWx"
+
+
+def _doc_items():
+    return [
+        _item(
+            "ext@gmail.com",
+            "change_user_access",
+            {
+                "target_user": "Partner@corp.example",
+                "new_value": ["can_edit"],
+                "owner": "drive_Lab",
+                "doc_title": "quote.pdf",
+                "doc_id": DOC,
+            },
+            time="2026-07-02T00:00:00.000Z",
+        ),
+        _item(
+            "ext@gmail.com",
+            "create",
+            {"owner": "drive_Lab", "doc_title": "quote.pdf", "doc_id": DOC},
+            time="2026-07-01T00:00:00.000Z",
+        ),
+        _item("viewer@example.edu", "view", {"doc_id": DOC}, time="2026-07-01T12:00:00.000Z"),
+    ]
+
+
+def test_drive_doc_activity_reconstructs_history(inject):
+    client = FakeDomainClient("example.edu", {("drive", f"doc_id=={DOC}"): (_doc_items(), False)})
+    inject([client], {"example.edu"})
+    out = server.drive_doc_activity(DOC)
+    dom = out["domains"]["example.edu"]
+    assert dom["owner"] == "drive_Lab"  # a shared drive name, not a user address
+    assert dom["doc_title"] == "quote.pdf"
+    assert dom["event_counts"] == {"change_user_access": 1, "create": 1, "view": 1}
+    assert [e["event"] for e in dom["events"]] == ["change_user_access", "create"]  # view counted, not listed
+    assert dom["events"][0]["target_user"] == "partner@corp.example"  # normalized like the sharing tool
+    assert dom["events_truncated"] is False and dom["capped"] is False
+    # The fetch itself was doc-scoped server-side, not a full-window scan.
+    assert ("drive", None, 5, f"doc_id=={DOC}") in client.calls
+
+
+def test_drive_doc_activity_rejects_malformed_doc_id(inject):
+    client = FakeDomainClient("example.edu", {})
+    inject([client], {"example.edu"})
+    # A comma/operator would change the meaning of the filters expression.
+    out = server.drive_doc_activity("abc,doc_id==other0000")
+    assert "error" in out
+    assert client.calls == []  # rejected before any API traffic
+
+
+def test_drive_doc_activity_truncates_listing_but_not_counts(inject):
+    client = FakeDomainClient("example.edu", {("drive", f"doc_id=={DOC}"): (_doc_items(), True)})
+    inject([client], {"example.edu"})
+    dom = server.drive_doc_activity(DOC, max_events=1)["domains"]["example.edu"]
+    assert len(dom["events"]) == 1
+    assert dom["events_truncated"] is True
+    assert dom["event_counts"]["create"] == 1  # counts still cover everything fetched
+    assert dom["capped"] is True  # pagination cap surfaced unchanged
+
+
+def test_drive_doc_activity_degrades_per_domain(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    ok = FakeDomainClient("a.example.edu", {("drive", f"doc_id=={DOC}"): (_doc_items(), False)})
+    boom = FakeDomainClient("b.example.edu", {("drive", f"doc_id=={DOC}"): GwsAuthError("auth failed")})
+    inject([ok, boom], {"a.example.edu", "b.example.edu"})
+    out = server.drive_doc_activity(DOC)["domains"]
+    assert out["a.example.edu"]["owner"] == "drive_Lab"
+    assert "error" in out["b.example.edu"]  # one tenant's failure does not sink the other
+
+
+def test_drive_doc_activity_unknown_domain_is_error(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    assert "error" in server.drive_doc_activity(DOC, domain="nope.example")
+
+
+# --- shared_drive_membership_changes ---
+
+
+def _membership_items():
+    return [
+        _item(
+            "prof@example.edu",
+            "shared_drive_membership_change",
+            {
+                "owner": "drive_Lab",
+                "target_user": "Ext@gmail.com",
+                "membership_change_type": "add_to_shared_drive",
+            },
+        ),
+        _item(
+            "prof@example.edu",
+            "shared_drive_membership_change",
+            {
+                "owner": "OtherDrive",
+                "target_user": "s1@example.edu",
+                "membership_change_type": "change_roles",
+            },
+        ),
+    ]
+
+
+def test_shared_drive_membership_changes_classifies_targets(inject):
+    client = FakeDomainClient(
+        "example.edu", {("drive", "shared_drive_membership_change"): (_membership_items(), False)}
+    )
+    inject([client], {"example.edu"})
+    dom = server.shared_drive_membership_changes()["domains"]["example.edu"]
+    assert dom["total"] == 2
+    ext, internal = dom["entries"]
+    assert ext["drive"] == "drive_Lab"
+    assert ext["target_user"] == "ext@gmail.com"
+    assert ext["target_is_external"] is True
+    assert ext["membership_change_type"] == "add_to_shared_drive"
+    assert internal["target_is_external"] is False
+
+
+def test_shared_drive_membership_changes_drive_name_narrows_listing(inject):
+    client = FakeDomainClient("example.edu", {("drive", "shared_drive_membership_change"): (_membership_items(), True)})
+    inject([client], {"example.edu"})
+    dom = server.shared_drive_membership_changes(drive_name="lab")["domains"]["example.edu"]
+    assert dom["total"] == 1  # case-insensitive substring on the drive name
+    assert dom["entries"][0]["drive"] == "drive_Lab"
+    assert dom["capped"] is True  # scan-level cap unrelated to the name filter
+
+
+def test_shared_drive_membership_changes_truncates_listing_but_not_total(inject):
+    client = FakeDomainClient(
+        "example.edu", {("drive", "shared_drive_membership_change"): (_membership_items(), False)}
+    )
+    inject([client], {"example.edu"})
+    dom = server.shared_drive_membership_changes(max_events=1)["domains"]["example.edu"]
+    assert dom["total"] == 2
+    assert len(dom["entries"]) == 1
+    assert dom["events_truncated"] is True
+
+
+def test_shared_drive_membership_changes_degrades_per_domain(inject):
+    ok = FakeDomainClient("a.example.edu", {("drive", "shared_drive_membership_change"): (_membership_items(), False)})
+    boom = FakeDomainClient("b.example.edu", {("drive", "shared_drive_membership_change"): GwsError("boom")})
+    inject([ok, boom], {"a.example.edu", "b.example.edu"})
+    out = server.shared_drive_membership_changes()["domains"]
+    assert out["a.example.edu"]["total"] == 2
+    assert "error" in out["b.example.edu"]
