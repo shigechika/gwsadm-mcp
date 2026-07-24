@@ -1500,3 +1500,64 @@ def test_shared_drive_membership_changes_degrades_per_domain(inject):
     out = server.shared_drive_membership_changes()["domains"]
     assert out["a.example.edu"]["total"] == 2
     assert "error" in out["b.example.edu"]
+
+
+def test_drive_doc_activity_sibling_events_do_not_contaminate(inject):
+    # One activity item can carry events for OTHER documents (a multi-file
+    # share is one activity, one event per file). The sibling — listed FIRST,
+    # with its own owner/title — must not leak into this doc's history.
+    item = {
+        "id": {"time": "2026-07-03T00:00:00.000Z"},
+        "actor": {"email": "u@example.edu"},
+        "events": [
+            {
+                "name": "change_user_access",
+                "parameters": [
+                    {"name": "doc_id", "value": "0OtherDocId000000000"},
+                    {"name": "owner", "value": "someone.else@example.edu"},
+                    {"name": "doc_title", "value": "other.pdf"},
+                    {"name": "target_user", "value": "x@gmail.com"},
+                ],
+            },
+            {
+                "name": "change_user_access",
+                "parameters": [
+                    {"name": "doc_id", "value": DOC},
+                    {"name": "owner", "value": "drive_Lab"},
+                    {"name": "doc_title", "value": "quote.pdf"},
+                    {"name": "target_user", "value": "y@gmail.com"},
+                ],
+            },
+            {"name": "view", "parameters": []},  # no doc_id at all: unattributable
+        ],
+    }
+    client = FakeDomainClient("example.edu", {("drive", f"doc_id=={DOC}"): ([item], False)})
+    inject([client], {"example.edu"})
+    dom = server.drive_doc_activity(DOC)["domains"]["example.edu"]
+    assert dom["owner"] == "drive_Lab"  # not the sibling's owner
+    assert dom["doc_title"] == "quote.pdf"
+    assert dom["event_counts"] == {"change_user_access": 1}
+    assert [e["target_user"] for e in dom["events"]] == ["y@gmail.com"]
+    assert dom["sibling_events_skipped"] == 2  # other doc + unattributable
+
+
+def test_shared_drive_membership_missing_drive_name_is_surfaced(inject):
+    nameless = _item(
+        "prof@example.edu",
+        "shared_drive_membership_change",
+        {"target_user": "ext@gmail.com", "membership_change_type": "add_to_shared_drive"},
+    )
+    client = FakeDomainClient(
+        "example.edu",
+        {("drive", "shared_drive_membership_change"): (_membership_items() + [nameless], False)},
+    )
+    inject([client], {"example.edu"})
+    # With a name filter the nameless event can't be judged: dropped but counted.
+    dom = server.shared_drive_membership_changes(drive_name="lab")["domains"]["example.edu"]
+    assert dom["total"] == 1
+    assert dom["missing_drive_name"] == 1
+    # Without a filter it is listed normally with drive=None.
+    dom = server.shared_drive_membership_changes()["domains"]["example.edu"]
+    assert dom["total"] == 3
+    assert dom["missing_drive_name"] == 0
+    assert any(e["drive"] is None for e in dom["entries"])
