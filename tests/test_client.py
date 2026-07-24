@@ -321,3 +321,14 @@ def test_permission_403_is_not_retried(monkeypatch):
     with pytest.raises(GwsError):
         c.fetch_activities("login", start=datetime.datetime.now(datetime.timezone.utc))
     assert slept == []  # no backoff for a permanent permission error
+
+
+def test_fetch_activities_passes_filters_only_when_set():
+    import datetime
+
+    c, a = _client([{"items": []}, {"items": []}])
+    start = datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
+    c.fetch_activities("drive", start=start, filters="doc_id==abc123defg")
+    assert a.calls[0]["filters"] == "doc_id==abc123defg"
+    c.fetch_activities("drive", start=start)
+    assert "filters" not in a.calls[1]

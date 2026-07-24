@@ -7,6 +7,8 @@ Phase 1 tools:
 - ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
 - ``user_oauth_tokens``       — third-party OAuth app grants for one user (Directory API)
 - ``drive_external_sharing``  — Drive ACL grants to external targets and new link/public exposure
+- ``drive_doc_activity``      — one document's owner + ACL/lifecycle history (finding triage)
+- ``shared_drive_membership_changes`` — who added/removed shared-drive members, and when
 - ``daily_brief``             — one-call summary of the Reports-based tools
   (``login_audit`` + ``drive_external_sharing``) across all configured domains;
   ``suspended_accounts`` is separate (different API/scope) and not included
@@ -22,6 +24,7 @@ import collections
 import concurrent.futures
 import datetime
 import os
+import re
 import secrets
 import threading
 import time
@@ -138,6 +141,31 @@ CANONICAL_VISIBILITY_EVENT = "change_document_access_scope"
 # transition — excluding those names here would blind the tool's primary
 # signal instead of just removing creation noise.
 SELF_CREATION_GRANT_EVENTS = {"change_user_access", "change_acl_editors"}
+
+# Document lifecycle events worth surfacing alongside the ACL events when
+# reconstructing one file's history (how it came to exist, moved, or died) —
+# the high-volume access noise (view/edit/download/print) is deliberately
+# absent so a hot document's history is not drowned in reads.
+DOC_LIFECYCLE_EVENTS = (
+    "create",
+    "upload",
+    "copy",
+    "move",
+    "rename",
+    "add_to_folder",
+    "remove_from_folder",
+    "delete",
+    "trash",
+    "untrash",
+)
+
+# Drive file / shared-drive ids are URL-safe token strings. The Reports API
+# ``filters`` parameter is an operator expression language (comma = AND,
+# ``==`` etc.), so an id is validated against this charset BEFORE being
+# interpolated — a rejected id reports an input error instead of silently
+# turning into a different filter expression. Tool inputs are LLM-driven and
+# must be treated as adversarial.
+_DOC_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 
 # Visibility values that expose content beyond named accounts. Google's
 # "shared_externally" is deliberately absent: it is relative to the file
@@ -697,6 +725,15 @@ def drive_external_sharing(hours: int = 24, domain: str | None = None, max_pages
     domain's counts as lower bounds. Narrow ``hours`` or raise ``max_pages``
     for full coverage (term-time weekdays see >10k change_user_access
     events/day).
+
+    Shared-drive caveat: a file created INSIDE a shared drive emits
+    ``change_user_access`` events for each existing drive member (ACL
+    propagation), so an external member merely uploading files looks like
+    bulk external sharing here. When a finding's documents share one owner
+    that is a drive NAME rather than a user address, triage with
+    ``drive_doc_activity`` (per-document history: the "grants" coincide with
+    ``create``/``upload`` by the same actor) and
+    ``shared_drive_membership_changes`` (who added the members, and when).
     """
     try:
         clients, internal = _clients()
@@ -707,6 +744,232 @@ def drive_external_sharing(hours: int = 24, domain: str | None = None, max_pages
         "window_hours": hours,
         "domains": _drive_external_sharing(picked, internal, hours, max_pages, samples),
     }
+
+
+def _doc_event_entry(item: dict, event: dict, p: dict) -> dict:
+    return {
+        **_entry(item, event),
+        "target_user": _scalar_lower(p.get("target_user")),
+        "target_domain": _scalar_lower(p.get("target_domain")),
+        "visibility": _scalar(p.get("visibility")),
+        "old_visibility": _scalar(p.get("old_visibility")),
+        "new_value": p.get("new_value"),
+        "membership_change_type": _scalar(p.get("membership_change_type")),
+    }
+
+
+def _fetch_drive_per_domain(
+    picked: list[DomainClient],
+    *,
+    start: datetime.datetime,
+    event_name: str | None = None,
+    filters: str | None = None,
+    max_pages: int,
+) -> dict:
+    """Run one drive probe per domain concurrently (same worker pool policy as
+    ``_parallel_fetch``, which cannot carry a ``filters`` expression in its task
+    tuple). Returns ``{domain: (items, capped) | Exception}`` so each caller
+    applies its own per-domain degradation."""
+    results: dict = {}
+
+    def _one(c: DomainClient):
+        return c.fetch_activities("drive", start=start, event_name=event_name, filters=filters, max_pages=max_pages)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(picked))) as ex:
+        futs = {ex.submit(_one, c): c.domain for c in picked}
+        for fut in concurrent.futures.as_completed(futs):
+            dom = futs[fut]
+            try:
+                results[dom] = fut.result()
+            except (GwsAuthError, GwsError) as e:
+                results[dom] = e
+    return results
+
+
+@mcp.tool()
+def drive_doc_activity(
+    doc_id: str, days: int = 180, domain: str | None = None, max_pages: int = 5, max_events: int = 100
+) -> dict:
+    """Full audit history of one Drive document: owner, ACL changes, lifecycle.
+
+    The triage companion to ``drive_external_sharing``: a sharing finding names
+    a ``doc_id``, and judging it requires who OWNS the document (an individual
+    user vs. a shared drive completely changes the risk read) and its grant
+    history over time. Uses a server-side ``doc_id`` filter, so the page budget
+    is spent on this one document only.
+
+    ``owner`` / ``doc_title`` are taken from the document's own events (a
+    shared-drive-owned file reports the drive's name — not a user address — as
+    owner). ``events`` lists ACL and lifecycle events newest-first
+    (view/edit/download noise is counted in ``event_counts`` but not listed);
+    ``events_truncated`` is set when more matched than ``max_events``.
+    The ``doc_id`` filter matches at the ACTIVITY level and one activity can
+    carry sibling events for OTHER documents (a multi-file share is one
+    activity with one event per file) — events whose own ``doc_id`` parameter
+    does not match (or is absent) are excluded from every output field and
+    tallied in ``sibling_events_skipped`` instead, so a bulk action cannot
+    contaminate this document's history or misattribute its owner.
+    An empty result means no events in the window for the queried tenant —
+    NOT proof the document does not exist (history older than the Reports API
+    retention, or a document living in a different tenant, looks the same).
+
+    Args:
+        doc_id: Drive document id (from a sharing finding's ``doc_id`` field).
+        days: How far back to scan (Reports API retains roughly 6 months).
+        domain: Restrict to one configured domain/tenant (default: all).
+        max_pages: Reports page cap per domain; ``capped=true`` means more existed.
+        max_events: Cap on listed events (counts are unaffected).
+    """
+    doc_id = doc_id.strip()
+    if not _DOC_ID_RE.match(doc_id):
+        return {"doc_id": doc_id, "error": "doc_id is not a valid Drive id (URL-safe token expected)"}
+    try:
+        clients, _ = _clients()
+        picked = _select(clients, domain)
+    except (ConfigError, GwsError) as e:
+        return {"doc_id": doc_id, "error": str(e)}
+    start = _window(days * 24)
+    relevant = set(DRIVE_ACL_EVENTS) | set(DOC_LIFECYCLE_EVENTS)
+    # filters-without-eventName semantics verified live (2026-07-24): a bare
+    # "doc_id==<id>" filter applies across event types — one real document
+    # returned exactly its create / change_user_access / add_to_folder events
+    # and nothing else, matching an unfiltered scan of the same document.
+    fetched = _fetch_drive_per_domain(picked, start=start, filters=f"doc_id=={doc_id}", max_pages=max_pages)
+    out: dict = {}
+    for c in picked:
+        r = fetched[c.domain]
+        if isinstance(r, Exception):
+            out[c.domain] = {"error": str(r)}
+            continue
+        items, capped = r
+        counts: collections.Counter = collections.Counter()
+        entries: list[dict] = []
+        truncated = False
+        siblings_skipped = 0
+        owner = None
+        title = None
+        for it in items:
+            for ev in it.get("events", []):
+                p = event_parameters(ev)
+                # The doc_id filter matches at the ACTIVITY level; one activity
+                # can carry sibling events for other documents (a multi-file
+                # share is one activity with one event per file). Mirror the
+                # eventName sibling guard in _drive_external_sharing: only this
+                # document's own events may feed owner/title/counts/listing.
+                # An absent doc_id parameter cannot be attributed and is
+                # skipped too (conservative: omission over contamination).
+                if _scalar(p.get("doc_id")) != doc_id:
+                    siblings_skipped += 1
+                    continue
+                name = ev.get("name") or "(unnamed)"
+                counts[name] += 1
+                # Newest-first stream: keep the first (most recent) non-empty value.
+                owner = owner or _scalar(p.get("owner"))
+                title = title or _scalar(p.get("doc_title"))
+                if name in relevant:
+                    if len(entries) < max_events:
+                        entries.append(_doc_event_entry(it, ev, p))
+                    else:
+                        truncated = True
+        out[c.domain] = {
+            "owner": owner,
+            "doc_title": title,
+            "event_counts": dict(counts),
+            "events": entries,
+            "events_truncated": truncated,
+            "sibling_events_skipped": siblings_skipped,
+            "capped": capped,
+        }
+    return {"doc_id": doc_id, "window_days": days, "domains": out}
+
+
+@mcp.tool()
+def shared_drive_membership_changes(
+    days: int = 180, domain: str | None = None, drive_name: str | None = None, max_pages: int = 5, max_events: int = 200
+) -> dict:
+    """Membership add/remove/role-change history across shared drives.
+
+    Answers "who added this (external) member, and when" — the other half of
+    triaging a shared-drive sharing finding (see ``drive_doc_activity``).
+    Membership changes are low-volume, so a plain window scan of the single
+    ``shared_drive_membership_change`` event works even over months.
+
+    Each entry's ``drive`` is the shared drive's NAME as the audit log reports
+    it (the event's ``owner`` parameter — not an id, not a user address);
+    ``target_is_external`` classifies the affected member against the
+    configured internal domains. The Reports API cannot filter by drive
+    server-side, so ``drive_name`` is a client-side case-insensitive substring
+    match on that name — it narrows the listing, not the scan. An event whose
+    drive name is absent can neither match nor be ruled out; with
+    ``drive_name`` set such events are excluded from ``total``/``entries`` but
+    tallied in ``missing_drive_name`` so the drop is never silent (without
+    ``drive_name`` they are listed normally with ``drive: null``).
+
+    Args:
+        days: How far back to scan (Reports API retains roughly 6 months).
+        domain: Restrict to one configured domain/tenant (default: all).
+        drive_name: Only list entries whose drive name contains this substring.
+        max_pages: Reports page cap per domain; ``capped=true`` means more existed.
+        max_events: Cap on listed entries (``total`` counts all matches).
+    """
+    try:
+        clients, internal = _clients()
+        picked = _select(clients, domain)
+    except (ConfigError, GwsError) as e:
+        return {"error": str(e)}
+    start = _window(days * 24)
+    needle = drive_name.strip().lower() if drive_name else None
+    fetched = _fetch_drive_per_domain(
+        picked, start=start, event_name="shared_drive_membership_change", max_pages=max_pages
+    )
+    out: dict = {}
+    for c in picked:
+        r = fetched[c.domain]
+        if isinstance(r, Exception):
+            out[c.domain] = {"error": str(r)}
+            continue
+        items, capped = r
+        total = 0
+        truncated = False
+        missing_drive = 0
+        entries: list[dict] = []
+        for it in items:
+            for ev in it.get("events", []):
+                if ev.get("name") != "shared_drive_membership_change":
+                    continue
+                p = event_parameters(ev)
+                drive = _scalar(p.get("owner"))
+                if needle is not None:
+                    if drive is None:
+                        # Cannot match or rule out a nameless drive — surface
+                        # the drop instead of silently undercounting.
+                        missing_drive += 1
+                        continue
+                    if needle not in str(drive).lower():
+                        continue
+                total += 1
+                if len(entries) >= max_events:
+                    truncated = True
+                    continue
+                target = _scalar_lower(p.get("target_user"))
+                entries.append(
+                    {
+                        **_entry(it, ev),
+                        "drive": drive,
+                        "target_user": target,
+                        "target_is_external": is_external(target, internal) if target else None,
+                        "membership_change_type": _scalar(p.get("membership_change_type")),
+                        "new_value": p.get("new_value"),
+                    }
+                )
+        out[c.domain] = {
+            "total": total,
+            "capped": capped,
+            "events_truncated": truncated,
+            "missing_drive_name": missing_drive,
+            "entries": entries,
+        }
+    return {"window_days": days, "domains": out}
 
 
 def _daily_brief_impl(hours: int, max_pages: int, samples: int) -> dict:

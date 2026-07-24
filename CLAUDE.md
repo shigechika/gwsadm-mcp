@@ -7,7 +7,10 @@ Exposes `login_audit` (Google-side account locks, suspicious logins),
 `suspended_accounts` (current suspended-account snapshot),
 `user_oauth_tokens` (one user's third-party OAuth app grants),
 `drive_external_sharing` (ACL grants to external targets, new link/public
-exposure), and a `daily_brief` combining the Reports-based tools, to AI
+exposure), `drive_doc_activity` (one document's owner + ACL/lifecycle
+history via a server-side `doc_id` filter), `shared_drive_membership_changes`
+(shared-drive member add/remove/role history), and a `daily_brief` combining
+the Reports-based tools, to AI
 assistants via STDIO transport, built on the official `mcp` Python SDK's
 `FastMCP`. Read-only: the only Admin SDK methods called anywhere in this
 package are `activities().list` (Reports API), `users().list` (Directory
@@ -33,13 +36,16 @@ to guard against stdio newline regressions).
 
 - `gwsadm_mcp/server.py` — FastMCP server with `health_check`,
   `login_audit`, `suspended_accounts`, `user_oauth_tokens`,
-  `drive_external_sharing`, `daily_brief`, and the background
+  `drive_external_sharing`, `drive_doc_activity`,
+  `shared_drive_membership_changes`, `daily_brief`, and the background
   pair `daily_brief_start` / `daily_brief_result` (plus an env-gated
   `timeout_probe` diagnostic). Holds a module-level `_state` cache
   (`{"clients": ..., "internal": ...}`) built lazily on first tool call by
   `_clients()`, so `load_config()` runs once per process, not per call.
   Every audit tool fans its `(domain × eventName)` Reports-API fetches out
-  through `_parallel_fetch` onto a bounded `ThreadPoolExecutor`
+  through `_parallel_fetch` — or, for the single-probe doc/membership tools
+  whose task shape carries a `filters` expression, the sibling
+  `_fetch_drive_per_domain` — onto a bounded `ThreadPoolExecutor`
   (`GWSADM_MAX_WORKERS`, default 8, clamped 1..32) — running them serially
   would blow past a gateway's request timeout on a large tenant — then
   aggregates the collected results serially.

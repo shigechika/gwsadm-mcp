@@ -21,6 +21,8 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `suspended_accounts` | Directory API — **停止中**アカウントの現在スナップショット（`isSuspended=true`）。下流 IdP（KeyCloak 等）と突合し、停止済みなのに IdP 側で有効なままのアカウントを洗い出す |
 | `user_oauth_tokens` | Directory API `tokens().list` — **特定ユーザー1名**の第三者OAuthアプリ連携一覧。既存トークンはログイン不要で使えるため `login_audit` では検知できない侵害経路。ドメインはユーザー名のサフィックスから解決（エイリアス/セカンダリドメインのアドレス用に `domain` で明示指定も可） |
 | `drive_external_sharing` | Reports API `drive` — 外部アドレス/ドメインへの ACL **付与**（取り消しは別集計）、リンク公開/一般公開への可視性**遷移** |
+| `drive_doc_activity` | Reports API `drive` をサーバー側 `doc_id` フィルタで — **特定1文書**の所有者・ACL 変更・ライフサイクル履歴。`drive_external_sharing` の検知トリアージ用： 所有者（個人か共有ドライブ名か）で「共有ドライブ内のファイル作成が既存メンバーへの ACL 伝播として一括外部共有に見える」誤検知クラスを切り分ける |
+| `shared_drive_membership_changes` | Reports API `drive`（`shared_drive_membership_change`）— 共有ドライブのメンバー追加/削除/ロール変更の履歴。対象メンバーの外部判定と、クライアント側ドライブ名フィルタ付き |
 | `daily_brief` | 設定済み全ドメインを横断した一括サマリ |
 | `daily_brief_start` / `daily_brief_result` | `daily_brief` をバックグラウンド実行： `start` が即座に `job_id` を返し、`result(job_id)` を `done` になるまでポーリングする。同期呼び出しがクライアントの ~60秒 tool-call タイムアウトに掛かる大規模テナント向け |
 
@@ -39,7 +41,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
-| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`drive_external_sharing`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
