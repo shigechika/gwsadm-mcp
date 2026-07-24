@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.7.0...v0.8.0) (2026-07-24)
+
+
+### Features
+
+* add drive_doc_activity and shared_drive_membership_changes tools ([#31](https://github.com/shigechika/gwsadm-mcp/issues/31)) ([2d70573](https://github.com/shigechika/gwsadm-mcp/commit/2d705732cb4d3761a21b5e44bc3e97577d9a2f63))
+
 ## [0.7.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.6.0...v0.7.0) (2026-07-14)
 
 
