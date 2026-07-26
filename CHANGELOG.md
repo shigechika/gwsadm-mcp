@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.0...v0.9.1) (2026-07-26)
+
+
+### Bug Fixes
+
+* close two holes the per-domain guard did not cover ([#39](https://github.com/shigechika/gwsadm-mcp/issues/39)) ([5a15c5d](https://github.com/shigechika/gwsadm-mcp/commit/5a15c5dde98341e30027025a51a7627347d3fe65))
+
 ## [0.9.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.8.0...v0.9.0) (2026-07-26)
 
 
