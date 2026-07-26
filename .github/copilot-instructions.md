@@ -141,6 +141,15 @@ bar of evidence as the existing exclusions, not a green-light copy-paste.
   `capped=True` / `GwsError` / `GwsAuthError` path — see convention #3 and
   #4 above; a test suite gap on the capped/error paths is a real coverage
   gap for this codebase, not a nice-to-have.
+- `tests/test_smoke_probes.py` guards `scripts/smoke_test.py`, which
+  exercises every registered tool against a real tenant. It asserts what
+  can be checked without one: every registered tool has a probe spec, no
+  spec targets a removed tool, state-changing tools stay skipped, every
+  bounding parameter a tool offers is passed explicitly, and no
+  tenant-specific literal (account, domain, doc id, drive name) is written
+  into the specs — this repository is public. A new tool therefore needs an
+  entry in `scripts/smoke_probes.py` or CI fails; that is deliberate, not an
+  obstacle to route around.
 
 ## 10. The Reports-API fan-out is concurrent — guard its thread-safety invariants
 

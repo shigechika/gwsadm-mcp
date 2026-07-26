@@ -195,6 +195,45 @@ python3 -m venv .venv
 .venv/bin/ruff check .
 ```
 
+### Live smoke test
+
+The unit suite never talks to Google, which is what makes it fast — and also
+what makes it blind to a tool that has stopped returning real data.
+`scripts/smoke_test.py` runs **every registered tool** against the configured
+tenant and fails on empty, malformed or error answers:
+
+```bash
+# uses the same config file as the server (GWSADM_CONFIG)
+uv run python scripts/smoke_test.py
+uv run python scripts/smoke_test.py --only oauth --traceback
+```
+
+- **Read-only.** Every tool here reads an audit log or a directory snapshot;
+  nothing in Workspace is changed. `daily_brief_start` creates a job inside the
+  process, which expires on its own.
+- **No payloads in the report.** Tool names, statuses and row counts only;
+  server-authored error text is redacted too, since these tools deal in account
+  addresses and document titles throughout.
+- **Bounded.** Every bounding parameter a tool offers is passed explicitly —
+  the defaults (5 pages, 180 days, 200 events) are sized for a human asking
+  once, and are enforced by a test that finds them from the source.
+- **Nothing tenant-specific in the specs.** The account and the document the
+  per-user and per-document tools need are discovered at run time, and skipped
+  when the tenant has none to offer. Two tests keep it that way: one refuses
+  those parameters as literals, the other bans anything address-shaped anywhere
+  in the file, because this repository is public.
+- An empty answer passes: no external sharing and no locked accounts is the
+  desired state. What is asserted instead is the envelope — and, where the
+  answer is keyed by domain, that the domain map is not empty, since a config
+  resolving to zero domains would otherwise report every tool as working while
+  auditing nothing.
+- CI enforces the cheap half: a tool registered without a probe spec fails the
+  build (`tests/test_smoke_probes.py`), so adding a tool forces the question
+  "how would we know it works?".
+- `scripts/smoke_harness.py` is the engine and holds no Workspace knowledge: it
+  is kept identical across the servers that share it, so fix engine bugs once
+  and sync the file rather than patching this copy.
+
 ## Releasing
 
 Releases are automated with [release-please](https://github.com/googleapis/release-please).
