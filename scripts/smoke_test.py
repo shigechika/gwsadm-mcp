@@ -63,6 +63,12 @@ def _decode(result: Any) -> Any:
     # transport holds for the other. Structured content before .data: the
     # latter is the client's own coercion of it.
     if hasattr(result, "content") and hasattr(result, "is_error"):
+        if result.is_error:
+            # The client raises on error by default, so this is belt and
+            # braces — but a tool failure decoded as ordinary data could
+            # satisfy a loose text probe and report a broken tool as OK, which
+            # is the one outcome this whole exercise exists to prevent.
+            raise RuntimeError("the server reported the tool call as failed")
         structured = getattr(result, "structured_content", None)
         if isinstance(structured, dict) and set(structured) == {"result"}:
             inner = structured["result"]
