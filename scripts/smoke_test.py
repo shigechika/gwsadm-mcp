@@ -52,11 +52,29 @@ def _decode(result: Any) -> Any:
     """Normalise an MCP tool result into plain Python data.
 
     ``mcp.server.fastmcp`` hands back ``(content_blocks, structured_result)``
-    when it converts a result, and bare content blocks otherwise — neither of
-    which the standalone FastMCP package returns. Everything downstream expects
-    a str/dict/list, so unwrap here rather than teaching the engine about SDK
-    shapes.
+    when it converts a result, and bare content blocks otherwise; the
+    standalone FastMCP client used by --stdio hands back a ``CallToolResult``.
+    Everything downstream expects a str/dict/list, so unwrap all three here
+    rather than teaching the engine about SDK shapes.
     """
+    # --stdio: the standalone client returns a CallToolResult object rather
+    # than either of the SDK shapes below. Unwrapped first, and to the same
+    # str/dict/list the in-process path yields, so a probe written against one
+    # transport holds for the other. Structured content before .data: the
+    # latter is the client's own coercion of it.
+    if hasattr(result, "content") and hasattr(result, "is_error"):
+        structured = getattr(result, "structured_content", None)
+        if isinstance(structured, dict) and set(structured) == {"result"}:
+            inner = structured["result"]
+            if isinstance(inner, str):
+                return inner
+        if isinstance(structured, (dict, list)):
+            return structured
+        data = getattr(result, "data", None)
+        if isinstance(data, (str, dict, list)):
+            return data
+        result = result.content
+
     # (content, structured): prefer the structured half when the tool declares
     # one — except for the {"result": "..."} wrapper the SDK puts around a tool
     # annotated `-> str`. Probes assert what the tool renders, and inside that

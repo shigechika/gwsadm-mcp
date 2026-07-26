@@ -28,6 +28,7 @@ resolves to zero domains would otherwise report every tool as working while
 auditing nothing.
 """
 
+import asyncio
 import re
 from typing import Any
 
@@ -37,6 +38,14 @@ from smoke_harness import Caller, Probe, SkipProbe
 #: payload. The keys are the tenant's own domains, so they cannot be named
 #: here — what matters is that at least one is present.
 DOMAINS_NOT_EMPTY = r'"domains": \{"'
+
+#: A failed domain is reported *inside* the map — ``domains[<domain>] =
+#: {"error": ...}`` — which the harness's top-level error check cannot see. A
+#: run where every domain's credentials were rejected would otherwise return a
+#: full-looking answer and pass. Matched on the quoted key, so the accounting
+#: fields whose names end in "errors" (``event_errors``, ``fetch_errors``) do
+#: not trip it.
+NO_DOMAIN_ERROR = (r'"error":',)
 
 #: Window and page bounds for the log-scanning tools. Small on purpose: one
 #: page over one day proves the fetch, the external/internal classification and
@@ -89,8 +98,13 @@ async def _some_account(call: Caller) -> dict[str, Any]:
     return {"username": address}
 
 
-async def _started_job(call: Caller) -> dict[str, Any]:
-    """Start a brief and hand its id to the polling tool."""
+async def _finished_job(call: Caller) -> dict[str, Any]:
+    """Start a brief and poll it to a terminal state for the result tool.
+
+    Accepting "running" would prove only that the id round-trips: a worker that
+    dies, or one whose result is never stored, would pass. So this waits for
+    the job to finish and leaves the probe to assert the completed envelope.
+    """
     payload = await call(
         "daily_brief_start",
         {"hours": WINDOW_HOURS, "max_pages": MAX_PAGES, "samples": 5},
@@ -98,7 +112,15 @@ async def _started_job(call: Caller) -> dict[str, Any]:
     job_id = payload.get("job_id") if isinstance(payload, dict) else None
     if not job_id:
         raise SkipProbe("daily_brief_start did not return a job to poll")
-    return {"job_id": job_id}
+
+    # Bounded by the probe's own timeout as well; this loop just decides how
+    # often to ask.
+    for _ in range(60):
+        await asyncio.sleep(5)
+        result = await call("daily_brief_result", {"job_id": job_id})
+        if isinstance(result, dict) and result.get("status") != "running":
+            return {"job_id": job_id}
+    raise SkipProbe("the brief job was still running when the probe gave up")
 
 
 PROBES: dict[str, Probe] = {
@@ -118,16 +140,22 @@ PROBES: dict[str, Probe] = {
         require_keys=("window_hours", "domains"),
         must_match=(DOMAINS_NOT_EMPTY,),
         allow_empty=True,
+        must_not_match=NO_DOMAIN_ERROR,
     ),
     "suspended_accounts": Probe(
         args={"max_pages": 1},
         require_keys=("domains",),
         must_match=(DOMAINS_NOT_EMPTY,),
         allow_empty=True,
+        must_not_match=NO_DOMAIN_ERROR,
     ),
     "user_oauth_tokens": Probe(
         args_factory=_some_account,
         require_keys=("domain", "username", "count", "tokens"),
+        rows_key="tokens",
+        # This tool reports a failure as {"username": ..., "error": ...}, which
+        # still satisfies two of the required keys.
+        must_not_match=NO_DOMAIN_ERROR,
         allow_empty=True,
     ),
     # -- Drive exposure ------------------------------------------------------
@@ -136,6 +164,7 @@ PROBES: dict[str, Probe] = {
         require_keys=("window_hours", "domains"),
         must_match=(DOMAINS_NOT_EMPTY,),
         allow_empty=True,
+        must_not_match=NO_DOMAIN_ERROR,
     ),
     "drive_doc_activity": Probe(
         args_factory=_first_document,
@@ -151,6 +180,7 @@ PROBES: dict[str, Probe] = {
         require_keys=("domains",),
         must_match=(DOMAINS_NOT_EMPTY,),
         allow_empty=True,
+        must_not_match=NO_DOMAIN_ERROR,
     ),
     # -- morning patrol ------------------------------------------------------
     # The brief runs the login audit and the Drive scan across every domain, so
@@ -166,6 +196,7 @@ PROBES: dict[str, Probe] = {
         must_match=(r'"summary": \{"',),
         allow_empty=True,
         timeout=600,
+        must_not_match=NO_DOMAIN_ERROR,
     ),
     # The async pair exists because the synchronous brief can outlive a
     # client's tool-call timeout. Both halves are exercised: start must hand
@@ -178,9 +209,11 @@ PROBES: dict[str, Probe] = {
         allow_empty=True,
     ),
     "daily_brief_result": Probe(
-        args_factory=_started_job,
-        require_keys=("status",),
-        must_match=(r'"status": "(running|done)"',),
+        args_factory=_finished_job,
+        require_keys=("status", "result"),
+        must_match=(r'"status": "done"',),
+        must_not_match=NO_DOMAIN_ERROR,
         allow_empty=True,
+        timeout=600,
     ),
 }
