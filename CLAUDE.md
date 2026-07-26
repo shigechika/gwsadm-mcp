@@ -99,3 +99,15 @@ to guard against stdio newline regressions).
   family). `tests/test_server.py` injects a hand-rolled `FakeDomainClient`
   test double via a `monkeypatch.setitem(server._state, ...)` fixture
   (`inject`), not `respx` or `unittest.mock.patch`.
+- `scripts/` holds the live smoke test: `smoke_test.py` (CLI), its per-tool
+  specs in `smoke_probes.py`, and `smoke_harness.py` — the server-agnostic
+  engine, kept identical across the servers that share it, so fix engine bugs
+  once and sync the file rather than patching this copy (it is excluded from
+  `ruff format` for that reason and keeps the shared copies' own style;
+  `ruff check` still applies). It runs every registered tool against a real
+  tenant (see README); `tests/test_smoke_probes.py` is the offline half and
+  needs only the tool registry. Adding a tool without a probe spec fails CI:
+  decide when you add the tool how anyone would know it works. Probes stay
+  read-only, name no tenant-specific value (the account and document ids come
+  from an `args_factory`), and pass an explicit small value for every bounding
+  parameter a tool offers.

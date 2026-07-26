@@ -53,6 +53,12 @@ version = {attr = "gwsadm_mcp.__version__"}
 [tool.ruff]
 target-version = "py310"
 line-length = 120
+# The smoke-test engine is shared verbatim with the other servers that use this
+# harness and is formatted at a narrower width there. Reformatting it here would
+# make every future sync produce a spurious diff and invite the copies to drift
+# apart, so it is excluded from *formatting* only — `ruff check` does not consult
+# this list, so its lint rules still apply.
+format.exclude = ["scripts/smoke_harness.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
