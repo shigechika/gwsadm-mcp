@@ -171,8 +171,10 @@ PROBES: dict[str, Probe] = {
         args={"days": 30, "max_pages": MAX_PAGES, "max_events": 25},
         require_keys=("doc_id", "window_days", "domains"),
         # The id came from a sharing finding moments earlier, so a rejection
-        # here would mean the two tools disagree about what a doc_id is.
-        must_not_match=(r'"error": "doc_id is not a valid',),
+        # here would mean the two tools disagree about what a doc_id is. The
+        # per-domain guard belongs here too: this tool reports a failed domain
+        # the same way its siblings do, nested where the engine cannot see it.
+        must_not_match=(r'"error": "doc_id is not a valid', *NO_DOMAIN_ERROR),
         allow_empty=True,
     ),
     "shared_drive_membership_changes": Probe(
@@ -208,10 +210,13 @@ PROBES: dict[str, Probe] = {
         must_match=(r'"status": "running"',),
         allow_empty=True,
     ),
+    # The same envelope its synchronous twin asserts, not just "done": a job
+    # that ran against zero configured domains finishes normally with empty
+    # sections, and a status of "done" alone would call that a success.
     "daily_brief_result": Probe(
         args_factory=_finished_job,
         require_keys=("status", "result"),
-        must_match=(r'"status": "done"',),
+        must_match=(r'"status": "done"', r'"summary": \{"'),
         must_not_match=NO_DOMAIN_ERROR,
         allow_empty=True,
         timeout=600,
