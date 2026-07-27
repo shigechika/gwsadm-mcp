@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.2](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.1...v0.9.2) (2026-07-27)
+
+
+### Bug Fixes
+
+* **ci:** read AI-review guidance from the base revision, drop the checkout ([#44](https://github.com/shigechika/gwsadm-mcp/issues/44)) ([31ef34d](https://github.com/shigechika/gwsadm-mcp/commit/31ef34de742939bb4ee9d97834b307f57920c285))
+* sync the smoke-test engine ([#42](https://github.com/shigechika/gwsadm-mcp/issues/42)) ([6ab46aa](https://github.com/shigechika/gwsadm-mcp/commit/6ab46aa001dc892c7828bd202ae8be72a471038b))
+
 ## [0.9.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.0...v0.9.1) (2026-07-26)
 
 
