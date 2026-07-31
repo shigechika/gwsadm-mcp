@@ -431,7 +431,7 @@ requires-dist = [
     { name = "google-api-python-client", specifier = ">=2.100" },
     { name = "google-auth", specifier = ">=2.23" },
     { name = "google-auth-httplib2", specifier = ">=0.2" },
-    { name = "mcp", specifier = ">=1.2" },
+    { name = "mcp", specifier = ">=1.2,<2" },
 ]
 
 [package.metadata.requires-dev]
