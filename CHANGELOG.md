@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.2...v0.9.3) (2026-07-31)
+
+
+### Bug Fixes
+
+* **deps:** cap the MCP SDK below v2 ([#46](https://github.com/shigechika/gwsadm-mcp/issues/46)) ([4360483](https://github.com/shigechika/gwsadm-mcp/commit/4360483698816797c36854c9eb4a9376c4bee426))
+
 ## [0.9.2](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.1...v0.9.2) (2026-07-27)
 
 
