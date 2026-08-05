@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "mcp>=1.2,<2",
+    "mcp>=1.2,<3",
     "google-api-python-client>=2.100",
     "google-auth>=2.23",
     "google-auth-httplib2>=0.2",
