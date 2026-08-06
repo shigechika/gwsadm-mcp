@@ -489,16 +489,28 @@ def user_oauth_tokens(username: str, domain: str | None = None) -> dict:
 # request or is handed a clear error, never a silently truncated list.
 MAX_TRACE_RECIPIENTS = 50
 
+# find_message_by_id interpolates this straight into a Gmail search query
+# (``rfc822msgid:<id>``), an operator-language string like the Reports
+# ``filters`` expression ``_DOC_ID_RE`` guards above -- so it gets the same
+# treatment: validated against a charset BEFORE being interpolated, rather
+# than trusting a caller-supplied id not to contain whitespace or Gmail
+# search syntax (``OR``, ``from:...``) that would silently broaden the
+# search to unrelated messages. Tool inputs are LLM-driven and must be
+# treated as adversarial.
+_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$")
+
 
 def _parse_recipients(raw: str) -> list[str]:
-    """Split a comma/whitespace-separated recipient list, de-duplicated, order preserved."""
+    """Split a comma/whitespace-separated recipient list, de-duplicated
+    case-insensitively (Gmail treats an address's casing as insignificant),
+    order preserved, first-seen casing kept."""
     parts = re.split(r"[,\s]+", raw.strip())
-    seen: dict[str, None] = {}
+    seen: dict[str, str] = {}
     for p in parts:
         p = p.strip()
         if p:
-            seen.setdefault(p, None)
-    return list(seen)
+            seen.setdefault(p.casefold(), p)
+    return list(seen.values())
 
 
 def _classify_folder(label_ids: list[str]) -> str:
@@ -539,9 +551,16 @@ def gmail_message_trace(message_id: str, recipients: str, domain: str | None = N
     only, never the message body) are issued against each impersonated
     mailbox — see ``DomainClient.find_message_by_id``.
 
+    A per-recipient result sets ``ambiguous: true`` (with ``match_count``)
+    when more than one message in that mailbox shares the Message-ID (e.g. a
+    mailing-list copy plus a direct CC) — the other fields describe only the
+    first match in that case, not a combined answer.
+
     Args:
         message_id: The RFC 822 Message-ID to search for, with or without
-            angle brackets.
+            angle brackets. Must be shaped like an address (``local@domain``,
+            no whitespace) — this is validated before use, since it is
+            interpolated into a Gmail search query.
         recipients: Comma- and/or whitespace-separated exact recipient email
             addresses to check (max 50 per call — split a larger list across
             multiple calls rather than expecting a partial result).
@@ -552,6 +571,11 @@ def gmail_message_trace(message_id: str, recipients: str, domain: str | None = N
             config section of its own.
     """
     stripped_id = message_id.strip().strip("<>")
+    if not _MESSAGE_ID_RE.match(stripped_id):
+        return {
+            "message_id": stripped_id,
+            "error": "message_id is not a valid RFC 822 Message-ID (local@domain expected)",
+        }
     addrs = _parse_recipients(recipients)
     if not addrs:
         return {"message_id": stripped_id, "error": "no recipients given"}
@@ -580,7 +604,7 @@ def gmail_message_trace(message_id: str, recipients: str, domain: str | None = N
             return {"domain": c.domain, "error": str(e)}
         if found is None:
             return {"domain": c.domain, "found": False}
-        return {
+        result = {
             "domain": c.domain,
             "found": True,
             "folder": _classify_folder(found["label_ids"]),
@@ -589,6 +613,15 @@ def gmail_message_trace(message_id: str, recipients: str, domain: str | None = N
             "internal_date": found["internal_date"],
             "snippet": found["snippet"],
         }
+        if found["match_count"] > 1:
+            # More than one message in this mailbox shares the Message-ID
+            # (mailing-list + direct CC, a forwarding rule, a quarantine
+            # release copy); the fields above describe only the first
+            # match, so flag it rather than presenting one copy's folder as
+            # the definitive answer.
+            result["ambiguous"] = True
+            result["match_count"] = found["match_count"]
+        return result
 
     results: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(addrs))) as ex:

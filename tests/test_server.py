@@ -289,6 +289,7 @@ def test_gmail_message_trace_mixed_found_not_found_error(inject):
         "headers": {"Date": "Wed, 01 Jul 2026 00:00:00 +0900"},
         "internal_date": "1783000000000",
         "snippet": "hello",
+        "match_count": 1,
     }
     from gwsadm_mcp.client import GwsAuthError
 
@@ -310,8 +311,37 @@ def test_gmail_message_trace_mixed_found_not_found_error(inject):
     assert out["errors"] == 1
     assert out["results"]["hit@example.edu"]["folder"] == "inbox"
     assert out["results"]["hit@example.edu"]["found"] is True
+    assert "ambiguous" not in out["results"]["hit@example.edu"]
     assert out["results"]["miss@example.edu"] == {"domain": "example.edu", "found": False}
     assert "error" in out["results"]["denied@example.edu"]
+
+
+def test_gmail_message_trace_flags_ambiguous_multi_match(inject):
+    found = {
+        "label_ids": ["INBOX"],
+        "headers": {},
+        "internal_date": "1",
+        "snippet": "",
+        "match_count": 2,
+    }
+    c = FakeDomainClient("example.edu", {}, gmail_messages={"hit@example.edu": found})
+    inject([c], {"example.edu"})
+    out = server.gmail_message_trace("abc@agent.smp.ne.jp", "hit@example.edu")
+    result = out["results"]["hit@example.edu"]
+    assert result["ambiguous"] is True
+    assert result["match_count"] == 2
+
+
+def test_gmail_message_trace_rejects_malformed_message_id(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    # Embedded whitespace could smuggle Gmail search syntax (e.g. "OR",
+    # "from:...") into the rfc822msgid query -- rejected before any recipient
+    # is even looked at.
+    out = server.gmail_message_trace("abc@agent.example OR from:me", "user@example.edu")
+    assert "error" in out
+    assert "not a valid" in out["error"]
+    assert c.gmail_calls == []
 
 
 def test_gmail_message_trace_folder_classification():
@@ -342,6 +372,14 @@ def test_gmail_message_trace_rejects_empty_recipients(inject):
 def test_gmail_message_trace_parses_comma_and_whitespace_and_dedupes():
     addrs = server._parse_recipients("a@example.edu, b@example.edu\n a@example.edu\tc@example.edu")
     assert addrs == ["a@example.edu", "b@example.edu", "c@example.edu"]
+
+
+def test_gmail_message_trace_dedupes_recipients_case_insensitively():
+    # Gmail treats an address's casing as insignificant; a caller pasting a
+    # mixed-case duplicate must not double the per-recipient API work or
+    # inflate recipients_checked/found/not_found for what is one mailbox.
+    addrs = server._parse_recipients("User@Example.com, user@example.com")
+    assert addrs == ["User@Example.com"]  # first-seen casing kept
 
 
 def test_gmail_message_trace_routes_mixed_domain_recipients_by_suffix(inject):

@@ -219,10 +219,24 @@ def test_find_message_by_id_found_returns_labels_and_headers():
     assert found["label_ids"] == ["INBOX", "UNREAD"]
     assert found["headers"]["Subject"] == "Hi"
     assert found["snippet"] == "hello"
+    assert found["match_count"] == 1
     # Angle brackets are stripped before being embedded in the rfc822msgid query.
     assert messages.list_calls[0]["q"] == "rfc822msgid:abc@agent.example"
     assert messages.list_calls[0]["includeSpamTrash"] is True
     assert messages.get_calls[0]["format"] == "metadata"
+
+
+def test_find_message_by_id_multiple_matches_reports_match_count():
+    # A mailing-list copy plus a direct CC (or a quarantine-release
+    # duplicate) can land two messages under one Message-ID; the first is
+    # still used for the returned fields, but match_count must say so.
+    c, messages = _gmail_client(
+        list_resp={"messages": [{"id": "m1"}, {"id": "m2"}]},
+        get_resp={"labelIds": ["INBOX"], "snippet": "", "internalDate": "1", "payload": {}},
+    )
+    found = c.find_message_by_id("user@example.edu", "x@example.edu")
+    assert found["match_count"] == 2
+    assert messages.get_calls[0]["id"] == "m1"  # first match, not the second
 
 
 def test_find_message_by_id_not_found_returns_none():
@@ -251,6 +265,22 @@ def test_find_message_by_id_get_http_error_maps_to_gws_error():
     err = HttpError(httplib2.Response({"status": "500", "reason": "boom"}), b"{}")
     c, _ = _gmail_client(list_resp={"messages": [{"id": "m1"}]}, get_resp=None, get_exc=err)
     with pytest.raises(GwsError):
+        c.find_message_by_id("user@example.edu", "x@example.edu")
+
+
+def test_find_message_by_id_get_auth_error_maps_to_gws_auth_error():
+    # A scope/subject problem can surface on the get() call just as easily as
+    # on list() (same creds/http) -- both must degrade to GwsAuthError, not
+    # let the raw GoogleAuthError escape and crash the whole batch in
+    # server.py's ThreadPoolExecutor loop.
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _gmail_client(
+        list_resp={"messages": [{"id": "m1"}]}, get_resp=None, get_exc=RefreshError("unauthorized_client")
+    )
+    with pytest.raises(GwsAuthError):
         c.find_message_by_id("user@example.edu", "x@example.edu")
 
 
@@ -298,6 +328,26 @@ def test_gmail_service_builds_once_and_caches_per_user_email(monkeypatch):
     svc3, _ = c._gmail_service("b@example.edu")
     assert svc3 is not svc1  # a different recipient gets its own service/creds
     assert len(build_calls) == 2
+
+
+def test_gmail_service_cache_evicts_oldest_once_over_cap(monkeypatch):
+    # _gmail_cache accumulates one entry per distinct recipient ever traced
+    # across this process's lifetime (not per call), so it must not grow
+    # without bound -- verify the FIFO eviction with a cap small enough to
+    # exercise cheaply.
+    monkeypatch.setattr(client, "_GMAIL_CACHE_MAX", 2)
+    monkeypatch.setattr(
+        client.service_account.Credentials, "from_service_account_file", lambda filename, **kw: object()
+    )
+    monkeypatch.setattr(client, "build", lambda *a, **kw: object())
+
+    c = DomainClient(CFG)
+    c._gmail_service("a@example.edu")
+    c._gmail_service("b@example.edu")
+    assert list(c._gmail_cache) == ["a@example.edu", "b@example.edu"]
+
+    c._gmail_service("c@example.edu")  # over cap: evicts "a" (oldest)
+    assert list(c._gmail_cache) == ["b@example.edu", "c@example.edu"]
 
 
 def test_http_error_maps_to_gws_error():

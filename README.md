@@ -193,6 +193,11 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
   classification counts for the window are a lower bound even though
   `change_document_visibility` (and thus `acl_events`) may show data.
 - A failure in one domain degrades only that domain's section (`{"error": ...}`).
+- `gmail_message_trace` sets `ambiguous: true` (with `match_count`) on a
+  recipient whose mailbox has more than one message under the same
+  Message-ID (mailing-list copy plus a direct CC, a quarantine-release
+  duplicate, …) — the rest of that recipient's fields describe only the
+  first match, not a combined answer.
 - Read-only by design: `activities().list` (Reports API), `users().list` /
   `tokens().list` (Directory API), and `messages().list` / `messages().get`
   (Gmail API, metadata only) are the only API calls issued anywhere in this

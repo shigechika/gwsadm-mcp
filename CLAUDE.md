@@ -89,11 +89,17 @@ to guard against stdio newline regressions).
   (`googleapiclient.discovery.build("gmail", "v1", ...)`) per impersonated
   *user* rather than per domain — `_gmail_cache` is keyed by the recipient's
   own email address, not `self.domain`, since the DWD `subject` varies per
-  call instead of being fixed like the Reports/Directory credential. The
-  requested scope is `gmail.readonly`, not the narrower `gmail.metadata`:
-  `metadata` does not support the `q=` search parameter `rfc822msgid:...`
-  needs, even though the tool code itself only ever requests
-  `format="metadata"` on the matched message.
+  call instead of being fixed like the Reports/Directory credential. Capped
+  at `_GMAIL_CACHE_MAX` (500) with FIFO eviction — this cache accumulates
+  one entry per distinct recipient across the process's whole lifetime, not
+  per call, unlike the other three services. `message_id` is validated
+  against `_MESSAGE_ID_RE` (server.py) before being interpolated into the
+  `rfc822msgid:` search query, the same treatment `_DOC_ID_RE` gives
+  `doc_id` in the Reports `filters` expression. The requested scope is
+  `gmail.readonly`, not the narrower `gmail.metadata`: `metadata` does not
+  support the `q=` search parameter `rfc822msgid:...` needs, even though the
+  tool code itself only ever requests `format="metadata"` on the matched
+  message.
 - `gwsadm_mcp/config.py` — `load_config()` parses the `GWSADM_CONFIG` INI
   file into `list[DomainConfig]` + the `internal_domains` allowlist;
   `ConfigError` on a missing file, missing keys, or zero `[domain.*]`

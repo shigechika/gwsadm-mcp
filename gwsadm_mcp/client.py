@@ -66,6 +66,16 @@ _HTTP_TIMEOUT = 30
 _MAX_RETRIES = 5
 _MAX_BACKOFF = 8.0
 
+# Cap on DomainClient._gmail_cache: unlike the other three services (one
+# instance for cfg.subject, alive for the DomainClient's lifetime), this
+# grows one entry per distinct recipient ever traced -- across a
+# process-lifetime singleton reused over many separate gmail_message_trace
+# calls investigating different incidents, that is otherwise unbounded.
+# Evicted in FIFO order (oldest-built entry first) once the cap is hit; a
+# re-traced recipient just rebuilds, at the cost of one extra credential
+# build -- cheap next to the API calls each trace already makes.
+_GMAIL_CACHE_MAX = 500
+
 
 def _is_retryable(e: HttpError) -> bool:
     """True for a rate-limit / transient server error worth a backoff-retry.
@@ -125,10 +135,9 @@ class DomainClient:
         # user_email -> (creds, service). Unlike the other three services,
         # which cache one instance for cfg.subject and live for the
         # DomainClient's lifetime, this grows one entry per DISTINCT
-        # recipient a caller has asked about -- unbounded in principle, but
-        # bounded in practice by MAX_RECIPIENTS in server.py's tool and by
-        # the fact that a DomainClient itself is a process-lifetime
-        # singleton reused across many tool calls, not per-call.
+        # recipient a caller has asked about, across every
+        # gmail_message_trace call the process ever handles -- capped at
+        # _GMAIL_CACHE_MAX with FIFO eviction (see _gmail_service).
         self._gmail_cache: dict[str, tuple] = {}
         # Guards the lazy build so concurrent fetch_activities() calls (the
         # parallel daily_brief) build the service/credentials at most once.
@@ -220,6 +229,11 @@ class DomainClient:
             # concurrent lookups for the same recipient converge on one
             # client rather than each holding their own.
             self._gmail_cache.setdefault(user_email, (svc, creds))
+            if len(self._gmail_cache) > _GMAIL_CACHE_MAX:
+                # dict iteration order is insertion order (Python 3.7+), so
+                # the first key is the oldest entry -- plain FIFO, no access
+                # tracking needed for a cap this generous.
+                del self._gmail_cache[next(iter(self._gmail_cache))]
             return self._gmail_cache[user_email]
 
     def _new_http(self, creds=None):
@@ -414,8 +428,12 @@ class DomainClient:
         matches = resp.get("messages", [])
         if not matches:
             return None
-        # rfc822msgid is expected to be unique within one mailbox; take the
-        # first match defensively rather than assume exactly one.
+        # rfc822msgid is expected to be unique within one mailbox, but a
+        # mailing-list + direct-CC delivery or a quarantine-release copy can
+        # land two copies under the same Message-ID; take the first match
+        # defensively rather than assume exactly one, and surface the count
+        # so a caller sees when the answer is ambiguous rather than reading
+        # a single silently-picked folder as authoritative.
         gmail_id = matches[0]["id"]
         try:
             msg = self._execute(
@@ -434,6 +452,10 @@ class DomainClient:
         except HttpError as e:
             status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
             raise GwsError(f"[{self.domain}] gmail API error (messages.get, {user_email}): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Same rationale as the list() call above: a scope/subject
+            # problem can surface on either request sharing this creds/http.
+            raise GwsAuthError(f"[{self.domain}] auth failed for {user_email}: {e}") from e
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (messages.get, {user_email}): {type(e).__name__}") from e
 
@@ -444,6 +466,7 @@ class DomainClient:
             "snippet": msg.get("snippet", ""),
             "internal_date": msg.get("internalDate"),
             "headers": headers,
+            "match_count": len(matches),
         }
 
     def check(self) -> dict:
