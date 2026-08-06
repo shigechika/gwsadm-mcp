@@ -197,7 +197,9 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
   recipient whose mailbox has more than one message under the same
   Message-ID (mailing-list copy plus a direct CC, a quarantine-release
   duplicate, …) — the rest of that recipient's fields describe only the
-  first match, not a combined answer.
+  first match, not a combined answer. `match_count_capped` is set alongside
+  it when the mailbox has enough matches that `match_count` is a lower
+  bound rather than exact (the search does not paginate).
 - Read-only by design: `activities().list` (Reports API), `users().list` /
   `tokens().list` (Directory API), and `messages().list` / `messages().get`
   (Gmail API, metadata only) are the only API calls issued anywhere in this

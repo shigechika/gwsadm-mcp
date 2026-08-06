@@ -190,7 +190,9 @@ gwsadm-mcp             # MCP サーバを起動（STDIO、既定）
 - `gmail_message_trace` は、同じ Message-ID を持つメッセージが宛先メールボックス内に
   複数存在する場合（メーリングリスト経由＋直接CC、隔離解放時の重複など）、
   `ambiguous: true`（`match_count` 付き）を返す — その他のフィールドは最初の1件
-  だけを表しており、複数件を統合した答えではない点に注意。
+  だけを表しており、複数件を統合した答えではない点に注意。検索はページングしないため、
+  一定件数以上マッチした場合は `match_count` が正確な件数ではなく下限値であることを示す
+  `match_count_capped` も併せて立つ。
 - 設計上 read-only — このパッケージが発行する API 呼び出しは `activities().list`
   （Reports API）、`users().list` / `tokens().list`（Directory API）、
   `messages().list` / `messages().get`（Gmail API、メタデータのみ）に限られる。

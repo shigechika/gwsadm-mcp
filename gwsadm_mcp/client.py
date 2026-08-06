@@ -76,6 +76,14 @@ _MAX_BACKOFF = 8.0
 # build -- cheap next to the API calls each trace already makes.
 _GMAIL_CACHE_MAX = 500
 
+# messages().list page size for a Message-ID search. rfc822msgid is expected
+# to return at most a small handful of matches even in the ambiguous case
+# (see find_message_by_id), so this is a safety bound, not a real page size
+# -- but it means a mailbox with MORE matches than this reports match_count
+# capped at this number rather than the true count; find_message_by_id sets
+# match_count_capped in that case rather than presenting the count as exact.
+_MESSAGE_LIST_MAX_RESULTS = 5
+
 
 def _is_retryable(e: HttpError) -> bool:
     """True for a rate-limit / transient server error worth a backoff-retry.
@@ -404,8 +412,12 @@ class DomainClient:
         those from here). Otherwise a dict with ``label_ids`` (raw Gmail
         labels — check for ``"SPAM"``/``"TRASH"``/``"INBOX"`` to classify
         where it landed), ``thread_id``, ``snippet``, ``internal_date``
-        (epoch ms, when Gmail received it), and ``headers`` (From/To/Cc/
-        Subject/Date/Message-ID, flattened to a dict).
+        (epoch ms, when Gmail received it), ``headers`` (From/To/Cc/
+        Subject/Date/Message-ID, flattened to a dict), ``match_count`` (see
+        the mailing-list/direct-CC note above), and ``match_count_capped``
+        (true when this mailbox has ``_MESSAGE_LIST_MAX_RESULTS`` or more
+        matches — ``match_count`` is a lower bound in that case, not exact,
+        since this call does not paginate).
         """
         stripped = message_id.strip().strip("<>")
         query = f"rfc822msgid:{stripped}"
@@ -413,7 +425,11 @@ class DomainClient:
             svc, creds = self._gmail_service(user_email)
             http = self._new_http(creds)
             resp = self._execute(
-                lambda: svc.users().messages().list(userId="me", q=query, includeSpamTrash=True, maxResults=5),
+                lambda: (
+                    svc.users()
+                    .messages()
+                    .list(userId="me", q=query, includeSpamTrash=True, maxResults=_MESSAGE_LIST_MAX_RESULTS)
+                ),
                 http,
             )
         except HttpError as e:
@@ -467,6 +483,10 @@ class DomainClient:
             "internal_date": msg.get("internalDate"),
             "headers": headers,
             "match_count": len(matches),
+            # True when the list() page was full at _MESSAGE_LIST_MAX_RESULTS
+            # -- there may be more matches than match_count says, since this
+            # call does not paginate.
+            "match_count_capped": len(matches) >= _MESSAGE_LIST_MAX_RESULTS,
         }
 
     def check(self) -> dict:

@@ -290,6 +290,7 @@ def test_gmail_message_trace_mixed_found_not_found_error(inject):
         "internal_date": "1783000000000",
         "snippet": "hello",
         "match_count": 1,
+        "match_count_capped": False,
     }
     from gwsadm_mcp.client import GwsAuthError
 
@@ -323,6 +324,7 @@ def test_gmail_message_trace_flags_ambiguous_multi_match(inject):
         "internal_date": "1",
         "snippet": "",
         "match_count": 2,
+        "match_count_capped": False,
     }
     c = FakeDomainClient("example.edu", {}, gmail_messages={"hit@example.edu": found})
     inject([c], {"example.edu"})
@@ -330,6 +332,24 @@ def test_gmail_message_trace_flags_ambiguous_multi_match(inject):
     result = out["results"]["hit@example.edu"]
     assert result["ambiguous"] is True
     assert result["match_count"] == 2
+    assert "match_count_capped" not in result
+
+
+def test_gmail_message_trace_flags_match_count_capped(inject):
+    found = {
+        "label_ids": ["INBOX"],
+        "headers": {},
+        "internal_date": "1",
+        "snippet": "",
+        "match_count": 5,
+        "match_count_capped": True,
+    }
+    c = FakeDomainClient("example.edu", {}, gmail_messages={"hit@example.edu": found})
+    inject([c], {"example.edu"})
+    out = server.gmail_message_trace("abc@agent.smp.ne.jp", "hit@example.edu")
+    result = out["results"]["hit@example.edu"]
+    assert result["ambiguous"] is True
+    assert result["match_count_capped"] is True
 
 
 def test_gmail_message_trace_rejects_malformed_message_id(inject):
@@ -342,6 +362,19 @@ def test_gmail_message_trace_rejects_malformed_message_id(inject):
     assert "error" in out
     assert "not a valid" in out["error"]
     assert c.gmail_calls == []
+
+
+def test_gmail_message_trace_accepts_legitimate_atext_characters(inject):
+    # RFC 5322 dot-atom-text allows "!#$%&'*+-/=?^_`{|}~" in a Message-ID's
+    # local part, not just alnum/dot/underscore/percent/plus/hyphen -- a
+    # real id using them (e.g. "/" and "=") must not be rejected as
+    # malformed.
+    c = FakeDomainClient("example.edu", {}, gmail_messages={"user@example.edu": None})
+    inject([c], {"example.edu"})
+    out = server.gmail_message_trace("<abc/def=123@example.edu>", "user@example.edu")
+    assert "error" not in out
+    assert out["message_id"] == "abc/def=123@example.edu"
+    assert c.gmail_calls == [("user@example.edu", "abc/def=123@example.edu")]
 
 
 def test_gmail_message_trace_folder_classification():
