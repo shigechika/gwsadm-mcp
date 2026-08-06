@@ -4,6 +4,7 @@ import httplib2
 import pytest
 from googleapiclient.errors import HttpError
 
+import gwsadm_mcp.client as client
 from gwsadm_mcp.client import DomainClient, GwsError, event_parameters
 from gwsadm_mcp.config import DomainConfig
 
@@ -253,8 +254,12 @@ def test_find_message_by_id_get_http_error_maps_to_gws_error():
         c.find_message_by_id("user@example.edu", "x@example.edu")
 
 
-def test_gmail_service_cached_per_user_email():
-    """Two lookups for the same recipient must not rebuild credentials twice."""
+def test_gmail_service_factory_injection_is_not_itself_cached():
+    """The factory-injection path (tests only) calls the factory every time --
+    it is a deliberate bypass of ``_gmail_cache``, not a caching mechanism, so
+    a test factory can hand back per-call fakes. Real per-user_email caching
+    lives in the non-injected path and is covered by
+    ``test_gmail_service_builds_once_and_caches_per_user_email`` below."""
     calls = []
 
     def factory(user_email):
@@ -264,13 +269,35 @@ def test_gmail_service_cached_per_user_email():
     c = DomainClient(CFG, gmail_service_factory=factory)
     c.find_message_by_id("a@example.edu", "x")
     c.find_message_by_id("a@example.edu", "y")
-    # The factory-injection path (tests only) is intentionally NOT cached --
-    # only the real credential-building path caches by user_email, since a
-    # test factory is cheap and callers may want per-call fakes. Real caching
-    # is exercised by the fact this constructs new FakeGmailService objects
-    # each time without error, i.e. the client tolerates a factory that does
-    # not memoize on its own.
     assert calls == ["a@example.edu", "a@example.edu"]
+
+
+def test_gmail_service_builds_once_and_caches_per_user_email(monkeypatch):
+    """The real (non-factory) path must build credentials/service once per
+    user_email and reuse them on a later call for the same recipient, while a
+    different recipient gets its own entry."""
+    build_calls = []
+
+    def fake_from_service_account_file(filename, **kwargs):
+        return ("creds", filename, kwargs.get("subject"))
+
+    def fake_build(service_name, version, credentials=None, cache_discovery=None):
+        build_calls.append((service_name, version, credentials))
+        return object()
+
+    monkeypatch.setattr(client.service_account.Credentials, "from_service_account_file", fake_from_service_account_file)
+    monkeypatch.setattr(client, "build", fake_build)
+
+    c = DomainClient(CFG)
+    svc1, creds1 = c._gmail_service("a@example.edu")
+    svc2, creds2 = c._gmail_service("a@example.edu")
+    assert svc1 is svc2  # second call for the same user reused the cache entry
+    assert creds1 == creds2
+    assert len(build_calls) == 1
+
+    svc3, _ = c._gmail_service("b@example.edu")
+    assert svc3 is not svc1  # a different recipient gets its own service/creds
+    assert len(build_calls) == 2
 
 
 def test_http_error_maps_to_gws_error():

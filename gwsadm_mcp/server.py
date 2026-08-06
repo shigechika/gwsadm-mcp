@@ -606,11 +606,11 @@ def gmail_message_trace(message_id: str, recipients: str, domain: str | None = N
         "not_found": not_found_n,
         "errors": error_n,
         # Keyed by the recipient address as given, in the de-duplicated
-        # input order -- results dict itself is insertion-order-stable but
-        # ThreadPoolExecutor completion order is not, so callers relying on
-        # "same order as input" should read this key rather than dict
-        # iteration order alone (kept stable here for convenience, not
-        # guaranteed by the language).
+        # input order -- this dict comprehension re-inserts in that order,
+        # which Python 3.7+ dict iteration preserves. ThreadPoolExecutor
+        # completion order (the order `results` above was actually built in)
+        # is NOT deterministic, so this re-keying is what guarantees "same
+        # order as input" rather than incidental luck.
         "results": {addr: results[addr] for addr in addrs},
     }
 
