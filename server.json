@@ -7,12 +7,12 @@
     "url": "https://github.com/shigechika/gwsadm-mcp",
     "source": "github"
   },
-  "version": "0.9.3",
+  "version": "0.9.4",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "gwsadm-mcp",
-      "version": "0.9.3",
+      "version": "0.9.4",
       "transport": {
         "type": "stdio"
       }
