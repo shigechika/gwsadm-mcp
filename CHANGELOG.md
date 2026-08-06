@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.4...v0.10.0) (2026-08-06)
+
+
+### Features
+
+* add gmail_message_trace tool ([#54](https://github.com/shigechika/gwsadm-mcp/issues/54)) ([5c1bef7](https://github.com/shigechika/gwsadm-mcp/commit/5c1bef7cf296e142778192d80c41486962c6d924))
+
 ## [0.9.4](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.3...v0.9.4) (2026-08-06)
 
 
