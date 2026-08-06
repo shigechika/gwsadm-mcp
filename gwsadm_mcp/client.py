@@ -79,9 +79,11 @@ _GMAIL_CACHE_MAX = 500
 # messages().list page size for a Message-ID search. rfc822msgid is expected
 # to return at most a small handful of matches even in the ambiguous case
 # (see find_message_by_id), so this is a safety bound, not a real page size
-# -- but it means a mailbox with MORE matches than this reports match_count
-# capped at this number rather than the true count; find_message_by_id sets
-# match_count_capped in that case rather than presenting the count as exact.
+# -- but it means a mailbox with MORE matches than this only returns a
+# partial page, since this call does not paginate. find_message_by_id
+# detects that from Gmail's own "nextPageToken" (NOT from
+# len(matches) >= this constant, which is also true of a mailbox with
+# EXACTLY this many matches and nothing more) and sets match_count_capped.
 _MESSAGE_LIST_MAX_RESULTS = 5
 
 
@@ -415,9 +417,9 @@ class DomainClient:
         (epoch ms, when Gmail received it), ``headers`` (From/To/Cc/
         Subject/Date/Message-ID, flattened to a dict), ``match_count`` (see
         the mailing-list/direct-CC note above), and ``match_count_capped``
-        (true when this mailbox has ``_MESSAGE_LIST_MAX_RESULTS`` or more
-        matches — ``match_count`` is a lower bound in that case, not exact,
-        since this call does not paginate).
+        (true when Gmail's own ``nextPageToken`` says more matches exist
+        beyond this page — ``match_count`` is a lower bound in that case,
+        not exact, since this call does not paginate).
         """
         stripped = message_id.strip().strip("<>")
         query = f"rfc822msgid:{stripped}"
@@ -483,10 +485,14 @@ class DomainClient:
             "internal_date": msg.get("internalDate"),
             "headers": headers,
             "match_count": len(matches),
-            # True when the list() page was full at _MESSAGE_LIST_MAX_RESULTS
-            # -- there may be more matches than match_count says, since this
-            # call does not paginate.
-            "match_count_capped": len(matches) >= _MESSAGE_LIST_MAX_RESULTS,
+            # A "nextPageToken" in the response is Gmail's own signal that
+            # more results exist beyond this page -- NOT len(matches) >=
+            # _MESSAGE_LIST_MAX_RESULTS, which is also true, wrongly, of a
+            # mailbox with EXACTLY that many matches and nothing more (that
+            # response omits nextPageToken). This call does not paginate, so
+            # when the token is present match_count is a lower bound, not
+            # the true count.
+            "match_count_capped": bool(resp.get("nextPageToken")),
         }
 
     def check(self) -> dict:

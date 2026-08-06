@@ -240,20 +240,33 @@ def test_find_message_by_id_multiple_matches_reports_match_count():
     assert messages.get_calls[0]["id"] == "m1"  # first match, not the second
 
 
-def test_find_message_by_id_reports_capped_when_page_is_full():
-    # messages().list does not paginate, so a mailbox with
-    # _MESSAGE_LIST_MAX_RESULTS or more matches only ever returns a full
-    # page -- match_count must say it's a lower bound, not present it as
-    # the true count.
+def test_find_message_by_id_reports_capped_when_more_pages_exist():
+    # A "nextPageToken" is Gmail's own signal that more matches exist beyond
+    # this page -- the ONLY correct source for match_count_capped, since
+    # this call does not paginate to find out itself.
     full_page = [{"id": f"m{i}"} for i in range(client._MESSAGE_LIST_MAX_RESULTS)]
     c, messages = _gmail_client(
-        list_resp={"messages": full_page},
+        list_resp={"messages": full_page, "nextPageToken": "more"},
         get_resp={"labelIds": ["INBOX"], "snippet": "", "internalDate": "1", "payload": {}},
     )
     found = c.find_message_by_id("user@example.edu", "x@example.edu")
     assert found["match_count"] == client._MESSAGE_LIST_MAX_RESULTS
     assert found["match_count_capped"] is True
     assert messages.list_calls[0]["maxResults"] == client._MESSAGE_LIST_MAX_RESULTS
+
+
+def test_find_message_by_id_not_capped_when_page_full_but_no_more_pages():
+    # A mailbox with EXACTLY _MESSAGE_LIST_MAX_RESULTS matches and nothing
+    # more also fills the page, but Gmail omits nextPageToken in that case --
+    # match_count here IS the true count and must not be flagged as capped.
+    full_page = [{"id": f"m{i}"} for i in range(client._MESSAGE_LIST_MAX_RESULTS)]
+    c, _ = _gmail_client(
+        list_resp={"messages": full_page},
+        get_resp={"labelIds": ["INBOX"], "snippet": "", "internalDate": "1", "payload": {}},
+    )
+    found = c.find_message_by_id("user@example.edu", "x@example.edu")
+    assert found["match_count"] == client._MESSAGE_LIST_MAX_RESULTS
+    assert found["match_count_capped"] is False
 
 
 def test_find_message_by_id_not_found_returns_none():
