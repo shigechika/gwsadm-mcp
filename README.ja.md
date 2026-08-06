@@ -23,6 +23,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `drive_external_sharing` | Reports API `drive` — 外部アドレス/ドメインへの ACL **付与**（取り消しは別集計）、リンク公開/一般公開への可視性**遷移** |
 | `drive_doc_activity` | Reports API `drive` をサーバー側 `doc_id` フィルタで — **特定1文書**の所有者・ACL 変更・ライフサイクル履歴。`drive_external_sharing` の検知トリアージ用： 所有者（個人か共有ドライブ名か）で「共有ドライブ内のファイル作成が既存メンバーへの ACL 伝播として一括外部共有に見える」誤検知クラスを切り分ける |
 | `shared_drive_membership_changes` | Reports API `drive`（`shared_drive_membership_change`）— 共有ドライブのメンバー追加/削除/ロール変更の履歴。対象メンバーの外部判定と、クライアント側ドライブ名フィルタ付き |
+| `gmail_message_trace` | Gmail API — **既知の** Message-ID が**特定の**メールボックスに届いたか、届いたならどこに入っているか（受信トレイ/迷惑メール/ゴミ箱/アーカイブ）を確認する。宛先ごとに DWD でそのユーザーになりすまし、本人のメールボックスを検索する。別付与の `gmail.readonly` DWD スコープが必要（下記「認証方式」参照）。未付与のドメインは宛先ごとのエラーとして報告され、誤って「届いていない」扱いにはならない |
 | `daily_brief` | 設定済み全ドメインを横断した一括サマリ |
 | `daily_brief_start` / `daily_brief_result` | `daily_brief` をバックグラウンド実行： `start` が即座に `job_id` を返し、`result(job_id)` を `done` になるまでポーリングする。同期呼び出しがクライアントの ~60秒 tool-call タイムアウトに掛かる大規模テナント向け |
 
@@ -47,6 +48,23 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 
 `health_check` はスコープが一切無くても応答する。グラント漏れが疑われるときこそ呼ぶツールで、
 自身が失敗する代わりにドメインごとの認証失敗を構造化された結果として報告する。
+
+`gmail_message_trace` にはもう1つスコープが要るが、これは意図的に上のまとめ付与とは
+**別立て**にしてある:
+
+| スコープ | 必要とするツール | 未付与の場合 |
+|------|------|------|
+| `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace` | そのツールだけ宛先ごとのエラーに縮退。他は動作を続ける |
+
+これは上の3つより明らかに広い付与である： サービスアカウントがなりすませる
+どのユーザーについても、メタデータだけでなく**メッセージ本文**まで読める権限になる。
+ツールのコード自体は常に `format="metadata"` しか要求せず本文は一切読まないが、
+その制約はグラント自体には効かない。より狭い `gmail.metadata` スコープも検討したが、
+`rfc822msgid:` 検索に必要な `q=` パラメータをこのスコープはサポートしないため採用しなかった。
+他のスコープと**同じ**サービスアカウントのクライアント ID に付与すること
+（管理コンソール → セキュリティ → API の制御 → ドメイン全体の委任 → 既存のクライアント ID を
+探す → このスコープをリストに追加）。実際にどこまでメッセージトレースが必要かと、
+この広い露出とを天秤にかけたうえで、ドメインごとに付与するかどうかを判断すること。
 
 `suspended_accounts` と `user_oauth_tokens` はどちらも Reports 系ツール（顧客テナント全体）と異なり、
 設定済みドメイン単位で動作する（Directory の `domain=`/`userKey=`）。突合したいドメイン
@@ -169,9 +187,13 @@ gwsadm-mcp             # MCP サーバを起動（STDIO、既定）
   `acl_events` — にはデータが出ていても）。
 - 1ドメインでの失敗は、そのドメインのセクションのみを縮退させる
   （`{"error": ...}`）。
-- 設計上 read-only — 発行する API 呼び出しは `activities().list` のみ。
+- 設計上 read-only — このパッケージが発行する API 呼び出しは `activities().list`
+  （Reports API）、`users().list` / `tokens().list`（Directory API）、
+  `messages().list` / `messages().get`（Gmail API、メタデータのみ）に限られる。
 - 出力にはアカウントアドレスが含まれる（監査ツールの目的上当然） —
-  権限のあるセキュリティ担当者にアクセスを限定すること。
+  権限のあるセキュリティ担当者にアクセスを限定すること。`gmail_message_trace`
+  はマッチしたメッセージのスニペットとヘッダー（From/To/Cc/Subject/Date）も返す —
+  取り扱いはメールボックスの中身そのものと同等の注意で扱うこと。
 
 ## 開発
 

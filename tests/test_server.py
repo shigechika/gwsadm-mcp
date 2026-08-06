@@ -9,14 +9,20 @@ from gwsadm_mcp.client import GwsError
 
 
 class FakeDomainClient:
-    def __init__(self, domain, canned, auth="ok", suspended=None, tokens=None):
+    def __init__(self, domain, canned, auth="ok", suspended=None, tokens=None, gmail_messages=None):
         self.domain = domain
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
         self._auth = auth
         self._suspended = suspended  # (users, capped) | Exception | None
         self._tokens = tokens  # list[dict] | Exception | None
+        # gmail_messages: dict[user_email, dict | None | Exception] | Exception
+        # (a bare Exception applies to every recipient, for the "whole domain
+        # lacks the scope" case; a per-user dict lets one test cover a mixed
+        # found/not-found/error recipient list against a single client)
+        self._gmail_messages = gmail_messages
         self.calls = []
         self.token_calls = []
+        self.gmail_calls = []
 
     def fetch_activities(self, application_name, *, start, end=None, event_name=None, filters=None, max_pages=5):
         self.calls.append((application_name, event_name, max_pages, filters))
@@ -40,6 +46,17 @@ class FakeDomainClient:
         if isinstance(self._tokens, Exception):
             raise self._tokens
         return self._tokens
+
+    def find_message_by_id(self, user_email, message_id):
+        self.gmail_calls.append((user_email, message_id))
+        if self._gmail_messages is None:
+            return None
+        if isinstance(self._gmail_messages, Exception):
+            raise self._gmail_messages
+        got = self._gmail_messages.get(user_email)
+        if isinstance(got, Exception):
+            raise got
+        return got  # a dict (found) or None (not found) — caller's choice per user
 
     def check(self):
         return {"domain": self.domain, "auth": self._auth}
@@ -264,6 +281,95 @@ def test_user_oauth_tokens_rejects_internal_whitespace(inject):
     out = server.user_oauth_tokens("user@ example.edu")
     assert "not an email address" in out["error"]
     assert c.token_calls == []  # never reached the API
+
+
+def test_gmail_message_trace_mixed_found_not_found_error(inject):
+    found = {
+        "label_ids": ["INBOX", "UNREAD"],
+        "headers": {"Date": "Wed, 01 Jul 2026 00:00:00 +0900"},
+        "internal_date": "1783000000000",
+        "snippet": "hello",
+    }
+    from gwsadm_mcp.client import GwsAuthError
+
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        gmail_messages={
+            "hit@example.edu": found,
+            "miss@example.edu": None,
+            "denied@example.edu": GwsAuthError("no gmail scope"),
+        },
+    )
+    inject([c], {"example.edu"})
+    out = server.gmail_message_trace("<abc@agent.smp.ne.jp>", "hit@example.edu, miss@example.edu, denied@example.edu")
+    assert out["message_id"] == "abc@agent.smp.ne.jp"  # angle brackets stripped
+    assert out["recipients_checked"] == 3
+    assert out["found"] == 1
+    assert out["not_found"] == 1
+    assert out["errors"] == 1
+    assert out["results"]["hit@example.edu"]["folder"] == "inbox"
+    assert out["results"]["hit@example.edu"]["found"] is True
+    assert out["results"]["miss@example.edu"] == {"domain": "example.edu", "found": False}
+    assert "error" in out["results"]["denied@example.edu"]
+
+
+def test_gmail_message_trace_folder_classification():
+    trash = {"label_ids": ["TRASH"], "headers": {}, "internal_date": "1", "snippet": ""}
+    spam = {"label_ids": ["SPAM", "UNREAD"], "headers": {}, "internal_date": "1", "snippet": ""}
+    archived = {"label_ids": ["UNREAD"], "headers": {}, "internal_date": "1", "snippet": ""}
+    assert server._classify_folder(trash["label_ids"]) == "trash"
+    assert server._classify_folder(spam["label_ids"]) == "spam"
+    assert server._classify_folder(archived["label_ids"]) == "archived"
+
+
+def test_gmail_message_trace_rejects_over_limit_recipients(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    addrs = " ".join(f"u{i}@example.edu" for i in range(server.MAX_TRACE_RECIPIENTS + 1))
+    out = server.gmail_message_trace("id@example.invalid", addrs)
+    assert "error" in out
+    assert "exceeds" in out["error"]
+    assert c.gmail_calls == []  # rejected before any per-recipient work
+
+
+def test_gmail_message_trace_rejects_empty_recipients(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    out = server.gmail_message_trace("id@example.invalid", "   ")
+    assert out["error"] == "no recipients given"
+
+
+def test_gmail_message_trace_parses_comma_and_whitespace_and_dedupes():
+    addrs = server._parse_recipients("a@example.edu, b@example.edu\n a@example.edu\tc@example.edu")
+    assert addrs == ["a@example.edu", "b@example.edu", "c@example.edu"]
+
+
+def test_gmail_message_trace_routes_mixed_domain_recipients_by_suffix(inject):
+    staff = FakeDomainClient("example.edu", {}, gmail_messages={"a@example.edu": None})
+    students = FakeDomainClient("students.example.edu", {}, gmail_messages={"b@students.example.edu": None})
+    inject([staff, students], {"example.edu", "students.example.edu"})
+    out = server.gmail_message_trace("id@example.invalid", "a@example.edu b@students.example.edu")
+    assert out["results"]["a@example.edu"]["domain"] == "example.edu"
+    assert out["results"]["b@students.example.edu"]["domain"] == "students.example.edu"
+    assert staff.gmail_calls == [("a@example.edu", "id@example.invalid")]
+    assert students.gmail_calls == [("b@students.example.edu", "id@example.invalid")]
+
+
+def test_gmail_message_trace_explicit_domain_overrides_per_recipient_resolution(inject):
+    # An alias/secondary-domain recipient has no [domain.*] section of its
+    # own; the explicit domain param routes it through the configured
+    # section instead of the unresolvable suffix.
+    c = FakeDomainClient("example.edu", {}, gmail_messages={"user@alias.edu": None})
+    inject([c], {"example.edu"})
+    out = server.gmail_message_trace("id@example.invalid", "user@alias.edu", domain="example.edu")
+    assert out["results"]["user@alias.edu"] == {"domain": "example.edu", "found": False}
+
+
+def test_gmail_message_trace_unresolvable_domain_is_per_recipient_error(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    out = server.gmail_message_trace("id@example.invalid", "user@nope.example")
+    assert "error" in out["results"]["user@nope.example"]
+    assert out["errors"] == 1
 
 
 def test_select_normalizes_case_and_whitespace(inject):

@@ -9,13 +9,17 @@ Exposes `login_audit` (Google-side account locks, suspicious logins),
 `drive_external_sharing` (ACL grants to external targets, new link/public
 exposure), `drive_doc_activity` (one document's owner + ACL/lifecycle
 history via a server-side `doc_id` filter), `shared_drive_membership_changes`
-(shared-drive member add/remove/role history), and a `daily_brief` combining
-the Reports-based tools, to AI
-assistants via STDIO transport, built on the official `mcp` Python SDK's
-`FastMCP`. Read-only: the only Admin SDK methods called anywhere in this
-package are `activities().list` (Reports API), `users().list` (Directory
-API, for `suspended_accounts`), and `tokens().list` (Directory API, for
-`user_oauth_tokens`) — all read-only; no mutating call exists.
+(shared-drive member add/remove/role history), `gmail_message_trace` (did a
+known Message-ID reach specific mailboxes, and where — Gmail API, requires
+the separate `gmail.readonly` DWD scope, see its docstring), and a
+`daily_brief` combining the Reports-based tools, to AI assistants via STDIO
+transport, built on the official `mcp` Python SDK's `FastMCP`. Read-only:
+the only Admin SDK / Gmail API methods called anywhere in this package are
+`activities().list` (Reports API), `users().list` (Directory API, for
+`suspended_accounts`), `tokens().list` (Directory API, for
+`user_oauth_tokens`), and `messages().list` / `messages().get` (Gmail API,
+`format="metadata"` only, for `gmail_message_trace`) — all read-only; no
+mutating call exists.
 The underlying `googleapiclient.discovery.build()` setup call also fetches
 Google's discovery document over HTTP, separately from this guarantee.
 
@@ -37,9 +41,17 @@ to guard against stdio newline regressions).
 - `gwsadm_mcp/server.py` — FastMCP server with `health_check`,
   `login_audit`, `suspended_accounts`, `user_oauth_tokens`,
   `drive_external_sharing`, `drive_doc_activity`,
-  `shared_drive_membership_changes`, `daily_brief`, and the background
-  pair `daily_brief_start` / `daily_brief_result` (plus an env-gated
-  `timeout_probe` diagnostic). Holds a module-level `_state` cache
+  `shared_drive_membership_changes`, `gmail_message_trace`, `daily_brief`,
+  and the background pair `daily_brief_start` / `daily_brief_result` (plus
+  an env-gated `timeout_probe` diagnostic). `gmail_message_trace` fans its
+  per-recipient `DomainClient.find_message_by_id` calls across a
+  `ThreadPoolExecutor` (same `_max_workers()` bound as the Reports tools)
+  and resolves each recipient's `[domain.*]` client from its own address
+  suffix (`_domain_of` + `_select`) unless an explicit `domain` override is
+  given — so one call can cover a mixed staff/student recipient list, and
+  one recipient's unresolvable domain or missing DWD scope surfaces as that
+  recipient's own `error`, not a whole-call failure. Holds a module-level
+  `_state` cache
   (`{"clients": ..., "internal": ...}`) built lazily on first tool call by
   `_clients()`, so `load_config()` runs once per process, not per call.
   Every audit tool fans its `(domain × eventName)` Reports-API fetches out
@@ -73,6 +85,15 @@ to guard against stdio newline regressions).
   rate/quota reason (a permission 403 is permanent) — up to `_MAX_RETRIES`
   (5) with full-jitter backoff so simultaneously-throttled parallel fetches
   don't retry in lockstep.
+  `DomainClient` also builds a separate Gmail API service
+  (`googleapiclient.discovery.build("gmail", "v1", ...)`) per impersonated
+  *user* rather than per domain — `_gmail_cache` is keyed by the recipient's
+  own email address, not `self.domain`, since the DWD `subject` varies per
+  call instead of being fixed like the Reports/Directory credential. The
+  requested scope is `gmail.readonly`, not the narrower `gmail.metadata`:
+  `metadata` does not support the `q=` search parameter `rfc822msgid:...`
+  needs, even though the tool code itself only ever requests
+  `format="metadata"` on the matched message.
 - `gwsadm_mcp/config.py` — `load_config()` parses the `GWSADM_CONFIG` INI
   file into `list[DomainConfig]` + the `internal_domains` allowlist;
   `ConfigError` on a missing file, missing keys, or zero `[domain.*]`

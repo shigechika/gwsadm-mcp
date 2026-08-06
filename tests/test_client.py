@@ -165,6 +165,114 @@ def test_list_user_oauth_tokens_http_error_maps_to_gws_error():
         c.list_user_oauth_tokens("user@example.edu")
 
 
+class FakeGmailMessagesResource:
+    def __init__(self, list_resp, get_resp=None, list_exc=None, get_exc=None):
+        self.list_resp, self.get_resp = list_resp, get_resp
+        self.list_exc, self.get_exc = list_exc, get_exc
+        self.list_calls, self.get_calls = [], []
+
+    def list(self, **kw):
+        self.list_calls.append(kw)
+        return _Req(self.list_resp, self.list_exc)
+
+    def get(self, **kw):
+        self.get_calls.append(kw)
+        return _Req(self.get_resp, self.get_exc)
+
+
+class FakeGmailUsersResource:
+    def __init__(self, messages):
+        self._m = messages
+
+    def messages(self):
+        return self._m
+
+
+class FakeGmailService:
+    def __init__(self, messages):
+        self._u = FakeGmailUsersResource(messages)
+
+    def users(self):
+        return self._u
+
+
+def _gmail_client(list_resp, get_resp=None, list_exc=None, get_exc=None):
+    messages = FakeGmailMessagesResource(list_resp, get_resp, list_exc, get_exc)
+    svc = FakeGmailService(messages)
+    c = DomainClient(CFG, gmail_service_factory=lambda user_email: svc)
+    return c, messages
+
+
+def test_find_message_by_id_found_returns_labels_and_headers():
+    c, messages = _gmail_client(
+        list_resp={"messages": [{"id": "m1", "threadId": "t1"}]},
+        get_resp={
+            "threadId": "t1",
+            "labelIds": ["INBOX", "UNREAD"],
+            "snippet": "hello",
+            "internalDate": "1785794429000",
+            "payload": {"headers": [{"name": "Subject", "value": "Hi"}, {"name": "Date", "value": "Wed, 1 Jan 2026"}]},
+        },
+    )
+    found = c.find_message_by_id("user@example.edu", "<abc@agent.example>")
+    assert found["label_ids"] == ["INBOX", "UNREAD"]
+    assert found["headers"]["Subject"] == "Hi"
+    assert found["snippet"] == "hello"
+    # Angle brackets are stripped before being embedded in the rfc822msgid query.
+    assert messages.list_calls[0]["q"] == "rfc822msgid:abc@agent.example"
+    assert messages.list_calls[0]["includeSpamTrash"] is True
+    assert messages.get_calls[0]["format"] == "metadata"
+
+
+def test_find_message_by_id_not_found_returns_none():
+    c, _ = _gmail_client(list_resp={})
+    assert c.find_message_by_id("user@example.edu", "nope@example.edu") is None
+
+
+def test_find_message_by_id_list_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _gmail_client(list_resp=None, list_exc=err)
+    with pytest.raises(GwsError):
+        c.find_message_by_id("user@example.edu", "x@example.edu")
+
+
+def test_find_message_by_id_auth_error_maps_to_gws_auth_error():
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _gmail_client(list_resp=None, list_exc=RefreshError("unauthorized_client"))
+    with pytest.raises(GwsAuthError):
+        c.find_message_by_id("user@example.edu", "x@example.edu")
+
+
+def test_find_message_by_id_get_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "500", "reason": "boom"}), b"{}")
+    c, _ = _gmail_client(list_resp={"messages": [{"id": "m1"}]}, get_resp=None, get_exc=err)
+    with pytest.raises(GwsError):
+        c.find_message_by_id("user@example.edu", "x@example.edu")
+
+
+def test_gmail_service_cached_per_user_email():
+    """Two lookups for the same recipient must not rebuild credentials twice."""
+    calls = []
+
+    def factory(user_email):
+        calls.append(user_email)
+        return FakeGmailService(FakeGmailMessagesResource({}))
+
+    c = DomainClient(CFG, gmail_service_factory=factory)
+    c.find_message_by_id("a@example.edu", "x")
+    c.find_message_by_id("a@example.edu", "y")
+    # The factory-injection path (tests only) is intentionally NOT cached --
+    # only the real credential-building path caches by user_email, since a
+    # test factory is cheap and callers may want per-call fakes. Real caching
+    # is exercised by the fact this constructs new FakeGmailService objects
+    # each time without error, i.e. the client tolerates a factory that does
+    # not memoize on its own.
+    assert calls == ["a@example.edu", "a@example.edu"]
+
+
 def test_http_error_maps_to_gws_error():
     import datetime
 

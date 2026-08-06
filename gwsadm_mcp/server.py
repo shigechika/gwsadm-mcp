@@ -6,6 +6,8 @@ Phase 1 tools:
 - ``login_audit``             — Google-side auto-disabled accounts, suspicious logins, failure top-N
 - ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
 - ``user_oauth_tokens``       — third-party OAuth app grants for one user (Directory API)
+- ``gmail_message_trace``     — did a known Message-ID reach specific mailboxes, and where
+  (Gmail API; requires the separate ``gmail.readonly`` DWD scope — see its docstring)
 - ``drive_external_sharing``  — Drive ACL grants to external targets and new link/public exposure
 - ``drive_doc_activity``      — one document's owner + ACL/lifecycle history (finding triage)
 - ``shared_drive_membership_changes`` — who added/removed shared-drive members, and when
@@ -477,6 +479,139 @@ def user_oauth_tokens(username: str, domain: str | None = None) -> dict:
         "username": username,
         "count": len(tokens),
         "tokens": [_token_entry(t) for t in tokens],
+    }
+
+
+# gmail_message_trace: hard cap on recipients per call. This is a per-recipient
+# DWD-impersonated Gmail search (2 API calls each), not a bulk/paged listing, so
+# there is no natural "capped" partial-result concept the way the Reports-based
+# tools have -- a caller asking about more recipients than this either splits the
+# request or is handed a clear error, never a silently truncated list.
+MAX_TRACE_RECIPIENTS = 50
+
+
+def _parse_recipients(raw: str) -> list[str]:
+    """Split a comma/whitespace-separated recipient list, de-duplicated, order preserved."""
+    parts = re.split(r"[,\s]+", raw.strip())
+    seen: dict[str, None] = {}
+    for p in parts:
+        p = p.strip()
+        if p:
+            seen.setdefault(p, None)
+    return list(seen)
+
+
+def _classify_folder(label_ids: list[str]) -> str:
+    """Map Gmail's raw label set to the one-word answer an incident report wants."""
+    if "TRASH" in label_ids:
+        return "trash"
+    if "SPAM" in label_ids:
+        return "spam"
+    if "INBOX" in label_ids:
+        return "inbox"
+    return "archived"  # exists, but the user filed/archived it out of all three
+
+
+@mcp.tool()
+def gmail_message_trace(message_id: str, recipients: str, domain: str | None = None) -> dict:
+    """Check whether a message (by RFC 822 Message-ID) reached specific users' mailboxes.
+
+    Answers "who got this email and who didn't" for a KNOWN Message-ID and a
+    KNOWN candidate recipient list — there is no Workspace API to search
+    across every user for one message, so the caller supplies who to check
+    (a mailing-list roster, or simply the people who reported a problem).
+    For each recipient this impersonates that exact user via domain-wide
+    delegation and searches their own mailbox (including Spam and Trash) for
+    the Message-ID.
+
+    Requires the ``gmail.readonly`` DWD scope — granted PER SERVICE ACCOUNT
+    CLIENT ID in the Admin console (Security > API controls > Domain-wide
+    delegation), separately from the ``admin.directory.*`` / ``admin.reports.*``
+    scopes the rest of this server uses, and NOT on by default. A domain
+    missing that grant reports a per-recipient ``error`` rather than a
+    silent "not found" — the two must never be confused, since "not found"
+    here can also legitimately mean the message was delivered and later
+    deleted by the user, or never delivered at all; this tool cannot tell
+    those apart, only "a match currently exists in this mailbox" from "it
+    doesn't".
+
+    Read-only: only ``messages().list`` and ``messages().get`` (metadata
+    only, never the message body) are issued against each impersonated
+    mailbox — see ``DomainClient.find_message_by_id``.
+
+    Args:
+        message_id: The RFC 822 Message-ID to search for, with or without
+            angle brackets.
+        recipients: Comma- and/or whitespace-separated exact recipient email
+            addresses to check (max 50 per call — split a larger list across
+            multiple calls rather than expecting a partial result).
+        domain: Configured ``[domain.*]`` section to route EVERY recipient
+            through. Default: resolved per-recipient from their own address
+            suffix, so one call can cover a mixed staff/student list. Set
+            this only when recipients use an alias/secondary domain with no
+            config section of its own.
+    """
+    stripped_id = message_id.strip().strip("<>")
+    addrs = _parse_recipients(recipients)
+    if not addrs:
+        return {"message_id": stripped_id, "error": "no recipients given"}
+    if len(addrs) > MAX_TRACE_RECIPIENTS:
+        return {
+            "message_id": stripped_id,
+            "error": f"{len(addrs)} recipients exceeds the {MAX_TRACE_RECIPIENTS}-per-call limit; split the list",
+        }
+
+    try:
+        clients, _ = _clients()
+    except ConfigError as e:
+        return {"message_id": stripped_id, "error": str(e)}
+
+    def _one(addr: str):
+        suffix_or_err = None
+        try:
+            suffix_or_err = _domain_of(addr)
+            picked = _select(clients, domain if domain is not None else suffix_or_err)
+        except GwsError as e:
+            return {"error": str(e)}
+        c = picked[0]
+        try:
+            found = c.find_message_by_id(addr, stripped_id)
+        except (GwsAuthError, GwsError) as e:
+            return {"domain": c.domain, "error": str(e)}
+        if found is None:
+            return {"domain": c.domain, "found": False}
+        return {
+            "domain": c.domain,
+            "found": True,
+            "folder": _classify_folder(found["label_ids"]),
+            "label_ids": found["label_ids"],
+            "date": found["headers"].get("Date"),
+            "internal_date": found["internal_date"],
+            "snippet": found["snippet"],
+        }
+
+    results: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(addrs))) as ex:
+        futs = {ex.submit(_one, addr): addr for addr in addrs}
+        for fut in concurrent.futures.as_completed(futs):
+            results[futs[fut]] = fut.result()
+
+    found_n = sum(1 for r in results.values() if r.get("found") is True)
+    not_found_n = sum(1 for r in results.values() if r.get("found") is False)
+    error_n = sum(1 for r in results.values() if "error" in r)
+    return {
+        "message_id": stripped_id,
+        "recipients_checked": len(addrs),
+        "found": found_n,
+        "not_found": not_found_n,
+        "errors": error_n,
+        # Keyed by the recipient address as given, in the de-duplicated
+        # input order -- results dict itself is insertion-order-stable but
+        # ThreadPoolExecutor completion order is not, so callers relying on
+        # "same order as input" should read this key rather than dict
+        # iteration order alone (kept stable here for convenience, not
+        # guaranteed by the language).
+        "results": {addr: results[addr] for addr in addrs},
     }
 
 
