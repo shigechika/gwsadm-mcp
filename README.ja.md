@@ -1,5 +1,3 @@
-<!-- mcp-name: io.github.shigechika/gwsadm-mcp -->
-
 # gwsadm-mcp
 
 [English](README.md) | 日本語
