@@ -30,6 +30,7 @@ auditing nothing.
 
 import asyncio
 import re
+import secrets
 from typing import Any
 
 from smoke_harness import Caller, Probe, SkipProbe
@@ -98,6 +99,23 @@ async def _some_account(call: Caller) -> dict[str, Any]:
     return {"username": address}
 
 
+async def _fake_message_and_recipient(call: Caller) -> dict[str, Any]:
+    """A syntactically valid but guaranteed-nonexistent Message-ID, paired
+    with a real account discovered at run time (reusing ``_some_account``).
+
+    This deliberately never finds a match: the point is to exercise the full
+    DWD-impersonation + Gmail-search code path (auth, the list() call, the
+    not-found return) without depending on -- or ever touching the content
+    of -- any real message. A "found" result would actually be surprising
+    here and is not what this probe checks for.
+    """
+    account = await _some_account(call)
+    return {
+        "message_id": f"smoke-test-{secrets.token_hex(16)}@example.invalid",
+        "recipients": account["username"],
+    }
+
+
 async def _finished_job(call: Caller) -> dict[str, Any]:
     """Start a brief and poll it to a terminal state for the result tool.
 
@@ -157,6 +175,19 @@ PROBES: dict[str, Probe] = {
         # still satisfies two of the required keys.
         must_not_match=NO_DOMAIN_ERROR,
         allow_empty=True,
+    ),
+    "gmail_message_trace": Probe(
+        args_factory=_fake_message_and_recipient,
+        require_keys=("message_id", "recipients_checked", "found", "not_found", "errors", "results"),
+        allow_empty=True,
+        # Deliberately no must_not_match on a per-recipient error here: the
+        # gmail.readonly DWD scope is granted separately from every other
+        # scope this server uses and may simply not be granted yet on a given
+        # tenant -- that surfaces as a per-recipient {"error": ...} inside
+        # "results", which is this tool WORKING correctly (see its
+        # docstring), not a broken probe. What must hold is the envelope
+        # shape above; a raised exception or a malformed shape still fails
+        # the probe through the harness's own checks.
     ),
     # -- Drive exposure ------------------------------------------------------
     "drive_external_sharing": Probe(

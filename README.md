@@ -24,6 +24,7 @@ anything.
 | `drive_external_sharing` | Reports API `drive` — ACL **grants** to external addresses or domains (revocations reported separately) and visibility **transitions** into link/public exposure |
 | `drive_doc_activity` | Reports API `drive` with a server-side `doc_id` filter — **one document's** owner, ACL changes, and lifecycle events. Triage companion to `drive_external_sharing`: the owner (an individual vs. a shared drive's name) disambiguates the shared-drive false-positive class, where files created inside a shared drive propagate member ACLs and read as bulk external sharing |
 | `shared_drive_membership_changes` | Reports API `drive` (`shared_drive_membership_change`) — who added/removed/re-roled shared-drive members and when, with external classification of the affected member and a client-side drive-name filter |
+| `gmail_message_trace` | Gmail API — did a **known** Message-ID reach **specific** mailboxes, and where (inbox/spam/trash/archived)? For each recipient it impersonates that user via DWD and searches their own mailbox. Requires the separate `gmail.readonly` DWD scope (see Auth model below); a domain missing that grant reports a per-recipient error, never a false "not found" |
 | `daily_brief` | One-call summary across all configured domains |
 | `daily_brief_start` / `daily_brief_result` | Same as `daily_brief`, run in the background: `start` returns a `job_id` immediately, then poll `result(job_id)` until `done`. Use on large tenants where the synchronous call risks the client's ~60s tool-call timeout |
 
@@ -50,6 +51,25 @@ degrading — one place, one pass, avoids the trap:
 `health_check` needs no scope at all to respond: it is the tool to call when
 a grant might be missing — it probes each domain and reports the failing
 auth in a structured per-domain result instead of failing itself.
+
+`gmail_message_trace` needs one more scope, granted as a **separate** step —
+it is intentionally not bundled into the pass above:
+
+| Scope | Needed by | Missing it |
+|-------|-----------|------------|
+| `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace` | that tool reports a per-recipient error; everything else keeps working |
+
+This is a materially broader grant than the three above: it allows reading
+*message content* for any user the service account impersonates, not just
+metadata. The tool code itself only ever requests `format="metadata"` — it
+never reads a message body — but the grant itself does not enforce that; the
+narrower `gmail.metadata` scope was considered and rejected because it does
+not support the `q=` search parameter the `rfc822msgid:` lookup needs. Grant
+it on the **same** service-account client ID as the other scopes (Admin
+console → Security → API controls → Domain-wide delegation → find the
+existing client ID → add this scope to its list), and weigh that broader
+exposure against how much you actually need message-trace before turning it
+on for a given domain.
 
 `suspended_accounts` and `user_oauth_tokens` both operate per configured
 domain (Directory `domain=`/`userKey=`), unlike the customer-wide Reports
@@ -173,9 +193,22 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
   classification counts for the window are a lower bound even though
   `change_document_visibility` (and thus `acl_events`) may show data.
 - A failure in one domain degrades only that domain's section (`{"error": ...}`).
-- Read-only by design; the only API call issued is `activities().list`.
+- `gmail_message_trace` sets `ambiguous: true` (with `match_count`) on a
+  recipient whose mailbox has more than one message under the same
+  Message-ID (mailing-list copy plus a direct CC, a quarantine-release
+  duplicate, …) — the rest of that recipient's fields describe only the
+  first match, not a combined answer. `match_count_capped` is set alongside
+  it when the mailbox has enough matches that `match_count` is a lower
+  bound rather than exact (the search does not paginate).
+- Read-only by design: `activities().list` (Reports API), `users().list` /
+  `tokens().list` (Directory API), and `messages().list` / `messages().get`
+  (Gmail API, metadata only) are the only API calls issued anywhere in this
+  package.
 - Output contains account addresses (that is the point of an audit tool):
-  restrict access to authorized security staff.
+  restrict access to authorized security staff. `gmail_message_trace` also
+  returns a message snippet and headers (From/To/Cc/Subject/Date) for a
+  matched message — treat its output with the same care as the mailbox
+  content it is drawn from.
 
 ## Development
 

@@ -5,9 +5,18 @@ domain-wide delegation impersonating an audit-capable admin (``subject``) —
 fully non-interactive, so the server can run unattended behind a gateway.
 
 Read-only by design: only ``activities().list`` (Admin SDK Reports API),
-``users().list`` (Directory API, for suspended-account snapshots), and
-``tokens().list`` (Directory API, for per-user OAuth app grants) are issued;
-no mutating call exists in this package.
+``users().list`` (Directory API, for suspended-account snapshots),
+``tokens().list`` (Directory API, for per-user OAuth app grants), and
+``messages().list`` / ``messages().get`` (Gmail API, for message-trace) are
+issued; no mutating call exists in this package.
+
+Gmail access is architecturally different from the other three: those
+impersonate one FIXED subject per domain (``cfg.subject``, the configured
+audit admin) and are built once and cached for the domain's whole lifetime.
+Gmail message-trace impersonates whichever RECIPIENT is being investigated —
+a different subject on every call, unknowable in advance — so its
+credentials/service are cached per user_email instead of once per domain
+(see ``_gmail_service``).
 """
 
 import datetime
@@ -36,6 +45,15 @@ SCOPE_DIRECTORY = "https://www.googleapis.com/auth/admin.directory.user.readonly
 # (e.g. suspended_accounts must keep working when only the readonly grant
 # exists). Do not merge the scope lists as a cleanup.
 SCOPE_DIRECTORY_SECURITY = "https://www.googleapis.com/auth/admin.directory.user.security"
+# gmail.readonly, not the narrower gmail.metadata: Gmail API's
+# users.messages.list rejects the `q` search parameter under gmail.metadata
+# (a documented, longstanding restriction, not an oversight here), and `q`
+# is how message-trace finds a Message-ID without listing a user's entire
+# mailbox. The tool code itself still only ever requests format="metadata"
+# on messages().get() -- never the message body -- so what is actually
+# READ stays narrow even though the DWD GRANT is broader than the other
+# three scopes in this file.
+SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.readonly"
 
 # Reports API hard limit is 1000 per page.
 PAGE_SIZE = 1000
@@ -47,6 +65,26 @@ _HTTP_TIMEOUT = 30
 # Backoff-retry budget for rate-limit / transient server errors.
 _MAX_RETRIES = 5
 _MAX_BACKOFF = 8.0
+
+# Cap on DomainClient._gmail_cache: unlike the other three services (one
+# instance for cfg.subject, alive for the DomainClient's lifetime), this
+# grows one entry per distinct recipient ever traced -- across a
+# process-lifetime singleton reused over many separate gmail_message_trace
+# calls investigating different incidents, that is otherwise unbounded.
+# Evicted in FIFO order (oldest-built entry first) once the cap is hit; a
+# re-traced recipient just rebuilds, at the cost of one extra credential
+# build -- cheap next to the API calls each trace already makes.
+_GMAIL_CACHE_MAX = 500
+
+# messages().list page size for a Message-ID search. rfc822msgid is expected
+# to return at most a small handful of matches even in the ambiguous case
+# (see find_message_by_id), so this is a safety bound, not a real page size
+# -- but it means a mailbox with MORE matches than this only returns a
+# partial page, since this call does not paginate. find_message_by_id
+# detects that from Gmail's own "nextPageToken" (NOT from
+# len(matches) >= this constant, which is also true of a mailbox with
+# EXACTLY this many matches and nothing more) and sets match_count_capped.
+_MESSAGE_LIST_MAX_RESULTS = 5
 
 
 def _is_retryable(e: HttpError) -> bool:
@@ -89,17 +127,32 @@ class DomainClient:
         reports_service=None,
         directory_service=None,
         directory_security_service=None,
+        gmail_service_factory=None,
     ):
         self.cfg = cfg
         self._reports = reports_service  # injectable for tests
         self._directory = directory_service  # injectable for tests
         self._directory_security = directory_security_service  # injectable for tests
+        # injectable for tests: callable(user_email) -> a fake Gmail service,
+        # bypassing real credential loading entirely (mirrors the *_service=
+        # params above, but per-call rather than per-domain since the real
+        # path below builds one client PER IMPERSONATED USER, not one for
+        # the whole domain).
+        self._gmail_service_factory = gmail_service_factory
         self._creds = None
         self._directory_creds = None
         self._directory_security_creds = None
+        # user_email -> (creds, service). Unlike the other three services,
+        # which cache one instance for cfg.subject and live for the
+        # DomainClient's lifetime, this grows one entry per DISTINCT
+        # recipient a caller has asked about, across every
+        # gmail_message_trace call the process ever handles -- capped at
+        # _GMAIL_CACHE_MAX with FIFO eviction (see _gmail_service).
+        self._gmail_cache: dict[str, tuple] = {}
         # Guards the lazy build so concurrent fetch_activities() calls (the
         # parallel daily_brief) build the service/credentials at most once.
         self._build_lock = threading.Lock()
+        self._gmail_cache_lock = threading.Lock()
 
     @property
     def domain(self) -> str:
@@ -156,6 +209,42 @@ class DomainClient:
                     self._directory_security_creds = creds
                     self._directory_security = build("admin", "directory_v1", credentials=creds, cache_discovery=False)
         return self._directory_security
+
+    def _gmail_service(self, user_email: str):
+        """Return (service, creds) for the Gmail API impersonating ONE user.
+
+        Cached per ``user_email`` (see the class docstring for why this
+        differs from the domain-fixed-subject services above). Building
+        credentials does not itself contact Google or prove the DWD grant
+        exists -- a bad/missing scope only surfaces once a request is
+        actually issued, same as the other *_service methods.
+        """
+        if self._gmail_service_factory is not None:
+            return self._gmail_service_factory(user_email), None
+        with self._gmail_cache_lock:
+            cached = self._gmail_cache.get(user_email)
+            if cached is not None:
+                return cached
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                self.cfg.service_account_file, scopes=[SCOPE_GMAIL], subject=user_email
+            )
+        except (OSError, ValueError) as e:
+            # See _reports_service: key path must not leak into tool output.
+            raise GwsAuthError(f"[{self.domain}] cannot load service account key ({type(e).__name__})") from e
+        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        with self._gmail_cache_lock:
+            # Another thread may have built the same user's client while this
+            # one was in flight; keep whichever landed in the cache first so
+            # concurrent lookups for the same recipient converge on one
+            # client rather than each holding their own.
+            self._gmail_cache.setdefault(user_email, (svc, creds))
+            if len(self._gmail_cache) > _GMAIL_CACHE_MAX:
+                # dict iteration order is insertion order (Python 3.7+), so
+                # the first key is the oldest entry -- plain FIFO, no access
+                # tracking needed for a cap this generous.
+                del self._gmail_cache[next(iter(self._gmail_cache))]
+            return self._gmail_cache[user_email]
 
     def _new_http(self, creds=None):
         """A fresh AuthorizedHttp per call so concurrent execute()s are thread-safe.
@@ -304,6 +393,107 @@ class DomainClient:
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (tokens.list): {type(e).__name__}") from e
         return resp.get("items", [])
+
+    def find_message_by_id(self, user_email: str, message_id: str) -> dict | None:
+        """Search one user's Gmail mailbox for an RFC 822 Message-ID.
+
+        Impersonates ``user_email`` via domain-wide delegation (NOT
+        ``cfg.subject`` — see the class docstring) and searches with
+        ``q=rfc822msgid:<id>``, including SPAM and TRASH so a message that
+        landed in either still counts as found. Requires the
+        ``gmail.readonly`` DWD scope; ``gmail.metadata`` cannot run this
+        query (Google restricts the ``q`` parameter to broader read scopes).
+
+        Read-only: only ``messages().list`` and ``messages().get`` (with
+        ``format="metadata"``, never ``"full"``/``"raw"``) are issued — the
+        message body is never requested even though the granted scope would
+        allow it.
+
+        Returns ``None`` when no match exists in this mailbox (never
+        delivered, or since deleted/expired — Gmail does not distinguish
+        those from here). Otherwise a dict with ``label_ids`` (raw Gmail
+        labels — check for ``"SPAM"``/``"TRASH"``/``"INBOX"`` to classify
+        where it landed), ``thread_id``, ``snippet``, ``internal_date``
+        (epoch ms, when Gmail received it), ``headers`` (From/To/Cc/
+        Subject/Date/Message-ID, flattened to a dict), ``match_count`` (see
+        the mailing-list/direct-CC note above), and ``match_count_capped``
+        (true when Gmail's own ``nextPageToken`` says more matches exist
+        beyond this page — ``match_count`` is a lower bound in that case,
+        not exact, since this call does not paginate).
+        """
+        stripped = message_id.strip().strip("<>")
+        query = f"rfc822msgid:{stripped}"
+        try:
+            svc, creds = self._gmail_service(user_email)
+            http = self._new_http(creds)
+            resp = self._execute(
+                lambda: (
+                    svc.users()
+                    .messages()
+                    .list(userId="me", q=query, includeSpamTrash=True, maxResults=_MESSAGE_LIST_MAX_RESULTS)
+                ),
+                http,
+            )
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] gmail API error (messages.list, {user_email}): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: gmail.readonly DWD scope not granted for this client.
+            raise GwsAuthError(f"[{self.domain}] auth failed for {user_email}: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (messages.list, {user_email}): {type(e).__name__}") from e
+
+        matches = resp.get("messages", [])
+        if not matches:
+            return None
+        # rfc822msgid is expected to be unique within one mailbox, but a
+        # mailing-list + direct-CC delivery or a quarantine-release copy can
+        # land two copies under the same Message-ID; take the first match
+        # defensively rather than assume exactly one, and surface the count
+        # so a caller sees when the answer is ambiguous rather than reading
+        # a single silently-picked folder as authoritative.
+        gmail_id = matches[0]["id"]
+        try:
+            msg = self._execute(
+                lambda: (
+                    svc.users()
+                    .messages()
+                    .get(
+                        userId="me",
+                        id=gmail_id,
+                        format="metadata",
+                        metadataHeaders=["From", "To", "Cc", "Subject", "Date", "Message-ID"],
+                    )
+                ),
+                http,
+            )
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] gmail API error (messages.get, {user_email}): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Same rationale as the list() call above: a scope/subject
+            # problem can surface on either request sharing this creds/http.
+            raise GwsAuthError(f"[{self.domain}] auth failed for {user_email}: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (messages.get, {user_email}): {type(e).__name__}") from e
+
+        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", []) if "name" in h}
+        return {
+            "label_ids": msg.get("labelIds", []),
+            "thread_id": msg.get("threadId"),
+            "snippet": msg.get("snippet", ""),
+            "internal_date": msg.get("internalDate"),
+            "headers": headers,
+            "match_count": len(matches),
+            # A "nextPageToken" in the response is Gmail's own signal that
+            # more results exist beyond this page -- NOT len(matches) >=
+            # _MESSAGE_LIST_MAX_RESULTS, which is also true, wrongly, of a
+            # mailbox with EXACTLY that many matches and nothing more (that
+            # response omits nextPageToken). This call does not paginate, so
+            # when the token is present match_count is a lower bound, not
+            # the true count.
+            "match_count_capped": bool(resp.get("nextPageToken")),
+        }
 
     def check(self) -> dict:
         """Cheap end-to-end probe: one 1-item login query (auth + API + DWD)."""
