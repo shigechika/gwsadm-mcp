@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.3...v0.9.4) (2026-08-06)
+
+
+### Bug Fixes
+
+* **deps:** ignore mcp major version updates in Dependabot ([#50](https://github.com/shigechika/gwsadm-mcp/issues/50)) ([e75ac63](https://github.com/shigechika/gwsadm-mcp/commit/e75ac63e0406649d1aea56923071aa74ba23f60d))
+
 ## [0.9.3](https://github.com/shigechika/gwsadm-mcp/compare/v0.9.2...v0.9.3) (2026-07-31)
 
 
