@@ -704,6 +704,9 @@ def test_list_group_members_confirmed_not_found_wins_over_unrelated_members_erro
     assert "group.member.readonly" in out["members_lookup_error"]
     assert "group" not in out
     assert "members" not in out
+    # Same coverage-contract marker every other incomplete-member-lookup
+    # response carries, so a caller checking one field needs no special case.
+    assert out["capped"] is True
 
 
 def test_list_group_members_group_not_found_but_members_found_is_not_top_level_not_found(inject):

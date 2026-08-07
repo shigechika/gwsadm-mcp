@@ -829,6 +829,12 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
             "group_email": group_email,
             "found": False,
             "members_lookup_error": members_err,
+            # A confirmed-nonexistent group trivially has no members, but
+            # the member-side call itself still failed to verify anything
+            # -- carry the same capped: true marker every other incomplete-
+            # coverage response uses, so a caller checking that one field
+            # doesn't need a special case for this shape.
+            "capped": True,
         }
     # From here on, group EXISTS (or its own lookup errored) but the member
     # roster could still be unusable two ways: a real error, OR an unpaired
