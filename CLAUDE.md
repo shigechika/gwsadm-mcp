@@ -11,15 +11,22 @@ exposure), `drive_doc_activity` (one document's owner + ACL/lifecycle
 history via a server-side `doc_id` filter), `shared_drive_membership_changes`
 (shared-drive member add/remove/role history), `gmail_message_trace` (did a
 known Message-ID reach specific mailboxes, and where — Gmail API, requires
-the separate `gmail.readonly` DWD scope, see its docstring), and a
-`daily_brief` combining the Reports-based tools, to AI assistants via STDIO
-transport, built on the official `mcp` Python SDK's `FastMCP`. Read-only:
-the only Admin SDK / Gmail API methods called anywhere in this package are
-`activities().list` (Reports API), `users().list` (Directory API, for
-`suspended_accounts`), `tokens().list` (Directory API, for
-`user_oauth_tokens`), and `messages().list` / `messages().get` (Gmail API,
-`format="metadata"` only, for `gmail_message_trace`) — all read-only; no
-mutating call exists.
+the separate `gmail.readonly` DWD scope, see its docstring),
+`group_delivery_policy` (a Google Group's own posting/delivery policy —
+Groups Settings API, requires the separate `apps.groups.settings` DWD
+scope), `list_group_members` (a Google Group's metadata + member roster —
+Directory API, requires the separate `admin.directory.group.readonly` and
+`admin.directory.group.member.readonly` DWD scopes), and a `daily_brief`
+combining the Reports-based tools, to AI assistants via STDIO transport,
+built on the official `mcp` Python SDK's `FastMCP`. Read-only: the only
+Admin SDK / Groups Settings / Gmail API methods called anywhere in this
+package are `activities().list` (Reports API), `users().list` (Directory
+API, for `suspended_accounts`), `tokens().list` (Directory API, for
+`user_oauth_tokens`), `groups().get` / `members().list` (Directory API, for
+`list_group_members`), `groups().get` (Groups Settings API, for
+`group_delivery_policy`), and `messages().list` / `messages().get` (Gmail
+API, `format="metadata"` only, for `gmail_message_trace`) — all read-only;
+no mutating call exists.
 The underlying `googleapiclient.discovery.build()` setup call also fetches
 Google's discovery document over HTTP, separately from this guarantee.
 
@@ -41,7 +48,8 @@ to guard against stdio newline regressions).
 - `gwsadm_mcp/server.py` — FastMCP server with `health_check`,
   `login_audit`, `suspended_accounts`, `user_oauth_tokens`,
   `drive_external_sharing`, `drive_doc_activity`,
-  `shared_drive_membership_changes`, `gmail_message_trace`, `daily_brief`,
+  `shared_drive_membership_changes`, `gmail_message_trace`,
+  `group_delivery_policy`, `list_group_members`, `daily_brief`,
   and the background pair `daily_brief_start` / `daily_brief_result` (plus
   an env-gated `timeout_probe` diagnostic). `gmail_message_trace` fans its
   per-recipient `DomainClient.find_message_by_id` calls across a
@@ -100,6 +108,35 @@ to guard against stdio newline regressions).
   support the `q=` search parameter `rfc822msgid:...` needs, even though the
   tool code itself only ever requests `format="metadata"` on the matched
   message.
+  `get_group_settings` (Groups Settings API), `get_group`, and
+  `list_group_members` (both Directory API) each build their own
+  separately-credentialed service — `_groups_settings_service`,
+  `_directory_group_service`, `_directory_group_member_service` — following
+  the same one-scope-per-service pattern as `_directory_service` vs
+  `_directory_security_service`, all impersonating the domain's fixed
+  `cfg.subject` (not a per-call recipient like Gmail). Unlike
+  `find_message_by_id`'s list-then-get (one scope, two calls sharing fate),
+  `get_group` (`groups().get()`) and `list_group_members` (paginated
+  `members().list()`, hard limit `GROUP_MEMBER_PAGE_SIZE`=200/page, distinct
+  from the 500/page `users().list()` limit) are two INDEPENDENT client
+  methods under two DIFFERENT DWD scopes — the `list_group_members` MCP tool
+  in `server.py` calls both and degrades per-section (a scope missing on
+  one side still returns the other), never letting one call's failure block
+  the other from even being attempted. All three group methods
+  (`get_group_settings`, `get_group`, `list_group_members`) map a plain
+  HTTP 404 to `None` (via `_is_not_found`) instead of raising — verified
+  live that all three underlying calls return exactly 404, never some other
+  status, for a nonexistent group — so "not a group" is a normal return
+  value distinguished from a real `GwsError`; `list_group_members`
+  additionally only treats a 404 on the FIRST page as "not found" (a later
+  page 404ing means the group was deleted mid-pagination, which stays a
+  real error). The `group_delivery_policy` / `list_group_members` MCP tools
+  surface this as `found: false`; this is also why their smoke probes
+  (`scripts/smoke_probes.py`) can safely use a synthetic nonexistent address
+  — the smoke harness treats any top-level `{"error": ...}` as an automatic
+  FAIL, which a `found: false` response never triggers. The Groups Settings API returns its
+  boolean fields as the strings `"true"` / `"false"`, not JSON booleans —
+  `_settings_bool()` normalizes that before it reaches tool output.
 - `gwsadm_mcp/config.py` — `load_config()` parses the `GWSADM_CONFIG` INI
   file into `list[DomainConfig]` + the `internal_domains` allowlist;
   `ConfigError` on a missing file, missing keys, or zero `[domain.*]`

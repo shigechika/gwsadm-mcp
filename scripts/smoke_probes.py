@@ -116,6 +116,29 @@ async def _fake_message_and_recipient(call: Caller) -> dict[str, Any]:
     }
 
 
+async def _fake_group(call: Caller) -> dict[str, Any]:
+    """A syntactically valid but guaranteed-nonexistent group address, in a
+    real configured domain discovered at run time (reusing ``_some_account``).
+
+    Mirrors ``_fake_message_and_recipient``: this deliberately never finds a
+    match, exercising the full DWD-impersonation + API code path (auth, both
+    independent group/member calls, their not-found handling) without
+    depending on -- or naming -- any real group in the tenant. This only
+    works because ``group_delivery_policy``/``list_group_members`` map a
+    plain HTTP 404 to ``found: false`` rather than a top-level ``error`` --
+    this harness's own ``evaluate()`` treats ANY top-level ``{"error": ...}``
+    as an automatic FAIL (see smoke_harness.py) before a probe's own
+    ``must_match``/``must_not_match`` ever runs, so a tool that reported
+    "not found" the same way as "the API call itself failed" could never be
+    probed this way (verified live against production: groups().get() on
+    both APIs and members().list() all return a plain 404 for a nonexistent
+    group, never something else).
+    """
+    account = await _some_account(call)
+    suffix = account["username"].rsplit("@", 1)[-1]
+    return {"group_email": f"smoke-test-{secrets.token_hex(16)}@{suffix}"}
+
+
 async def _finished_job(call: Caller) -> dict[str, Any]:
     """Start a brief and poll it to a terminal state for the result tool.
 
@@ -188,6 +211,24 @@ PROBES: dict[str, Probe] = {
         # docstring), not a broken probe. What must hold is the envelope
         # shape above; a raised exception or a malformed shape still fails
         # the probe through the harness's own checks.
+    ),
+    "group_delivery_policy": Probe(
+        args_factory=_fake_group,
+        require_keys=("domain", "group_email", "found"),
+        must_match=(r'"found": false',),
+        allow_empty=True,
+        # An "auth failed" match here would mean the top-level shape somehow
+        # still carried it despite found:false -- belt-and-braces, since the
+        # must_match above already proves no error branch was taken.
+        must_not_match=(r"auth failed",),
+    ),
+    "list_group_members": Probe(
+        args_factory=_fake_group,
+        args={"max_pages": 1},
+        require_keys=("domain", "group_email", "found"),
+        must_match=(r'"found": false',),
+        allow_empty=True,
+        must_not_match=(r"auth failed",),
     ),
     # -- Drive exposure ------------------------------------------------------
     "drive_external_sharing": Probe(

@@ -8,6 +8,12 @@ Phase 1 tools:
 - ``user_oauth_tokens``       — third-party OAuth app grants for one user (Directory API)
 - ``gmail_message_trace``     — did a known Message-ID reach specific mailboxes, and where
   (Gmail API; requires the separate ``gmail.readonly`` DWD scope — see its docstring)
+- ``group_delivery_policy``   — a Google Group's own posting/delivery policy (who_can_post,
+  allow_external_members) — why external mail silently never arrives (Groups Settings API;
+  requires the separate ``apps.groups.settings`` DWD scope — see its docstring)
+- ``list_group_members``      — a Google Group's metadata + member roster, independent of any
+  message ever sent to it (Directory API; requires the separate ``admin.directory.group.readonly``
+  and ``admin.directory.group.member.readonly`` DWD scopes — see its docstring)
 - ``drive_external_sharing``  — Drive ACL grants to external targets and new link/public exposure
 - ``drive_doc_activity``      — one document's owner + ACL/lifecycle history (finding triage)
 - ``shared_drive_membership_changes`` — who added/removed shared-drive members, and when
@@ -662,6 +668,201 @@ def gmail_message_trace(message_id: str, recipients: str, domain: str | None = N
         # is NOT deterministic, so this re-keying is what guarantees "same
         # order as input" rather than incidental luck.
         "results": {addr: results[addr] for addr in addrs},
+    }
+
+
+@mcp.tool()
+def group_delivery_policy(group_email: str, domain: str | None = None) -> dict:
+    """Check a Google Group's own posting/delivery policy — why an external sender's mail never arrived.
+
+    A Group's access-control layer sits IN FRONT of Gmail delivery: when
+    ``who_can_post`` is restricted (e.g. domain-members-only), an external
+    sender's message is rejected there and never generates a per-recipient
+    Gmail delivery event at all — ``gmail_message_trace`` (a real mailbox) and
+    any Reports-API-based delivery trace both see nothing for that address,
+    indistinguishable from a genuine delivery failure without this. Use this
+    FIRST when a group address "isn't receiving" mail from an external
+    sender, before chasing it as a transport/spam problem.
+
+    Read-only: only ``groups().get()`` is issued (Groups Settings API).
+    Requires the ``apps.groups.settings`` DWD scope — granted PER SERVICE
+    ACCOUNT CLIENT ID in the Admin console (Security > API controls >
+    Domain-wide delegation), separately from every other scope this server
+    uses, and NOT on by default.
+
+    Returns ``who_can_post`` (e.g. ``ALL_IN_DOMAIN_CAN_POST`` blocks external
+    senders entirely; ``ANYONE_CAN_POST`` allows them), ``allow_external_members``,
+    ``is_archived``, ``message_moderation_level``, ``spam_moderation_level``,
+    ``allow_web_posting``. Sets ``found: false`` (no policy fields) when
+    ``group_email`` does not name any group in this domain — that is a
+    normal, expected answer for a bad/typo'd address, not an ``error``.
+
+    Args:
+        group_email: The group's address (e.g. "team.gen@example.edu").
+        domain: Configured ``[domain.*]`` section to route the lookup through.
+            Default: resolved from the address's suffix.
+    """
+    group_email = group_email.strip()
+    try:
+        suffix = _domain_of(group_email)
+        clients, _ = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"group_email": group_email, "error": str(e)}
+    c = picked[0]
+    try:
+        policy = c.get_group_settings(group_email)
+    except (GwsAuthError, GwsError) as e:
+        return {"domain": c.domain, "group_email": group_email, "error": str(e)}
+    if policy is None:
+        return {"domain": c.domain, "group_email": group_email, "found": False}
+    return {"domain": c.domain, "group_email": group_email, "found": True, **policy}
+
+
+@mcp.tool()
+def list_group_members(group_email: str, domain: str | None = None, max_pages: int = 20) -> dict:
+    """List a Google Group's basic metadata and member roster (Directory API).
+
+    Resolves a group's actual membership directly, independent of any
+    specific message ever having been sent to it — unlike inferring
+    membership from Reports API delivery-event fanout (``applicationName=gmail``),
+    which only shows members who received one PARTICULAR message and
+    requires one to already exist to trace. Pair with ``gmail_message_trace``
+    to deep-dive a specific member's mailbox once the roster is known, or
+    with ``group_delivery_policy`` to see why the group as a whole may not be
+    receiving mail at all.
+
+    Read-only: only ``groups().get()`` and ``members().list()`` are issued
+    (Directory API), never a mutating call. Requires the
+    ``admin.directory.group.readonly`` and
+    ``admin.directory.group.member.readonly`` DWD scopes — granted PER
+    SERVICE ACCOUNT CLIENT ID in the Admin console, separately from every
+    other scope this server uses, and NOT on by default. The two calls are
+    independent: a tenant with only one of the two scopes granted still gets
+    that one section, with the other reported as ``{"error": ...}`` in its
+    place rather than failing the whole call — only when BOTH fail does the
+    tool return a single top-level ``error``.
+
+    Sets ``found: false`` (no ``group``/``members`` sections) when
+    ``group_email`` does not name any group in this domain — a normal,
+    expected answer for a bad/typo'd address, not an ``error``. This
+    triggers both when BOTH calls agree with no error on either side, AND
+    when one call CONFIRMS not-found while the other independently failed
+    (its own error is then attached as ``group_lookup_error`` /
+    ``members_lookup_error``) — a confirmed non-existence from one
+    independently-scoped call is stronger evidence than an unrelated
+    failure on the other, and must not be buried under it.
+
+    Args:
+        group_email: The group's address.
+        domain: Configured ``[domain.*]`` section to route the lookup through.
+            Default: resolved from the address's suffix.
+        max_pages: Pagination cap for the member roster (Directory API hard
+            limit 200 members per page). Default 20 (≤4,000 members) —
+            raise for an unusually large group. ``capped: true`` means the
+            roster is NOT the complete one — either more pages existed
+            beyond this, or the member lookup failed outright (see
+            ``members_error``); either way it must never be read as the
+            full membership, and an empty ``members`` list must not be
+            mistaken for a confirmed-empty group when ``capped`` is true.
+    """
+    group_email = group_email.strip()
+    try:
+        suffix = _domain_of(group_email)
+        clients, _ = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"group_email": group_email, "error": str(e)}
+    c = picked[0]
+
+    group = None
+    group_err = None
+    try:
+        group = c.get_group(group_email)  # None means "no such group", not an error
+    except (GwsAuthError, GwsError) as e:
+        group_err = str(e)
+
+    members: list = []
+    capped = False
+    members_not_found = False
+    members_err = None
+    try:
+        roster = c.list_group_members(group_email, max_pages=max_pages)
+        if roster is None:
+            members_not_found = True
+        else:
+            members, capped = roster
+    except (GwsAuthError, GwsError) as e:
+        members_err = str(e)
+
+    if group_err is not None and members_err is not None:
+        # Neither scope produced anything usable -- one combined error beats
+        # two redundant per-section ones.
+        return {
+            "domain": c.domain,
+            "group_email": group_email,
+            "error": f"group lookup failed ({group_err}); member lookup failed ({members_err})",
+        }
+    group_not_found = group_err is None and group is None
+    if group_not_found and members_not_found:
+        # Both independent lookups agree, with no error on either side, that
+        # this address is not a group at all -- a clean answer, not a partial
+        # failure, so it gets its own shape rather than an empty group/members
+        # pair that would look identical to "group exists but has 0 members".
+        return {"domain": c.domain, "group_email": group_email, "found": False}
+    # One side can independently CONFIRM non-existence (a 404, no exception)
+    # even when the OTHER side only failed to answer (a real error, e.g. its
+    # own scope missing) -- the confirmed not-found is the stronger,
+    # actionable signal and must not be buried under an unrelated error from
+    # a DIFFERENT scope, forcing an operator to manually cross-reference the
+    # two sections to reach the same conclusion this tool already has.
+    if members_not_found and group_err is not None:
+        return {
+            "domain": c.domain,
+            "group_email": group_email,
+            "found": False,
+            "group_lookup_error": group_err,
+        }
+    if group_not_found and members_err is not None:
+        return {
+            "domain": c.domain,
+            "group_email": group_email,
+            "found": False,
+            "members_lookup_error": members_err,
+            # A confirmed-nonexistent group trivially has no members, but
+            # the member-side call itself still failed to verify anything
+            # -- carry the same capped: true marker every other incomplete-
+            # coverage response uses, so a caller checking that one field
+            # doesn't need a special case for this shape.
+            "capped": True,
+        }
+    # From here on, group EXISTS (or its own lookup errored) but the member
+    # roster could still be unusable two ways: a real error, OR an unpaired
+    # not-found (e.g. the group was deleted between the two independent
+    # calls) -- both mean "no roster was actually fetched", so both must be
+    # treated alike for member_count/members/capped, not just the error case.
+    members_unusable = members_err is not None or members_not_found
+    members_reason = (
+        members_err
+        if members_err is not None
+        else ("member lookup returned not-found (group may have changed between the two independent lookups)")
+        if members_not_found
+        else None
+    )
+    return {
+        "domain": c.domain,
+        "group_email": group_email,
+        "group": ({"error": group_err} if group_err is not None else ({"found": False} if group is None else group)),
+        "member_count": 0 if members_unusable else len(members),
+        "members": [] if members_unusable else members,
+        # A member-lookup failure fetched NO roster at all -- strictly worse
+        # than a merely page-capped one, so it counts as partial coverage
+        # too (same convention drive_external_sharing uses: "a probe that
+        # errored out ... counts as partial coverage"). capped=False must
+        # mean "this IS the complete roster", never "we don't know" -- an
+        # empty group and an inaccessible one must not look identical here.
+        "capped": True if members_unusable else capped,
+        **({"members_error": members_reason} if members_reason is not None else {}),
     }
 
 

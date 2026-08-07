@@ -166,6 +166,239 @@ def test_list_user_oauth_tokens_http_error_maps_to_gws_error():
         c.list_user_oauth_tokens("user@example.edu")
 
 
+class FakeGroupsSettingsGroups:
+    def __init__(self, resp, exc=None):
+        self.resp, self.exc, self.calls = resp, exc, []
+
+    def get(self, **kw):
+        self.calls.append(kw)
+        return _Req(self.resp, self.exc)
+
+
+class FakeGroupsSettings:
+    def __init__(self, resp, exc=None):
+        self._g = FakeGroupsSettingsGroups(resp, exc)
+
+    def groups(self):
+        return self._g
+
+
+def _groups_settings_client(resp, exc=None):
+    svc = FakeGroupsSettings(resp, exc)
+    return DomainClient(CFG, groups_settings_service=svc), svc._g
+
+
+def test_get_group_settings_normalizes_string_booleans_and_passes_group_key():
+    # The Groups Settings API returns "true"/"false" as JSON strings, not
+    # booleans -- this must not leak into tool output.
+    resp = {
+        "whoCanPostMessage": "ALL_IN_DOMAIN_CAN_POST",
+        "allowExternalMembers": "false",
+        "isArchived": "false",
+        "messageModerationLevel": "MODERATE_NONE",
+        "spamModerationLevel": "MODERATE",
+        "allowWebPosting": "true",
+    }
+    c, g = _groups_settings_client(resp)
+    result = c.get_group_settings("team@example.edu")
+    assert result == {
+        "who_can_post": "ALL_IN_DOMAIN_CAN_POST",
+        "allow_external_members": False,
+        "is_archived": False,
+        "message_moderation_level": "MODERATE_NONE",
+        "spam_moderation_level": "MODERATE",
+        "allow_web_posting": True,
+    }
+    assert g.calls[0]["groupUniqueId"] == "team@example.edu"
+
+
+def test_get_group_settings_missing_fields_return_none_not_false():
+    # A field absent from the response must stay unresolved (None), not be
+    # coerced to False by the string-boolean normalizer.
+    c, _ = _groups_settings_client({"whoCanPostMessage": "ANYONE_CAN_POST"})
+    result = c.get_group_settings("team@example.edu")
+    assert result["allow_external_members"] is None
+    assert result["is_archived"] is None
+
+
+def test_get_group_settings_not_found_returns_none():
+    # A plain 404 means the address is not a group -- a normal, expected
+    # answer distinguished from a raised GwsError (any other HTTP status).
+    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
+    c, _ = _groups_settings_client(None, exc=err)
+    assert c.get_group_settings("nonexistent@example.edu") is None
+
+
+def test_get_group_settings_non_404_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _groups_settings_client(None, exc=err)
+    with pytest.raises(GwsError):
+        c.get_group_settings("team@example.edu")
+
+
+def test_get_group_settings_auth_error_maps_to_gws_auth_error():
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _groups_settings_client(None, exc=RefreshError("unauthorized_client"))
+    with pytest.raises(GwsAuthError):
+        c.get_group_settings("team@example.edu")
+
+
+class FakeDirectoryGroupsResource:
+    def __init__(self, resp, exc=None):
+        self.resp, self.exc, self.calls = resp, exc, []
+
+    def get(self, **kw):
+        self.calls.append(kw)
+        return _Req(self.resp, self.exc)
+
+
+class FakeDirectoryGroupService:
+    def __init__(self, resp, exc=None):
+        self._g = FakeDirectoryGroupsResource(resp, exc)
+
+    def groups(self):
+        return self._g
+
+
+class FakeDirectoryMembersResource:
+    def __init__(self, pages, exc=None):
+        self.pages, self.exc, self.calls = pages, exc, []
+
+    def list(self, **kw):
+        self.calls.append(kw)
+        if self.exc:
+            return _Req(None, self.exc)
+        return _Req(self.pages[min(len(self.calls) - 1, len(self.pages) - 1)])
+
+
+class FakeDirectoryGroupMemberService:
+    def __init__(self, pages, exc=None):
+        self._m = FakeDirectoryMembersResource(pages, exc)
+
+    def members(self):
+        return self._m
+
+
+def _group_client(resp, exc=None):
+    svc = FakeDirectoryGroupService(resp, exc)
+    return DomainClient(CFG, directory_group_service=svc), svc._g
+
+
+def _group_member_client(pages, exc=None):
+    svc = FakeDirectoryGroupMemberService(pages, exc)
+    return DomainClient(CFG, directory_group_member_service=svc), svc._m
+
+
+def test_get_group_returns_projected_metadata_and_passes_group_key():
+    c, g = _group_client({"email": "team@example.edu", "name": "Team", "description": "d", "directMembersCount": "2"})
+    result = c.get_group("team@example.edu")
+    assert result == {"email": "team@example.edu", "name": "Team", "description": "d", "direct_members_count": "2"}
+    assert g.calls[0]["groupKey"] == "team@example.edu"
+
+
+def test_get_group_not_found_returns_none():
+    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
+    c, _ = _group_client(None, exc=err)
+    assert c.get_group("nonexistent@example.edu") is None
+
+
+def test_get_group_non_404_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "500", "reason": "boom"}), b"{}")
+    c, _ = _group_client(None, exc=err)
+    with pytest.raises(GwsError):
+        c.get_group("team@example.edu")
+
+
+def test_get_group_auth_error_maps_to_gws_auth_error():
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _group_client(None, exc=RefreshError("unauthorized_client"))
+    with pytest.raises(GwsAuthError):
+        c.get_group("team@example.edu")
+
+
+def test_list_group_members_paginates_and_passes_group_key():
+    c, m = _group_member_client(
+        [
+            {
+                "members": [{"email": "a@example.edu", "role": "MEMBER", "type": "USER", "status": "ACTIVE"}],
+                "nextPageToken": "tok",
+            },
+            {"members": [{"email": "b@example.edu", "role": "OWNER", "type": "USER", "status": "ACTIVE"}]},
+        ]
+    )
+    members, capped = c.list_group_members("team@example.edu")
+    assert [x["email"] for x in members] == ["a@example.edu", "b@example.edu"]
+    assert capped is False
+    assert m.calls[0]["groupKey"] == "team@example.edu"
+    assert m.calls[1]["pageToken"] == "tok"
+
+
+def test_list_group_members_caps_pages():
+    c, _ = _group_member_client([{"members": [{"email": "x@example.edu"}], "nextPageToken": "more"}] * 5)
+    members, capped = c.list_group_members("team@example.edu", max_pages=2)
+    assert len(members) == 2
+    assert capped is True  # stopped early with pages remaining
+
+
+def test_list_group_members_not_found_on_first_page_returns_none():
+    # A 404 on the very first page means the group itself doesn't exist.
+    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
+    c, _ = _group_member_client(None, exc=err)
+    assert c.list_group_members("nonexistent@example.edu") is None
+
+
+def test_list_group_members_404_on_later_page_still_raises():
+    # A group that existed when listing started but was deleted mid-pagination
+    # is not "not found" -- it must stay a real error, not silently report a
+    # partial roster (or None) as though the group never existed.
+    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
+
+    class _FlakyMembersResource:
+        def __init__(self):
+            self.calls = 0
+
+        def list(self, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                return _Req({"members": [{"email": "a@example.edu"}], "nextPageToken": "tok"})
+            return _Req(None, err)
+
+    class _FlakyService:
+        def __init__(self, resource):
+            self._m = resource
+
+        def members(self):
+            return self._m
+
+    resource = _FlakyMembersResource()
+    c = DomainClient(CFG, directory_group_member_service=_FlakyService(resource))
+    with pytest.raises(GwsError):
+        c.list_group_members("team@example.edu")
+
+
+def test_list_group_members_non_404_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _group_member_client(None, exc=err)
+    with pytest.raises(GwsError):
+        c.list_group_members("team@example.edu")
+
+
+def test_list_group_members_auth_error_maps_to_gws_auth_error():
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _group_member_client(None, exc=RefreshError("unauthorized_client"))
+    with pytest.raises(GwsAuthError):
+        c.list_group_members("team@example.edu")
+
+
 class FakeGmailMessagesResource:
     def __init__(self, list_resp, get_resp=None, list_exc=None, get_exc=None):
         self.list_resp, self.get_resp = list_resp, get_resp

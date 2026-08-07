@@ -22,6 +22,8 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `drive_doc_activity` | Reports API `drive` をサーバー側 `doc_id` フィルタで — **特定1文書**の所有者・ACL 変更・ライフサイクル履歴。`drive_external_sharing` の検知トリアージ用： 所有者（個人か共有ドライブ名か）で「共有ドライブ内のファイル作成が既存メンバーへの ACL 伝播として一括外部共有に見える」誤検知クラスを切り分ける |
 | `shared_drive_membership_changes` | Reports API `drive`（`shared_drive_membership_change`）— 共有ドライブのメンバー追加/削除/ロール変更の履歴。対象メンバーの外部判定と、クライアント側ドライブ名フィルタ付き |
 | `gmail_message_trace` | Gmail API — **既知の** Message-ID が**特定の**メールボックスに届いたか、届いたならどこに入っているか（受信トレイ/迷惑メール/ゴミ箱/アーカイブ）を確認する。宛先ごとに DWD でそのユーザーになりすまし、本人のメールボックスを検索する。別付与の `gmail.readonly` DWD スコープが必要（下記「認証方式」参照）。未付与のドメインは宛先ごとのエラーとして報告され、誤って「届いていない」扱いにはならない |
+| `group_delivery_policy` | Groups Settings API — Google グループ自体の投稿/配送ポリシー（`who_can_post`、`allow_external_members`、モデレーションレベル）。グループのアクセス制御は Gmail 配送の**手前**にある： 学内限定の投稿ポリシーは外部送信者のメールを、Gmail の配送イベントが1件も生成されないまま静かに落とす — ポリシーを直接読まない限り配送失敗と見分けがつかない。別付与の `apps.groups.settings` DWD スコープが必要（下記「認証方式」参照） |
+| `list_group_members` | Directory API — Google グループの基本情報とメンバー一覧を直接取得する。特定のメッセージがたまたま誰に届いたかから推測するのではない。別付与の `admin.directory.group.readonly` と `admin.directory.group.member.readonly` DWD スコープが必要（下記「認証方式」参照） |
 | `daily_brief` | 設定済み全ドメインを横断した一括サマリ |
 | `daily_brief_start` / `daily_brief_result` | `daily_brief` をバックグラウンド実行： `start` が即座に `job_id` を返し、`result(job_id)` を `done` になるまでポーリングする。同期呼び出しがクライアントの ~60秒 tool-call タイムアウトに掛かる大規模テナント向け |
 
@@ -63,6 +65,19 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 （管理コンソール → セキュリティ → API の制御 → ドメイン全体の委任 → 既存のクライアント ID を
 探す → このスコープをリストに追加）。実際にどこまでメッセージトレースが必要かと、
 この広い露出とを天秤にかけたうえで、ドメインごとに付与するかどうかを判断すること。
+
+`group_delivery_policy` と `list_group_members` にもそれぞれ専用スコープが要る。
+上のまとめ付与とも `gmail.readonly` とも束ねない、さらに3つの別立てグラント:
+
+| スコープ | 必要とするツール | 未付与の場合 |
+|------|------|------|
+| `https://www.googleapis.com/auth/apps.groups.settings` | `group_delivery_policy` | そのツールだけエラーに縮退。他は動作を続ける |
+| `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members`（グループ情報側） | この側だけが自分のエラーを返す。下のメンバー用スコープが付与されていればメンバー一覧側は独立して動作する |
+| `https://www.googleapis.com/auth/admin.directory.group.member.readonly` | `list_group_members`（メンバー一覧側） | 同上、上のグループ情報側とは独立——2つの呼び出しは互いをブロックしない |
+
+Groups Settings API は Directory API とは別プロダクトなのでスコープも別立てになっている。
+読み取り専用バリアントは存在しないが、本サーバーが呼ぶのは `groups().get()` のみで、
+変更系メソッドは一切呼ばない。
 
 `suspended_accounts` と `user_oauth_tokens` はどちらも Reports 系ツール（顧客テナント全体）と異なり、
 設定済みドメイン単位で動作する（Directory の `domain=`/`userKey=`）。突合したいドメイン
@@ -191,8 +206,30 @@ gwsadm-mcp             # MCP サーバを起動（STDIO、既定）
   だけを表しており、複数件を統合した答えではない点に注意。検索はページングしないため、
   一定件数以上マッチした場合は `match_count` が正確な件数ではなく下限値であることを示す
   `match_count_capped` も併せて立つ。
+- `group_delivery_policy` は Groups Settings API の `"true"`/`"false"` 文字列
+  フィールド（JSON boolean ではなく、この API 固有の癖）を実際の boolean に
+  正規化して返す。Google の応答に無いフィールドは `null` のままで、`false`
+  に丸めない。`list_group_members` はグループ情報取得とメンバー一覧取得を
+  互いに独立して実行する — DWDスコープが片方しか付与されていないテナントでも、
+  付与されている方のセクションは返り、もう片方はそこに `{"error": ...}` を
+  埋め込む形で報告する。`capped: true` は、メンバー一覧がページ予算（既定20
+  ページ × 200件/ページ）を超えた場合と、メンバー取得自体が失敗した場合
+  （`members_error` 参照）の両方で返す — どちらも全件ではないという点は同じで、
+  `capped` が true のとき `members` が空でも「メンバー0名と確認できた」と
+  誤読してはいけない。
+  両ツールとも「このアドレスはグループではない」（3つの API 呼び出しすべてで
+  本番確認済みの、単純な HTTP 404）を本当のエラーと区別する:
+  `group_delivery_policy` は `found: false` を返す。`list_group_members` も
+  同様に返すが、それは2つの独立した取得が**両方とも**エラーなしで一致して
+  「見つからない」と答えたとき、または片方が「見つからない」と確定し、
+  もう片方は独立して失敗しただけのとき（その失敗は `group_lookup_error` /
+  `members_lookup_error` として隠さず添える）——確定した非存在は、もう片方の
+  無関係なエラーより強い根拠として扱う。片方が見つからず、もう片方は本当に
+  データを見つけた、という真の混在状態だけが通常のセクション別の形に
+  フォールバックする。
 - 設計上 read-only — このパッケージが発行する API 呼び出しは `activities().list`
-  （Reports API）、`users().list` / `tokens().list`（Directory API）、
+  （Reports API）、`users().list` / `tokens().list` / `groups().get` /
+  `members().list`（Directory API）、`groups().get`（Groups Settings API）、
   `messages().list` / `messages().get`（Gmail API、メタデータのみ）に限られる。
 - 出力にはアカウントアドレスが含まれる（監査ツールの目的上当然） —
   権限のあるセキュリティ担当者にアクセスを限定すること。`gmail_message_trace`
