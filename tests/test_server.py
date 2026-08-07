@@ -682,6 +682,29 @@ def test_list_group_members_group_not_found_but_members_found_is_not_top_level_n
     assert out["members"] == [{"email": "a@example.edu"}]
 
 
+def test_list_group_members_member_not_found_when_group_exists_is_not_a_confirmed_empty_roster(inject):
+    # Mirror of the above: get_group DOES find the group, but the member
+    # lookup independently returns not-found (no exception) -- e.g. the
+    # group was deleted between the two calls. This must not be reported as
+    # a confirmed-empty roster (member_count=0, capped=False looks IDENTICAL
+    # to a real, existing, genuinely-empty group without this check).
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta={"team@example.edu": {"email": "team@example.edu"}},
+        group_members={"team@example.edu": None},
+    )
+    inject([c], {"example.edu"})
+    out = server.list_group_members("team@example.edu")
+    assert "error" not in out
+    assert "found" not in out  # not the clean both-sides-agree shape (group WAS found)
+    assert out["group"] == {"email": "team@example.edu"}
+    assert out["members"] == []
+    assert out["member_count"] == 0
+    assert out["capped"] is True  # coverage incomplete, not "confirmed zero"
+    assert "members_error" in out
+
+
 def test_list_group_members_top_level_error_only_when_both_scopes_fail(inject):
     from gwsadm_mcp.client import GwsAuthError
 

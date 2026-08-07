@@ -805,20 +805,33 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
         # failure, so it gets its own shape rather than an empty group/members
         # pair that would look identical to "group exists but has 0 members".
         return {"domain": c.domain, "group_email": group_email, "found": False}
+    # From here on, group EXISTS (or its own lookup errored) but the member
+    # roster could still be unusable two ways: a real error, OR an unpaired
+    # not-found (e.g. the group was deleted between the two independent
+    # calls) -- both mean "no roster was actually fetched", so both must be
+    # treated alike for member_count/members/capped, not just the error case.
+    members_unusable = members_err is not None or members_not_found
+    members_reason = (
+        members_err
+        if members_err is not None
+        else ("member lookup returned not-found (group may have changed between the two independent lookups)")
+        if members_not_found
+        else None
+    )
     return {
         "domain": c.domain,
         "group_email": group_email,
         "group": ({"error": group_err} if group_err is not None else ({"found": False} if group is None else group)),
-        "member_count": 0 if members_err is not None else len(members),
-        "members": [] if members_err is not None else members,
+        "member_count": 0 if members_unusable else len(members),
+        "members": [] if members_unusable else members,
         # A member-lookup failure fetched NO roster at all -- strictly worse
         # than a merely page-capped one, so it counts as partial coverage
         # too (same convention drive_external_sharing uses: "a probe that
         # errored out ... counts as partial coverage"). capped=False must
         # mean "this IS the complete roster", never "we don't know" -- an
         # empty group and an inaccessible one must not look identical here.
-        "capped": True if members_err is not None else capped,
-        **({"members_error": members_err} if members_err is not None else {}),
+        "capped": True if members_unusable else capped,
+        **({"members_error": members_reason} if members_reason is not None else {}),
     }
 
 
