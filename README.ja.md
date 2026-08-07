@@ -221,8 +221,12 @@ gwsadm-mcp             # MCP サーバを起動（STDIO、既定）
   本番確認済みの、単純な HTTP 404）を本当のエラーと区別する:
   `group_delivery_policy` は `found: false` を返す。`list_group_members` も
   同様に返すが、それは2つの独立した取得が**両方とも**エラーなしで一致して
-  「見つからない」と答えたときだけ — 片方だけ見つからない・片方だけエラー
-  という混在状態は、通常のセクション別の形にフォールバックする。
+  「見つからない」と答えたとき、または片方が「見つからない」と確定し、
+  もう片方は独立して失敗しただけのとき（その失敗は `group_lookup_error` /
+  `members_lookup_error` として隠さず添える）——確定した非存在は、もう片方の
+  無関係なエラーより強い根拠として扱う。片方が見つからず、もう片方は本当に
+  データを見つけた、という真の混在状態だけが通常のセクション別の形に
+  フォールバックする。
 - 設計上 read-only — このパッケージが発行する API 呼び出しは `activities().list`
   （Reports API）、`users().list` / `tokens().list` / `groups().get` /
   `members().list`（Directory API）、`groups().get`（Groups Settings API）、

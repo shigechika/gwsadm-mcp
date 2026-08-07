@@ -743,10 +743,15 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
     place rather than failing the whole call — only when BOTH fail does the
     tool return a single top-level ``error``.
 
-    Sets ``found: false`` (no ``group``/``members`` sections) only when
-    BOTH calls agree, with no error on either side, that ``group_email``
-    does not name any group in this domain — a normal, expected answer for
-    a bad/typo'd address, not an ``error``.
+    Sets ``found: false`` (no ``group``/``members`` sections) when
+    ``group_email`` does not name any group in this domain — a normal,
+    expected answer for a bad/typo'd address, not an ``error``. This
+    triggers both when BOTH calls agree with no error on either side, AND
+    when one call CONFIRMS not-found while the other independently failed
+    (its own error is then attached as ``group_lookup_error`` /
+    ``members_lookup_error``) — a confirmed non-existence from one
+    independently-scoped call is stronger evidence than an unrelated
+    failure on the other, and must not be buried under it.
 
     Args:
         group_email: The group's address.
@@ -805,6 +810,26 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
         # failure, so it gets its own shape rather than an empty group/members
         # pair that would look identical to "group exists but has 0 members".
         return {"domain": c.domain, "group_email": group_email, "found": False}
+    # One side can independently CONFIRM non-existence (a 404, no exception)
+    # even when the OTHER side only failed to answer (a real error, e.g. its
+    # own scope missing) -- the confirmed not-found is the stronger,
+    # actionable signal and must not be buried under an unrelated error from
+    # a DIFFERENT scope, forcing an operator to manually cross-reference the
+    # two sections to reach the same conclusion this tool already has.
+    if members_not_found and group_err is not None:
+        return {
+            "domain": c.domain,
+            "group_email": group_email,
+            "found": False,
+            "group_lookup_error": group_err,
+        }
+    if group_not_found and members_err is not None:
+        return {
+            "domain": c.domain,
+            "group_email": group_email,
+            "found": False,
+            "members_lookup_error": members_err,
+        }
     # From here on, group EXISTS (or its own lookup errored) but the member
     # roster could still be unusable two ways: a real error, OR an unpaired
     # not-found (e.g. the group was deleted between the two independent

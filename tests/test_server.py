@@ -664,6 +664,48 @@ def test_list_group_members_not_found_when_both_agree_with_no_error(inject):
     assert "members" not in out
 
 
+def test_list_group_members_confirmed_not_found_wins_over_unrelated_group_error(inject):
+    # get_group fails (e.g. its own scope missing) but list_group_members
+    # independently CONFIRMS not-found (a 404, no exception) -- that
+    # confirmation is stronger evidence than an unrelated failure on the
+    # OTHER scope and must not be buried under a generic {"error": ...}.
+    from gwsadm_mcp.client import GwsAuthError
+
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta=GwsAuthError("no group.readonly scope"),
+        group_members={"nonexistent@example.edu": None},
+    )
+    inject([c], {"example.edu"})
+    out = server.list_group_members("nonexistent@example.edu")
+    assert "error" not in out
+    assert out["found"] is False
+    assert "group.readonly" in out["group_lookup_error"]
+    assert "group" not in out
+    assert "members" not in out
+
+
+def test_list_group_members_confirmed_not_found_wins_over_unrelated_members_error(inject):
+    # Mirror of the above: list_group_members fails (e.g. its own scope
+    # missing) but get_group independently CONFIRMS not-found.
+    from gwsadm_mcp.client import GwsAuthError
+
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta={"nonexistent@example.edu": None},
+        group_members=GwsAuthError("no group.member.readonly scope"),
+    )
+    inject([c], {"example.edu"})
+    out = server.list_group_members("nonexistent@example.edu")
+    assert "error" not in out
+    assert out["found"] is False
+    assert "group.member.readonly" in out["members_lookup_error"]
+    assert "group" not in out
+    assert "members" not in out
+
+
 def test_list_group_members_group_not_found_but_members_found_is_not_top_level_not_found(inject):
     # Mixed state: get_group says not-found (no error) but list_group_members
     # DOES find members -- inconsistent, but must not be misreported as a

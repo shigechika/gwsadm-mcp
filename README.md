@@ -230,10 +230,13 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
   Both group tools distinguish "this address is not a group" (a plain HTTP
   404, verified against production for all three underlying API calls) from
   a real failure: `group_delivery_policy` sets `found: false`;
-  `list_group_members` sets it too, but only when BOTH its independent
-  lookups agree with no error on either side — a mixed state (one side
-  not-found, the other erroring or finding data) falls through to the
-  normal per-section shape instead.
+  `list_group_members` sets it too, when either both independent lookups
+  agree with no error on either side, OR one CONFIRMS not-found while the
+  other independently failed (that failure is then attached as
+  `group_lookup_error` / `members_lookup_error` rather than hidden) — a
+  confirmed non-existence outweighs an unrelated error on the other scope.
+  Only a genuine mixed state (one side not-found, the other actually
+  finding data) falls through to the normal per-section shape instead.
 - Read-only by design: `activities().list` (Reports API), `users().list` /
   `tokens().list` / `groups().get` / `members().list` (Directory API),
   `groups().get` (Groups Settings API), and `messages().list` / `messages().get`
