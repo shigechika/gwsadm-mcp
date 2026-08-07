@@ -9,7 +9,17 @@ from gwsadm_mcp.client import GwsError
 
 
 class FakeDomainClient:
-    def __init__(self, domain, canned, auth="ok", suspended=None, tokens=None, gmail_messages=None):
+    def __init__(
+        self,
+        domain,
+        canned,
+        auth="ok",
+        suspended=None,
+        tokens=None,
+        gmail_messages=None,
+        group_settings=None,
+        group_roster=None,
+    ):
         self.domain = domain
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
         self._auth = auth
@@ -20,9 +30,15 @@ class FakeDomainClient:
         # lacks the scope" case; a per-user dict lets one test cover a mixed
         # found/not-found/error recipient list against a single client)
         self._gmail_messages = gmail_messages
+        # group_settings / group_roster: dict[group_email, dict | Exception] | Exception | None
+        # (same shape convention as gmail_messages above)
+        self._group_settings = group_settings
+        self._group_roster = group_roster
         self.calls = []
         self.token_calls = []
         self.gmail_calls = []
+        self.group_settings_calls = []
+        self.group_roster_calls = []
 
     def fetch_activities(self, application_name, *, start, end=None, event_name=None, filters=None, max_pages=5):
         self.calls.append((application_name, event_name, max_pages, filters))
@@ -57,6 +73,28 @@ class FakeDomainClient:
         if isinstance(got, Exception):
             raise got
         return got  # a dict (found) or None (not found) — caller's choice per user
+
+    def get_group_settings(self, group_email):
+        self.group_settings_calls.append(group_email)
+        if self._group_settings is None:
+            return {}
+        if isinstance(self._group_settings, Exception):
+            raise self._group_settings
+        got = self._group_settings.get(group_email)
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    def get_group_roster(self, group_email, *, max_pages=20):
+        self.group_roster_calls.append((group_email, max_pages))
+        if self._group_roster is None:
+            return {"group": {}, "members": [], "members_capped": False}
+        if isinstance(self._group_roster, Exception):
+            raise self._group_roster
+        got = self._group_roster.get(group_email)
+        if isinstance(got, Exception):
+            raise got
+        return got
 
     def check(self):
         return {"domain": self.domain, "auth": self._auth}
@@ -441,6 +479,117 @@ def test_gmail_message_trace_unresolvable_domain_is_per_recipient_error(inject):
     out = server.gmail_message_trace("id@example.invalid", "user@nope.example")
     assert "error" in out["results"]["user@nope.example"]
     assert out["errors"] == 1
+
+
+def test_group_delivery_policy_resolves_domain_and_returns_policy(inject):
+    policy = {
+        "who_can_post": "ALL_IN_DOMAIN_CAN_POST",
+        "allow_external_members": False,
+        "is_archived": False,
+        "message_moderation_level": "MODERATE_NONE",
+        "spam_moderation_level": "MODERATE",
+        "allow_web_posting": True,
+    }
+    c = FakeDomainClient("example.edu", {}, group_settings={"team@example.edu": policy})
+    inject([c], {"example.edu"})
+    out = server.group_delivery_policy("team@example.edu")
+    assert out["domain"] == "example.edu"
+    assert out["group_email"] == "team@example.edu"
+    assert out["who_can_post"] == "ALL_IN_DOMAIN_CAN_POST"
+    assert out["allow_external_members"] is False
+    assert c.group_settings_calls == ["team@example.edu"]
+
+
+def test_group_delivery_policy_degrades_on_auth_error(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    inject(
+        [FakeDomainClient("example.edu", {}, group_settings=GwsAuthError("no groups.settings scope"))],
+        {"example.edu"},
+    )
+    out = server.group_delivery_policy("team@example.edu")
+    assert "error" in out
+    assert out["domain"] == "example.edu"  # domain still identifiable even though the call failed
+
+
+def test_group_delivery_policy_unresolvable_domain_error_carries_group_email(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    out = server.group_delivery_policy("team@nope.example")
+    assert "error" in out
+    assert out["group_email"] == "team@nope.example"
+
+
+def test_group_delivery_policy_strips_whitespace(inject):
+    c = FakeDomainClient("example.edu", {}, group_settings={"team@example.edu": {}})
+    inject([c], {"example.edu"})
+    out = server.group_delivery_policy("  team@example.edu  ")
+    assert out["group_email"] == "team@example.edu"
+    assert c.group_settings_calls == ["team@example.edu"]  # not the untrimmed value
+
+
+def test_group_delivery_policy_explicit_domain_routes_alias_address(inject):
+    c = FakeDomainClient("example.edu", {}, group_settings={"team@alias.edu": {}})
+    inject([c], {"example.edu"})
+    out = server.group_delivery_policy("team@alias.edu", domain="example.edu")
+    assert "error" not in out
+    assert out["domain"] == "example.edu"
+    assert c.group_settings_calls == ["team@alias.edu"]
+
+
+def test_group_delivery_policy_rejects_non_email():
+    out = server.group_delivery_policy("not-an-email")
+    assert "not an email address" in out["error"]
+
+
+def test_list_group_members_returns_group_and_members(inject):
+    roster = {
+        "group": {"email": "team@example.edu", "name": "Team"},
+        "members": [{"email": "a@example.edu", "role": "MEMBER"}],
+        "members_capped": False,
+    }
+    c = FakeDomainClient("example.edu", {}, group_roster={"team@example.edu": roster})
+    inject([c], {"example.edu"})
+    out = server.list_group_members("team@example.edu")
+    assert out["domain"] == "example.edu"
+    assert out["group_email"] == "team@example.edu"
+    assert out["group"] == {"email": "team@example.edu", "name": "Team"}
+    assert out["member_count"] == 1
+    assert out["members"] == [{"email": "a@example.edu", "role": "MEMBER"}]
+    assert out["capped"] is False
+    assert c.group_roster_calls == [("team@example.edu", 20)]  # default max_pages
+
+
+def test_list_group_members_passes_max_pages_and_surfaces_capped(inject):
+    roster = {"group": {}, "members": [], "members_capped": True}
+    c = FakeDomainClient("example.edu", {}, group_roster={"team@example.edu": roster})
+    inject([c], {"example.edu"})
+    out = server.list_group_members("team@example.edu", max_pages=3)
+    assert out["capped"] is True
+    assert c.group_roster_calls == [("team@example.edu", 3)]
+
+
+def test_list_group_members_degrades_on_auth_error(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    inject(
+        [FakeDomainClient("example.edu", {}, group_roster=GwsAuthError("no directory group scope"))],
+        {"example.edu"},
+    )
+    out = server.list_group_members("team@example.edu")
+    assert "error" in out
+    assert out["domain"] == "example.edu"
+
+
+def test_list_group_members_unresolvable_domain_error_carries_group_email(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    out = server.list_group_members("team@nope.example")
+    assert "error" in out
+    assert out["group_email"] == "team@nope.example"
+
+
+def test_list_group_members_rejects_non_email():
+    out = server.list_group_members("not-an-email")
+    assert "not an email address" in out["error"]
 
 
 def test_select_normalizes_case_and_whitespace(inject):

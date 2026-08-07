@@ -8,6 +8,12 @@ Phase 1 tools:
 - ``user_oauth_tokens``       — third-party OAuth app grants for one user (Directory API)
 - ``gmail_message_trace``     — did a known Message-ID reach specific mailboxes, and where
   (Gmail API; requires the separate ``gmail.readonly`` DWD scope — see its docstring)
+- ``group_delivery_policy``   — a Google Group's own posting/delivery policy (who_can_post,
+  allow_external_members) — why external mail silently never arrives (Groups Settings API;
+  requires the separate ``apps.groups.settings`` DWD scope — see its docstring)
+- ``list_group_members``      — a Google Group's metadata + member roster, independent of any
+  message ever sent to it (Directory API; requires the separate ``admin.directory.group.readonly``
+  and ``admin.directory.group.member.readonly`` DWD scopes — see its docstring)
 - ``drive_external_sharing``  — Drive ACL grants to external targets and new link/public exposure
 - ``drive_doc_activity``      — one document's owner + ACL/lifecycle history (finding triage)
 - ``shared_drive_membership_changes`` — who added/removed shared-drive members, and when
@@ -662,6 +668,102 @@ def gmail_message_trace(message_id: str, recipients: str, domain: str | None = N
         # is NOT deterministic, so this re-keying is what guarantees "same
         # order as input" rather than incidental luck.
         "results": {addr: results[addr] for addr in addrs},
+    }
+
+
+@mcp.tool()
+def group_delivery_policy(group_email: str, domain: str | None = None) -> dict:
+    """Check a Google Group's own posting/delivery policy — why an external sender's mail never arrived.
+
+    A Group's access-control layer sits IN FRONT of Gmail delivery: when
+    ``who_can_post`` is restricted (e.g. domain-members-only), an external
+    sender's message is rejected there and never generates a per-recipient
+    Gmail delivery event at all — ``gmail_message_trace`` (a real mailbox) and
+    any Reports-API-based delivery trace both see nothing for that address,
+    indistinguishable from a genuine delivery failure without this. Use this
+    FIRST when a group address "isn't receiving" mail from an external
+    sender, before chasing it as a transport/spam problem.
+
+    Read-only: only ``groups().get()`` is issued (Groups Settings API).
+    Requires the ``apps.groups.settings`` DWD scope — granted PER SERVICE
+    ACCOUNT CLIENT ID in the Admin console (Security > API controls >
+    Domain-wide delegation), separately from every other scope this server
+    uses, and NOT on by default.
+
+    Returns ``who_can_post`` (e.g. ``ALL_IN_DOMAIN_CAN_POST`` blocks external
+    senders entirely; ``ANYONE_CAN_POST`` allows them), ``allow_external_members``,
+    ``is_archived``, ``message_moderation_level``, ``spam_moderation_level``,
+    ``allow_web_posting``.
+
+    Args:
+        group_email: The group's address (e.g. "team.gen@example.edu").
+        domain: Configured ``[domain.*]`` section to route the lookup through.
+            Default: resolved from the address's suffix.
+    """
+    group_email = group_email.strip()
+    try:
+        suffix = _domain_of(group_email)
+        clients, _ = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"group_email": group_email, "error": str(e)}
+    c = picked[0]
+    try:
+        policy = c.get_group_settings(group_email)
+    except (GwsAuthError, GwsError) as e:
+        return {"domain": c.domain, "group_email": group_email, "error": str(e)}
+    return {"domain": c.domain, "group_email": group_email, **policy}
+
+
+@mcp.tool()
+def list_group_members(group_email: str, domain: str | None = None, max_pages: int = 20) -> dict:
+    """List a Google Group's basic metadata and member roster (Directory API).
+
+    Resolves a group's actual membership directly, independent of any
+    specific message ever having been sent to it — unlike inferring
+    membership from Reports API delivery-event fanout (``applicationName=gmail``),
+    which only shows members who received one PARTICULAR message and
+    requires one to already exist to trace. Pair with ``gmail_message_trace``
+    to deep-dive a specific member's mailbox once the roster is known, or
+    with ``group_delivery_policy`` to see why the group as a whole may not be
+    receiving mail at all.
+
+    Read-only: only ``groups().get()`` and ``members().list()`` are issued
+    (Directory API), never a mutating call. Requires the
+    ``admin.directory.group.readonly`` and
+    ``admin.directory.group.member.readonly`` DWD scopes — granted PER
+    SERVICE ACCOUNT CLIENT ID in the Admin console, separately from every
+    other scope this server uses, and NOT on by default.
+
+    Args:
+        group_email: The group's address.
+        domain: Configured ``[domain.*]`` section to route the lookup through.
+            Default: resolved from the address's suffix.
+        max_pages: Pagination cap for the member roster (Directory API hard
+            limit 200 members per page). Default 20 (≤4,000 members) —
+            raise for an unusually large group. ``capped: true`` in the
+            result means more pages existed beyond this; a partial roster
+            must never be read as the full one.
+    """
+    group_email = group_email.strip()
+    try:
+        suffix = _domain_of(group_email)
+        clients, _ = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"group_email": group_email, "error": str(e)}
+    c = picked[0]
+    try:
+        result = c.get_group_roster(group_email, max_pages=max_pages)
+    except (GwsAuthError, GwsError) as e:
+        return {"domain": c.domain, "group_email": group_email, "error": str(e)}
+    return {
+        "domain": c.domain,
+        "group_email": group_email,
+        "group": result["group"],
+        "member_count": len(result["members"]),
+        "members": result["members"],
+        "capped": result["members_capped"],
     }
 
 

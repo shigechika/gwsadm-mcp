@@ -116,6 +116,20 @@ async def _fake_message_and_recipient(call: Caller) -> dict[str, Any]:
     }
 
 
+async def _fake_group(call: Caller) -> dict[str, Any]:
+    """A syntactically valid but guaranteed-nonexistent group address, in a
+    real configured domain discovered at run time (reusing ``_some_account``).
+
+    Mirrors ``_fake_message_and_recipient``: this deliberately never finds a
+    match, exercising the full DWD-impersonation + API code path (auth, the
+    groups().get() call, and its not-found response) without depending on --
+    or naming -- any real group in the tenant.
+    """
+    account = await _some_account(call)
+    suffix = account["username"].rsplit("@", 1)[-1]
+    return {"group_email": f"smoke-test-{secrets.token_hex(16)}@{suffix}"}
+
+
 async def _finished_job(call: Caller) -> dict[str, Any]:
     """Start a brief and poll it to a terminal state for the result tool.
 
@@ -188,6 +202,24 @@ PROBES: dict[str, Probe] = {
         # docstring), not a broken probe. What must hold is the envelope
         # shape above; a raised exception or a malformed shape still fails
         # the probe through the harness's own checks.
+    ),
+    "group_delivery_policy": Probe(
+        args_factory=_fake_group,
+        require_keys=("domain", "group_email"),
+        allow_empty=True,
+        # Deliberately no must_not_match on error here: the synthetic address
+        # is guaranteed not to be a real group, so a not-found-shaped
+        # {"error": ...} is this tool WORKING correctly (same rationale as
+        # gmail_message_trace's per-recipient error above), not a broken
+        # probe. What must hold is the envelope shape (domain + group_email
+        # always present).
+    ),
+    "list_group_members": Probe(
+        args_factory=_fake_group,
+        args={"max_pages": 1},
+        require_keys=("domain", "group_email"),
+        allow_empty=True,
+        # Same rationale as group_delivery_policy above.
     ),
     # -- Drive exposure ------------------------------------------------------
     "drive_external_sharing": Probe(

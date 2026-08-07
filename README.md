@@ -25,6 +25,8 @@ anything.
 | `drive_doc_activity` | Reports API `drive` with a server-side `doc_id` filter — **one document's** owner, ACL changes, and lifecycle events. Triage companion to `drive_external_sharing`: the owner (an individual vs. a shared drive's name) disambiguates the shared-drive false-positive class, where files created inside a shared drive propagate member ACLs and read as bulk external sharing |
 | `shared_drive_membership_changes` | Reports API `drive` (`shared_drive_membership_change`) — who added/removed/re-roled shared-drive members and when, with external classification of the affected member and a client-side drive-name filter |
 | `gmail_message_trace` | Gmail API — did a **known** Message-ID reach **specific** mailboxes, and where (inbox/spam/trash/archived)? For each recipient it impersonates that user via DWD and searches their own mailbox. Requires the separate `gmail.readonly` DWD scope (see Auth model below); a domain missing that grant reports a per-recipient error, never a false "not found" |
+| `group_delivery_policy` | Groups Settings API — a Google Group's own posting/delivery policy (`who_can_post`, `allow_external_members`, moderation levels). A group's access control sits **in front of** Gmail delivery: a domain-only posting policy silently drops an external sender's mail before it generates any Gmail delivery event at all, indistinguishable from a delivery failure without reading the policy directly. Requires the separate `apps.groups.settings` DWD scope (see Auth model below) |
+| `list_group_members` | Directory API — a Google Group's basic metadata and member roster, resolved directly rather than inferred from who happened to receive one particular message. Requires the separate `admin.directory.group.readonly` and `admin.directory.group.member.readonly` DWD scopes (see Auth model below) |
 | `daily_brief` | One-call summary across all configured domains |
 | `daily_brief_start` / `daily_brief_result` | Same as `daily_brief`, run in the background: `start` returns a `job_id` immediately, then poll `result(job_id)` until `done`. Use on large tenants where the synchronous call risks the client's ~60s tool-call timeout |
 
@@ -70,6 +72,20 @@ console → Security → API controls → Domain-wide delegation → find the
 existing client ID → add this scope to its list), and weigh that broader
 exposure against how much you actually need message-trace before turning it
 on for a given domain.
+
+`group_delivery_policy` and `list_group_members` each need their own
+separate scope too — three more grants beyond the base pass, none bundled
+with each other or with `gmail.readonly` above:
+
+| Scope | Needed by | Missing it |
+|-------|-----------|------------|
+| `https://www.googleapis.com/auth/apps.groups.settings` | `group_delivery_policy` | that tool degrades to an error; everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members` (group metadata half) | that tool degrades to an error even if the member scope below is granted — the two calls share fate |
+| `https://www.googleapis.com/auth/admin.directory.group.member.readonly` | `list_group_members` (member roster half) | same as above |
+
+The Groups Settings API is a distinct product from the Directory API, hence
+the separate scope; it has no readonly-only variant, but this server only
+ever calls `groups().get()`, never a mutating method.
 
 `suspended_accounts` and `user_oauth_tokens` both operate per configured
 domain (Directory `domain=`/`userKey=`), unlike the customer-wide Reports
@@ -200,8 +216,15 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
   first match, not a combined answer. `match_count_capped` is set alongside
   it when the mailbox has enough matches that `match_count` is a lower
   bound rather than exact (the search does not paginate).
+- `group_delivery_policy` normalizes the Groups Settings API's `"true"`/`"false"`
+  string fields (a quirk of that API, not JSON booleans) into real booleans in
+  its output; a field absent from Google's response stays `null`, never
+  coerced to `false`. `list_group_members` reports `capped: true` when the
+  member roster exceeded its page budget (default 20 pages × 200/page) — a
+  partial roster must not be read as the full one.
 - Read-only by design: `activities().list` (Reports API), `users().list` /
-  `tokens().list` (Directory API), and `messages().list` / `messages().get`
+  `tokens().list` / `groups().get` / `members().list` (Directory API),
+  `groups().get` (Groups Settings API), and `messages().list` / `messages().get`
   (Gmail API, metadata only) are the only API calls issued anywhere in this
   package.
 - Output contains account addresses (that is the point of an audit tool):

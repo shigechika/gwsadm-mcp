@@ -6,16 +6,19 @@ fully non-interactive, so the server can run unattended behind a gateway.
 
 Read-only by design: only ``activities().list`` (Admin SDK Reports API),
 ``users().list`` (Directory API, for suspended-account snapshots),
-``tokens().list`` (Directory API, for per-user OAuth app grants), and
-``messages().list`` / ``messages().get`` (Gmail API, for message-trace) are
-issued; no mutating call exists in this package.
+``tokens().list`` (Directory API, for per-user OAuth app grants),
+``messages().list`` / ``messages().get`` (Gmail API, for message-trace),
+``groups().get`` (Groups Settings API, for a group's own posting policy), and
+``groups().get`` / ``members().list`` (Directory API, for a group's roster)
+are issued; no mutating call exists in this package.
 
-Gmail access is architecturally different from the other three: those
-impersonate one FIXED subject per domain (``cfg.subject``, the configured
-audit admin) and are built once and cached for the domain's whole lifetime.
-Gmail message-trace impersonates whichever RECIPIENT is being investigated —
-a different subject on every call, unknowable in advance — so its
-credentials/service are cached per user_email instead of once per domain
+Gmail access is architecturally different from the other services: it
+impersonates whichever RECIPIENT is being investigated -- a different
+subject on every call, unknowable in advance -- while every other service
+(Reports, both Directory scopes, Groups Settings, both group scopes)
+impersonates one FIXED subject per domain (``cfg.subject``, the configured
+audit admin) and is built once and cached for the domain's whole lifetime.
+Gmail's credentials/service are cached per user_email instead
 (see ``_gmail_service``).
 """
 
@@ -54,11 +57,22 @@ SCOPE_DIRECTORY_SECURITY = "https://www.googleapis.com/auth/admin.directory.user
 # READ stays narrow even though the DWD GRANT is broader than the other
 # three scopes in this file.
 SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.readonly"
+# Groups Settings is a distinct API/product from the Directory API scopes
+# below -- it answers "what is this group's own access-control policy"
+# (who_can_post, allow_external_members, moderation), not "who is in it".
+# No readonly variant exists for this scope (Google has never split one out).
+SCOPE_GROUPS_SETTINGS = "https://www.googleapis.com/auth/apps.groups.settings"
+SCOPE_DIRECTORY_GROUP = "https://www.googleapis.com/auth/admin.directory.group.readonly"
+SCOPE_DIRECTORY_GROUP_MEMBER = "https://www.googleapis.com/auth/admin.directory.group.member.readonly"
 
 # Reports API hard limit is 1000 per page.
 PAGE_SIZE = 1000
-# Directory API hard limit is 500 per page.
+# Directory API hard limit is 500 per page (users().list()).
 DIRECTORY_PAGE_SIZE = 500
+# Directory API members().list() has a LOWER hard limit than users().list()
+# above (200, not 500) -- a separate constant, not a shared one, so a future
+# change to one does not silently mis-page the other.
+GROUP_MEMBER_PAGE_SIZE = 200
 
 # Per-request HTTP timeout (seconds).
 _HTTP_TIMEOUT = 30
@@ -117,6 +131,15 @@ def _rfc3339(dt: datetime.datetime) -> str:
     return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _settings_bool(v) -> bool | None:
+    """Groups Settings API booleans are the STRINGS "true"/"false", not JSON
+    booleans (a longstanding quirk of this older REST API) -- normalize so
+    tool output carries real booleans instead of leaking that quirk to callers."""
+    if v is None:
+        return None
+    return str(v).strip().lower() == "true"
+
+
 class DomainClient:
     """Audit-activities client for one Workspace domain."""
 
@@ -127,12 +150,18 @@ class DomainClient:
         reports_service=None,
         directory_service=None,
         directory_security_service=None,
+        groups_settings_service=None,
+        directory_group_service=None,
+        directory_group_member_service=None,
         gmail_service_factory=None,
     ):
         self.cfg = cfg
         self._reports = reports_service  # injectable for tests
         self._directory = directory_service  # injectable for tests
         self._directory_security = directory_security_service  # injectable for tests
+        self._groups_settings = groups_settings_service  # injectable for tests
+        self._directory_group = directory_group_service  # injectable for tests
+        self._directory_group_member = directory_group_member_service  # injectable for tests
         # injectable for tests: callable(user_email) -> a fake Gmail service,
         # bypassing real credential loading entirely (mirrors the *_service=
         # params above, but per-call rather than per-domain since the real
@@ -142,6 +171,9 @@ class DomainClient:
         self._creds = None
         self._directory_creds = None
         self._directory_security_creds = None
+        self._groups_settings_creds = None
+        self._directory_group_creds = None
+        self._directory_group_member_creds = None
         # user_email -> (creds, service). Unlike the other three services,
         # which cache one instance for cfg.subject and live for the
         # DomainClient's lifetime, this grows one entry per DISTINCT
@@ -209,6 +241,61 @@ class DomainClient:
                     self._directory_security_creds = creds
                     self._directory_security = build("admin", "directory_v1", credentials=creds, cache_discovery=False)
         return self._directory_security
+
+    def _groups_settings_service(self):
+        if self._groups_settings is None:
+            with self._build_lock:
+                if self._groups_settings is None:  # re-check under lock
+                    try:
+                        creds = service_account.Credentials.from_service_account_file(
+                            self.cfg.service_account_file, scopes=[SCOPE_GROUPS_SETTINGS], subject=self.cfg.subject
+                        )
+                    except (OSError, ValueError) as e:
+                        # See _reports_service: key path must not leak into tool output.
+                        raise GwsAuthError(
+                            f"[{self.domain}] cannot load service account key ({type(e).__name__})"
+                        ) from e
+                    self._groups_settings_creds = creds
+                    self._groups_settings = build("groupssettings", "v1", credentials=creds, cache_discovery=False)
+        return self._groups_settings
+
+    def _directory_group_service(self):
+        if self._directory_group is None:
+            with self._build_lock:
+                if self._directory_group is None:  # re-check under lock
+                    try:
+                        creds = service_account.Credentials.from_service_account_file(
+                            self.cfg.service_account_file, scopes=[SCOPE_DIRECTORY_GROUP], subject=self.cfg.subject
+                        )
+                    except (OSError, ValueError) as e:
+                        # See _reports_service: key path must not leak into tool output.
+                        raise GwsAuthError(
+                            f"[{self.domain}] cannot load service account key ({type(e).__name__})"
+                        ) from e
+                    self._directory_group_creds = creds
+                    self._directory_group = build("admin", "directory_v1", credentials=creds, cache_discovery=False)
+        return self._directory_group
+
+    def _directory_group_member_service(self):
+        if self._directory_group_member is None:
+            with self._build_lock:
+                if self._directory_group_member is None:  # re-check under lock
+                    try:
+                        creds = service_account.Credentials.from_service_account_file(
+                            self.cfg.service_account_file,
+                            scopes=[SCOPE_DIRECTORY_GROUP_MEMBER],
+                            subject=self.cfg.subject,
+                        )
+                    except (OSError, ValueError) as e:
+                        # See _reports_service: key path must not leak into tool output.
+                        raise GwsAuthError(
+                            f"[{self.domain}] cannot load service account key ({type(e).__name__})"
+                        ) from e
+                    self._directory_group_member_creds = creds
+                    self._directory_group_member = build(
+                        "admin", "directory_v1", credentials=creds, cache_discovery=False
+                    )
+        return self._directory_group_member
 
     def _gmail_service(self, user_email: str):
         """Return (service, creds) for the Gmail API impersonating ONE user.
@@ -493,6 +580,124 @@ class DomainClient:
             # when the token is present match_count is a lower bound, not
             # the true count.
             "match_count_capped": bool(resp.get("nextPageToken")),
+        }
+
+    def get_group_settings(self, group_email: str) -> dict:
+        """Fetch one Google Group's own posting/delivery policy (Groups Settings API).
+
+        A Group's access-control layer sits IN FRONT of Gmail delivery: when
+        ``who_can_post`` restricts posting to domain members/group members
+        only, an external sender's message is rejected there and never
+        generates a per-recipient Gmail delivery event at all -- so
+        ``find_message_by_id``/the Reports API ``applicationName=gmail`` event
+        stream both see nothing for that address, not a bounce. This method
+        reads the policy directly instead of it having to be inferred from an
+        absence of delivery events (see ``docs`` for the incident this was
+        built from: two G Suite groups accepted a normal internal newsletter
+        but silently dropped the same message from an external sender,
+        indistinguishable from a delivery failure without this).
+
+        Read-only: only ``groups().get()`` is issued. Requires the
+        ``apps.groups.settings`` DWD scope -- a distinct API/product from the
+        Directory API scopes ``get_group_roster`` uses, so either can be
+        granted without the other.
+        """
+        try:
+            svc = self._groups_settings_service()
+            http = self._new_http(self._groups_settings_creds)
+            resp = self._execute(lambda: svc.groups().get(groupUniqueId=group_email), http)
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] groups settings API error (groups.get): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: apps.groups.settings DWD scope not granted for this client.
+            raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (groups.get): {type(e).__name__}") from e
+        return {
+            "who_can_post": resp.get("whoCanPostMessage"),
+            "allow_external_members": _settings_bool(resp.get("allowExternalMembers")),
+            "is_archived": _settings_bool(resp.get("isArchived")),
+            "message_moderation_level": resp.get("messageModerationLevel"),
+            "spam_moderation_level": resp.get("spamModerationLevel"),
+            "allow_web_posting": _settings_bool(resp.get("allowWebPosting")),
+        }
+
+    def get_group_roster(self, group_email: str, *, max_pages: int = 20) -> dict:
+        """Fetch a Google Group's basic metadata + member roster (Directory API).
+
+        Resolves membership directly -- unlike inferring it from Reports API
+        delivery-event fanout (``applicationName=gmail``), which only shows
+        members who actually received one PARTICULAR message and requires one
+        to already have been sent. Two sequential calls sharing fate (same as
+        ``find_message_by_id``'s list-then-get): ``groups().get()`` for
+        name/description/direct-member-count, then a paginated
+        ``members().list()`` for the roster. Read-only, never a mutating call.
+
+        Requires the ``admin.directory.group.readonly`` DWD scope for the
+        metadata call and ``admin.directory.group.member.readonly`` for the
+        roster -- built as two separately-credentialed services (like
+        ``_directory_service`` vs ``_directory_security_service``), so a
+        caller only using one of the two returned sections is possible in a
+        future tool without both grants.
+
+        Returns ``{"group": {...}, "members": [...], "members_capped": bool}``;
+        ``members_capped=True`` means more pages existed beyond ``max_pages``
+        (Directory API hard limit ``GROUP_MEMBER_PAGE_SIZE`` per page) -- a
+        caller must not mistake a partial roster for the full one.
+        """
+        try:
+            gsvc = self._directory_group_service()
+            ghttp = self._new_http(self._directory_group_creds)
+            group = self._execute(lambda: gsvc.groups().get(groupKey=group_email), ghttp)
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] directory API error (groups.get): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: admin.directory.group.readonly DWD scope not granted.
+            raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (groups.get): {type(e).__name__}") from e
+
+        members: list[dict] = []
+        token = None
+        pages = 0
+        try:
+            msvc = self._directory_group_member_service()
+            mhttp = self._new_http(self._directory_group_member_creds)
+            while True:
+                resp = self._execute(
+                    lambda tok=token: msvc.members().list(
+                        groupKey=group_email, maxResults=GROUP_MEMBER_PAGE_SIZE, pageToken=tok
+                    ),
+                    mhttp,
+                )
+                members.extend(resp.get("members", []))
+                token = resp.get("nextPageToken")
+                pages += 1
+                if not token or pages >= max_pages:
+                    break
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] directory API error (members.list): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: admin.directory.group.member.readonly DWD scope not granted.
+            raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (members.list): {type(e).__name__}") from e
+
+        return {
+            "group": {
+                "email": group.get("email"),
+                "name": group.get("name"),
+                "description": group.get("description"),
+                "direct_members_count": group.get("directMembersCount"),
+            },
+            "members": [
+                {"email": m.get("email"), "role": m.get("role"), "type": m.get("type"), "status": m.get("status")}
+                for m in members
+            ],
+            "members_capped": bool(token),
         }
 
     def check(self) -> dict:
