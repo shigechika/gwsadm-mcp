@@ -274,77 +274,79 @@ class FakeDirectoryGroupMemberService:
         return self._m
 
 
-def _group_roster_client(group_resp, group_exc, member_pages, member_exc=None):
-    gsvc = FakeDirectoryGroupService(group_resp, group_exc)
-    msvc = FakeDirectoryGroupMemberService(member_pages, member_exc)
-    c = DomainClient(CFG, directory_group_service=gsvc, directory_group_member_service=msvc)
-    return c, gsvc._g, msvc._m
+def _group_client(resp, exc=None):
+    svc = FakeDirectoryGroupService(resp, exc)
+    return DomainClient(CFG, directory_group_service=svc), svc._g
 
 
-def test_get_group_roster_returns_group_and_paginated_members():
-    c, g, m = _group_roster_client(
-        group_resp={"email": "team@example.edu", "name": "Team", "description": "d", "directMembersCount": "2"},
-        group_exc=None,
-        member_pages=[
+def _group_member_client(pages, exc=None):
+    svc = FakeDirectoryGroupMemberService(pages, exc)
+    return DomainClient(CFG, directory_group_member_service=svc), svc._m
+
+
+def test_get_group_returns_projected_metadata_and_passes_group_key():
+    c, g = _group_client({"email": "team@example.edu", "name": "Team", "description": "d", "directMembersCount": "2"})
+    result = c.get_group("team@example.edu")
+    assert result == {"email": "team@example.edu", "name": "Team", "description": "d", "direct_members_count": "2"}
+    assert g.calls[0]["groupKey"] == "team@example.edu"
+
+
+def test_get_group_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
+    c, _ = _group_client(None, exc=err)
+    with pytest.raises(GwsError):
+        c.get_group("nonexistent@example.edu")
+
+
+def test_get_group_auth_error_maps_to_gws_auth_error():
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _group_client(None, exc=RefreshError("unauthorized_client"))
+    with pytest.raises(GwsAuthError):
+        c.get_group("team@example.edu")
+
+
+def test_list_group_members_paginates_and_passes_group_key():
+    c, m = _group_member_client(
+        [
             {
                 "members": [{"email": "a@example.edu", "role": "MEMBER", "type": "USER", "status": "ACTIVE"}],
                 "nextPageToken": "tok",
             },
             {"members": [{"email": "b@example.edu", "role": "OWNER", "type": "USER", "status": "ACTIVE"}]},
-        ],
+        ]
     )
-    result = c.get_group_roster("team@example.edu")
-    assert result["group"] == {
-        "email": "team@example.edu",
-        "name": "Team",
-        "description": "d",
-        "direct_members_count": "2",
-    }
-    assert [x["email"] for x in result["members"]] == ["a@example.edu", "b@example.edu"]
-    assert result["members_capped"] is False
-    assert g.calls[0]["groupKey"] == "team@example.edu"
+    members, capped = c.list_group_members("team@example.edu")
+    assert [x["email"] for x in members] == ["a@example.edu", "b@example.edu"]
+    assert capped is False
     assert m.calls[0]["groupKey"] == "team@example.edu"
     assert m.calls[1]["pageToken"] == "tok"
 
 
-def test_get_group_roster_caps_pages():
-    c, _, _ = _group_roster_client(
-        group_resp={"email": "team@example.edu"},
-        group_exc=None,
-        member_pages=[{"members": [{"email": "x@example.edu"}], "nextPageToken": "more"}] * 5,
-    )
-    result = c.get_group_roster("team@example.edu", max_pages=2)
-    assert len(result["members"]) == 2
-    assert result["members_capped"] is True  # stopped early with pages remaining
+def test_list_group_members_caps_pages():
+    c, _ = _group_member_client([{"members": [{"email": "x@example.edu"}], "nextPageToken": "more"}] * 5)
+    members, capped = c.list_group_members("team@example.edu", max_pages=2)
+    assert len(members) == 2
+    assert capped is True  # stopped early with pages remaining
 
 
-def test_get_group_roster_group_lookup_error_maps_to_gws_error():
-    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
-    c, _, _ = _group_roster_client(group_resp=None, group_exc=err, member_pages=[{}])
-    with pytest.raises(GwsError):
-        c.get_group_roster("nonexistent@example.edu")
-
-
-def test_get_group_roster_member_lookup_error_maps_to_gws_error():
-    # The group lookup succeeds but the member listing fails (e.g. only the
-    # group.readonly scope is granted, not group.member.readonly) -- the
-    # whole call must still surface as an error, not a partial/empty roster.
+def test_list_group_members_http_error_maps_to_gws_error():
     err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
-    c, _, _ = _group_roster_client(
-        group_resp={"email": "team@example.edu"}, group_exc=None, member_pages=None, member_exc=err
-    )
+    c, _ = _group_member_client(None, exc=err)
     with pytest.raises(GwsError):
-        c.get_group_roster("team@example.edu")
+        c.list_group_members("team@example.edu")
 
 
-def test_get_group_roster_auth_error_maps_to_gws_auth_error():
+def test_list_group_members_auth_error_maps_to_gws_auth_error():
     from google.auth.exceptions import RefreshError
 
     from gwsadm_mcp.client import GwsAuthError
 
-    c, _, _ = _group_roster_client(group_resp=None, group_exc=RefreshError("unauthorized_client"), member_pages=[{}])
+    c, _ = _group_member_client(None, exc=RefreshError("unauthorized_client"))
     with pytest.raises(GwsAuthError):
-        c.get_group_roster("team@example.edu")
+        c.list_group_members("team@example.edu")
 
 
 class FakeGmailMessagesResource:

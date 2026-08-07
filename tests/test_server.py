@@ -18,7 +18,8 @@ class FakeDomainClient:
         tokens=None,
         gmail_messages=None,
         group_settings=None,
-        group_roster=None,
+        group_meta=None,
+        group_members=None,
     ):
         self.domain = domain
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
@@ -30,15 +31,18 @@ class FakeDomainClient:
         # lacks the scope" case; a per-user dict lets one test cover a mixed
         # found/not-found/error recipient list against a single client)
         self._gmail_messages = gmail_messages
-        # group_settings / group_roster: dict[group_email, dict | Exception] | Exception | None
-        # (same shape convention as gmail_messages above)
+        # group_settings / group_meta / group_members: dict[group_email, ... | Exception] | Exception | None
+        # (same shape convention as gmail_messages above; group_members values
+        # are (members, capped) tuples, matching the real client's return shape)
         self._group_settings = group_settings
-        self._group_roster = group_roster
+        self._group_meta = group_meta
+        self._group_members = group_members
         self.calls = []
         self.token_calls = []
         self.gmail_calls = []
         self.group_settings_calls = []
-        self.group_roster_calls = []
+        self.group_meta_calls = []
+        self.group_members_calls = []
 
     def fetch_activities(self, application_name, *, start, end=None, event_name=None, filters=None, max_pages=5):
         self.calls.append((application_name, event_name, max_pages, filters))
@@ -85,13 +89,24 @@ class FakeDomainClient:
             raise got
         return got
 
-    def get_group_roster(self, group_email, *, max_pages=20):
-        self.group_roster_calls.append((group_email, max_pages))
-        if self._group_roster is None:
-            return {"group": {}, "members": [], "members_capped": False}
-        if isinstance(self._group_roster, Exception):
-            raise self._group_roster
-        got = self._group_roster.get(group_email)
+    def get_group(self, group_email):
+        self.group_meta_calls.append(group_email)
+        if self._group_meta is None:
+            return {}
+        if isinstance(self._group_meta, Exception):
+            raise self._group_meta
+        got = self._group_meta.get(group_email)
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    def list_group_members(self, group_email, *, max_pages=20):
+        self.group_members_calls.append((group_email, max_pages))
+        if self._group_members is None:
+            return [], False
+        if isinstance(self._group_members, Exception):
+            raise self._group_members
+        got = self._group_members.get(group_email)
         if isinstance(got, Exception):
             raise got
         return got
@@ -542,12 +557,12 @@ def test_group_delivery_policy_rejects_non_email():
 
 
 def test_list_group_members_returns_group_and_members(inject):
-    roster = {
-        "group": {"email": "team@example.edu", "name": "Team"},
-        "members": [{"email": "a@example.edu", "role": "MEMBER"}],
-        "members_capped": False,
-    }
-    c = FakeDomainClient("example.edu", {}, group_roster={"team@example.edu": roster})
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta={"team@example.edu": {"email": "team@example.edu", "name": "Team"}},
+        group_members={"team@example.edu": ([{"email": "a@example.edu", "role": "MEMBER"}], False)},
+    )
     inject([c], {"example.edu"})
     out = server.list_group_members("team@example.edu")
     assert out["domain"] == "example.edu"
@@ -556,28 +571,95 @@ def test_list_group_members_returns_group_and_members(inject):
     assert out["member_count"] == 1
     assert out["members"] == [{"email": "a@example.edu", "role": "MEMBER"}]
     assert out["capped"] is False
-    assert c.group_roster_calls == [("team@example.edu", 20)]  # default max_pages
+    assert c.group_meta_calls == ["team@example.edu"]
+    assert c.group_members_calls == [("team@example.edu", 20)]  # default max_pages
 
 
 def test_list_group_members_passes_max_pages_and_surfaces_capped(inject):
-    roster = {"group": {}, "members": [], "members_capped": True}
-    c = FakeDomainClient("example.edu", {}, group_roster={"team@example.edu": roster})
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta={"team@example.edu": {}},
+        group_members={"team@example.edu": ([], True)},
+    )
     inject([c], {"example.edu"})
     out = server.list_group_members("team@example.edu", max_pages=3)
     assert out["capped"] is True
-    assert c.group_roster_calls == [("team@example.edu", 3)]
+    assert c.group_members_calls == [("team@example.edu", 3)]
 
 
-def test_list_group_members_degrades_on_auth_error(inject):
+def test_list_group_members_degrades_to_group_only_when_only_member_scope_missing(inject):
+    # Only admin.directory.group.member.readonly is missing -- the group
+    # metadata (a DIFFERENT, independently-granted scope) must still come
+    # through rather than the whole call failing.
     from gwsadm_mcp.client import GwsAuthError
 
-    inject(
-        [FakeDomainClient("example.edu", {}, group_roster=GwsAuthError("no directory group scope"))],
-        {"example.edu"},
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta={"team@example.edu": {"email": "team@example.edu"}},
+        group_members=GwsAuthError("no group.member.readonly scope"),
     )
+    inject([c], {"example.edu"})
+    out = server.list_group_members("team@example.edu")
+    assert "error" not in out
+    assert out["group"] == {"email": "team@example.edu"}
+    assert out["members"] == []
+    assert out["member_count"] == 0
+    assert out["capped"] is False
+    assert "members_error" in out
+
+
+def test_list_group_members_degrades_to_members_only_when_only_group_scope_missing(inject):
+    # The mirror case: admin.directory.group.readonly is missing but
+    # admin.directory.group.member.readonly is granted -- the roster must
+    # still come through, with the group section reporting its own error.
+    from gwsadm_mcp.client import GwsAuthError
+
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta=GwsAuthError("no group.readonly scope"),
+        group_members={"team@example.edu": ([{"email": "a@example.edu"}], False)},
+    )
+    inject([c], {"example.edu"})
+    out = server.list_group_members("team@example.edu")
+    assert "error" not in out
+    assert "error" in out["group"]
+    assert out["members"] == [{"email": "a@example.edu"}]
+    assert out["member_count"] == 1
+
+
+def test_list_group_members_top_level_error_only_when_both_scopes_fail(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta=GwsAuthError("no group.readonly scope"),
+        group_members=GwsAuthError("no group.member.readonly scope"),
+    )
+    inject([c], {"example.edu"})
     out = server.list_group_members("team@example.edu")
     assert "error" in out
     assert out["domain"] == "example.edu"
+    assert "group" not in out  # a single combined error, not two redundant per-section ones
+
+
+def test_list_group_members_calls_both_independently_regardless_of_order(inject):
+    # Both get_group and list_group_members must always be attempted, even
+    # when one is guaranteed to fail -- neither call may gate the other,
+    # since they exercise two separately-granted DWD scopes.
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta=GwsError("[example.edu] directory API error (groups.get): HTTP 404"),
+        group_members={"team@example.edu": ([{"email": "a@example.edu"}], False)},
+    )
+    inject([c], {"example.edu"})
+    server.list_group_members("team@example.edu")
+    assert c.group_meta_calls == ["team@example.edu"]
+    assert c.group_members_calls == [("team@example.edu", 20)]
 
 
 def test_list_group_members_unresolvable_domain_error_carries_group_email(inject):

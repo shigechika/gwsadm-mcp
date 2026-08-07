@@ -108,19 +108,23 @@ to guard against stdio newline regressions).
   support the `q=` search parameter `rfc822msgid:...` needs, even though the
   tool code itself only ever requests `format="metadata"` on the matched
   message.
-  `get_group_settings` (Groups Settings API) and `get_group_roster`
-  (Directory API) each build their own separately-credentialed service —
-  `_groups_settings_service`, `_directory_group_service`,
-  `_directory_group_member_service` — following the same one-scope-per-service
-  pattern as `_directory_service` vs `_directory_security_service`, all
-  impersonating the domain's fixed `cfg.subject` (not a per-call recipient
-  like Gmail). `get_group_roster` issues `groups().get()` then a paginated
-  `members().list()` (hard limit `GROUP_MEMBER_PAGE_SIZE`=200/page, distinct
-  from the 500/page `users().list()` limit) as two sequential calls sharing
-  fate, the same pattern `find_message_by_id`'s list-then-get uses. The
-  Groups Settings API returns its boolean fields as the strings `"true"` /
-  `"false"`, not JSON booleans — `_settings_bool()` normalizes that before it
-  reaches tool output.
+  `get_group_settings` (Groups Settings API), `get_group`, and
+  `list_group_members` (both Directory API) each build their own
+  separately-credentialed service — `_groups_settings_service`,
+  `_directory_group_service`, `_directory_group_member_service` — following
+  the same one-scope-per-service pattern as `_directory_service` vs
+  `_directory_security_service`, all impersonating the domain's fixed
+  `cfg.subject` (not a per-call recipient like Gmail). Unlike
+  `find_message_by_id`'s list-then-get (one scope, two calls sharing fate),
+  `get_group` (`groups().get()`) and `list_group_members` (paginated
+  `members().list()`, hard limit `GROUP_MEMBER_PAGE_SIZE`=200/page, distinct
+  from the 500/page `users().list()` limit) are two INDEPENDENT client
+  methods under two DIFFERENT DWD scopes — the `list_group_members` MCP tool
+  in `server.py` calls both and degrades per-section (a scope missing on
+  one side still returns the other), never letting one call's failure block
+  the other from even being attempted. The Groups Settings API returns its
+  boolean fields as the strings `"true"` / `"false"`, not JSON booleans —
+  `_settings_bool()` normalizes that before it reaches tool output.
 - `gwsadm_mcp/config.py` — `load_config()` parses the `GWSADM_CONFIG` INI
   file into `list[DomainConfig]` + the `internal_domains` allowlist;
   `ConfigError` on a missing file, missing keys, or zero `[domain.*]`

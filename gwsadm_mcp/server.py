@@ -733,7 +733,11 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
     ``admin.directory.group.readonly`` and
     ``admin.directory.group.member.readonly`` DWD scopes — granted PER
     SERVICE ACCOUNT CLIENT ID in the Admin console, separately from every
-    other scope this server uses, and NOT on by default.
+    other scope this server uses, and NOT on by default. The two calls are
+    independent: a tenant with only one of the two scopes granted still gets
+    that one section, with the other reported as ``{"error": ...}`` in its
+    place rather than failing the whole call — only when BOTH fail does the
+    tool return a single top-level ``error``.
 
     Args:
         group_email: The group's address.
@@ -753,17 +757,33 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
     except (ConfigError, GwsError) as e:
         return {"group_email": group_email, "error": str(e)}
     c = picked[0]
+
+    group_err = members_err = None
     try:
-        result = c.get_group_roster(group_email, max_pages=max_pages)
+        group = c.get_group(group_email)
     except (GwsAuthError, GwsError) as e:
-        return {"domain": c.domain, "group_email": group_email, "error": str(e)}
+        group_err = str(e)
+    try:
+        members, capped = c.list_group_members(group_email, max_pages=max_pages)
+    except (GwsAuthError, GwsError) as e:
+        members_err = str(e)
+
+    if group_err is not None and members_err is not None:
+        # Neither scope produced anything usable -- one combined error beats
+        # two redundant per-section ones.
+        return {
+            "domain": c.domain,
+            "group_email": group_email,
+            "error": f"group lookup failed ({group_err}); member lookup failed ({members_err})",
+        }
     return {
         "domain": c.domain,
         "group_email": group_email,
-        "group": result["group"],
-        "member_count": len(result["members"]),
-        "members": result["members"],
-        "capped": result["members_capped"],
+        "group": {"error": group_err} if group_err is not None else group,
+        "member_count": 0 if members_err is not None else len(members),
+        "members": [] if members_err is not None else members,
+        "capped": False if members_err is not None else capped,
+        **({"members_error": members_err} if members_err is not None else {}),
     }
 
 

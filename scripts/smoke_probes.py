@@ -116,18 +116,20 @@ async def _fake_message_and_recipient(call: Caller) -> dict[str, Any]:
     }
 
 
-async def _fake_group(call: Caller) -> dict[str, Any]:
-    """A syntactically valid but guaranteed-nonexistent group address, in a
-    real configured domain discovered at run time (reusing ``_some_account``).
-
-    Mirrors ``_fake_message_and_recipient``: this deliberately never finds a
-    match, exercising the full DWD-impersonation + API code path (auth, the
-    groups().get() call, and its not-found response) without depending on --
-    or naming -- any real group in the tenant.
+async def _no_group_to_probe(call: Caller) -> dict[str, Any]:
+    """There is no tenant-agnostic way to name a real group at run time (no
+    group-listing tool exists in this server, unlike ``_some_account``'s
+    fallback onto suspended_accounts/login_audit for a real user), and a
+    synthetic nonexistent address does NOT substitute the way
+    ``_fake_message_and_recipient`` does for Gmail: this harness's own
+    ``evaluate()`` treats any top-level ``{"error": ...}`` as an automatic
+    FAIL (see smoke_harness.py), and a lookup against a guaranteed-missing
+    group always returns exactly that -- so a fabricated address would not
+    safely probe anything, it would just fail every run regardless of
+    whether the underlying DWD scopes actually work. Skip until this server
+    gains a real, tenant-agnostic way to name an existing group.
     """
-    account = await _some_account(call)
-    suffix = account["username"].rsplit("@", 1)[-1]
-    return {"group_email": f"smoke-test-{secrets.token_hex(16)}@{suffix}"}
+    raise SkipProbe("no tenant-agnostic way to discover a real group address to probe")
 
 
 async def _finished_job(call: Caller) -> dict[str, Any]:
@@ -203,23 +205,19 @@ PROBES: dict[str, Probe] = {
         # shape above; a raised exception or a malformed shape still fails
         # the probe through the harness's own checks.
     ),
+    # Skipped, not probed with a synthetic address: see _no_group_to_probe's
+    # docstring for why a fabricated group email cannot safely stand in here
+    # the way _fake_message_and_recipient does for gmail_message_trace.
     "group_delivery_policy": Probe(
-        args_factory=_fake_group,
+        args_factory=_no_group_to_probe,
         require_keys=("domain", "group_email"),
         allow_empty=True,
-        # Deliberately no must_not_match on error here: the synthetic address
-        # is guaranteed not to be a real group, so a not-found-shaped
-        # {"error": ...} is this tool WORKING correctly (same rationale as
-        # gmail_message_trace's per-recipient error above), not a broken
-        # probe. What must hold is the envelope shape (domain + group_email
-        # always present).
     ),
     "list_group_members": Probe(
-        args_factory=_fake_group,
+        args_factory=_no_group_to_probe,
         args={"max_pages": 1},
         require_keys=("domain", "group_email"),
         allow_empty=True,
-        # Same rationale as group_delivery_policy above.
     ),
     # -- Drive exposure ------------------------------------------------------
     "drive_external_sharing": Probe(

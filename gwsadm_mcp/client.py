@@ -599,8 +599,8 @@ class DomainClient:
 
         Read-only: only ``groups().get()`` is issued. Requires the
         ``apps.groups.settings`` DWD scope -- a distinct API/product from the
-        Directory API scopes ``get_group_roster`` uses, so either can be
-        granted without the other.
+        Directory API scopes ``get_group``/``list_group_members`` use, so
+        either can be granted without the other.
         """
         try:
             svc = self._groups_settings_service()
@@ -623,33 +623,24 @@ class DomainClient:
             "allow_web_posting": _settings_bool(resp.get("allowWebPosting")),
         }
 
-    def get_group_roster(self, group_email: str, *, max_pages: int = 20) -> dict:
-        """Fetch a Google Group's basic metadata + member roster (Directory API).
+    def get_group(self, group_email: str) -> dict:
+        """Fetch one Google Group's basic metadata (Directory API ``groups().get()``).
 
-        Resolves membership directly -- unlike inferring it from Reports API
-        delivery-event fanout (``applicationName=gmail``), which only shows
-        members who actually received one PARTICULAR message and requires one
-        to already have been sent. Two sequential calls sharing fate (same as
-        ``find_message_by_id``'s list-then-get): ``groups().get()`` for
-        name/description/direct-member-count, then a paginated
-        ``members().list()`` for the roster. Read-only, never a mutating call.
+        Deliberately independent of ``list_group_members`` below (not a
+        combined list-then-get like ``find_message_by_id``): the two calls
+        use DIFFERENT DWD scopes (``admin.directory.group.readonly`` here vs
+        ``admin.directory.group.member.readonly`` there) that are granted
+        separately in practice, so neither call's success may gate the
+        other's — a tenant that granted only one scope must still get that
+        one piece, and a caller wanting both issues both calls itself (see
+        the ``list_group_members`` MCP tool in ``server.py``).
 
-        Requires the ``admin.directory.group.readonly`` DWD scope for the
-        metadata call and ``admin.directory.group.member.readonly`` for the
-        roster -- built as two separately-credentialed services (like
-        ``_directory_service`` vs ``_directory_security_service``), so a
-        caller only using one of the two returned sections is possible in a
-        future tool without both grants.
-
-        Returns ``{"group": {...}, "members": [...], "members_capped": bool}``;
-        ``members_capped=True`` means more pages existed beyond ``max_pages``
-        (Directory API hard limit ``GROUP_MEMBER_PAGE_SIZE`` per page) -- a
-        caller must not mistake a partial roster for the full one.
+        Read-only: only ``groups().get()`` is issued.
         """
         try:
-            gsvc = self._directory_group_service()
-            ghttp = self._new_http(self._directory_group_creds)
-            group = self._execute(lambda: gsvc.groups().get(groupKey=group_email), ghttp)
+            svc = self._directory_group_service()
+            http = self._new_http(self._directory_group_creds)
+            resp = self._execute(lambda: svc.groups().get(groupKey=group_email), http)
         except HttpError as e:
             status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
             raise GwsError(f"[{self.domain}] directory API error (groups.get): HTTP {status}") from e
@@ -658,19 +649,41 @@ class DomainClient:
             raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (groups.get): {type(e).__name__}") from e
+        return {
+            "email": resp.get("email"),
+            "name": resp.get("name"),
+            "description": resp.get("description"),
+            "direct_members_count": resp.get("directMembersCount"),
+        }
 
+    def list_group_members(self, group_email: str, *, max_pages: int = 20) -> tuple[list[dict], bool]:
+        """Fetch a Google Group's member roster, paginated (Directory API ``members().list()``).
+
+        Resolves membership directly -- unlike inferring it from Reports API
+        delivery-event fanout (``applicationName=gmail``), which only shows
+        members who actually received one PARTICULAR message and requires one
+        to already have been sent. Independent of ``get_group`` above — see
+        its docstring for why neither call gates the other. Read-only, never
+        a mutating call. Requires the ``admin.directory.group.member.readonly``
+        DWD scope.
+
+        Returns ``(members, capped)``; ``capped=True`` means more pages
+        existed beyond ``max_pages`` (Directory API hard limit
+        ``GROUP_MEMBER_PAGE_SIZE`` per page) -- a caller must not mistake a
+        partial roster for the full one.
+        """
         members: list[dict] = []
         token = None
         pages = 0
         try:
-            msvc = self._directory_group_member_service()
-            mhttp = self._new_http(self._directory_group_member_creds)
+            svc = self._directory_group_member_service()
+            http = self._new_http(self._directory_group_member_creds)
             while True:
                 resp = self._execute(
-                    lambda tok=token: msvc.members().list(
+                    lambda tok=token: svc.members().list(
                         groupKey=group_email, maxResults=GROUP_MEMBER_PAGE_SIZE, pageToken=tok
                     ),
-                    mhttp,
+                    http,
                 )
                 members.extend(resp.get("members", []))
                 token = resp.get("nextPageToken")
@@ -685,20 +698,10 @@ class DomainClient:
             raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (members.list): {type(e).__name__}") from e
-
-        return {
-            "group": {
-                "email": group.get("email"),
-                "name": group.get("name"),
-                "description": group.get("description"),
-                "direct_members_count": group.get("directMembersCount"),
-            },
-            "members": [
-                {"email": m.get("email"), "role": m.get("role"), "type": m.get("type"), "status": m.get("status")}
-                for m in members
-            ],
-            "members_capped": bool(token),
-        }
+        return [
+            {"email": m.get("email"), "role": m.get("role"), "type": m.get("type"), "status": m.get("status")}
+            for m in members
+        ], bool(token)
 
     def check(self) -> dict:
         """Cheap end-to-end probe: one 1-item login query (auth + API + DWD)."""
