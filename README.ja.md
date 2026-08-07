@@ -72,8 +72,8 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
 | `https://www.googleapis.com/auth/apps.groups.settings` | `group_delivery_policy` | そのツールだけエラーに縮退。他は動作を続ける |
-| `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members`（グループ情報側） | 下のメンバー用スコープが付与済みでもこのツールはエラーに縮退する — 2つの呼び出しは運命共同体 |
-| `https://www.googleapis.com/auth/admin.directory.group.member.readonly` | `list_group_members`（メンバー一覧側） | 同上 |
+| `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members`（グループ情報側） | この側だけが自分のエラーを返す。下のメンバー用スコープが付与されていればメンバー一覧側は独立して動作する |
+| `https://www.googleapis.com/auth/admin.directory.group.member.readonly` | `list_group_members`（メンバー一覧側） | 同上、上のグループ情報側とは独立——2つの呼び出しは互いをブロックしない |
 
 Groups Settings API は Directory API とは別プロダクトなのでスコープも別立てになっている。
 読み取り専用バリアントは存在しないが、本サーバーが呼ぶのは `groups().get()` のみで、
@@ -209,9 +209,20 @@ gwsadm-mcp             # MCP サーバを起動（STDIO、既定）
 - `group_delivery_policy` は Groups Settings API の `"true"`/`"false"` 文字列
   フィールド（JSON boolean ではなく、この API 固有の癖）を実際の boolean に
   正規化して返す。Google の応答に無いフィールドは `null` のままで、`false`
-  に丸めない。`list_group_members` はメンバー一覧がページ予算（既定20ページ
-  × 200件/ページ）を超えた場合 `capped: true` を返す — 一部だけのメンバー
-  一覧を全件と誤読してはいけない。
+  に丸めない。`list_group_members` はグループ情報取得とメンバー一覧取得を
+  互いに独立して実行する — DWDスコープが片方しか付与されていないテナントでも、
+  付与されている方のセクションは返り、もう片方はそこに `{"error": ...}` を
+  埋め込む形で報告する。`capped: true` は、メンバー一覧がページ予算（既定20
+  ページ × 200件/ページ）を超えた場合と、メンバー取得自体が失敗した場合
+  （`members_error` 参照）の両方で返す — どちらも全件ではないという点は同じで、
+  `capped` が true のとき `members` が空でも「メンバー0名と確認できた」と
+  誤読してはいけない。
+  両ツールとも「このアドレスはグループではない」（3つの API 呼び出しすべてで
+  本番確認済みの、単純な HTTP 404）を本当のエラーと区別する:
+  `group_delivery_policy` は `found: false` を返す。`list_group_members` も
+  同様に返すが、それは2つの独立した取得が**両方とも**エラーなしで一致して
+  「見つからない」と答えたときだけ — 片方だけ見つからない・片方だけエラー
+  という混在状態は、通常のセクション別の形にフォールバックする。
 - 設計上 read-only — このパッケージが発行する API 呼び出しは `activities().list`
   （Reports API）、`users().list` / `tokens().list` / `groups().get` /
   `members().list`（Directory API）、`groups().get`（Groups Settings API）、

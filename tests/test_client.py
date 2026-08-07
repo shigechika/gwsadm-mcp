@@ -221,11 +221,19 @@ def test_get_group_settings_missing_fields_return_none_not_false():
     assert result["is_archived"] is None
 
 
-def test_get_group_settings_http_error_maps_to_gws_error():
+def test_get_group_settings_not_found_returns_none():
+    # A plain 404 means the address is not a group -- a normal, expected
+    # answer distinguished from a raised GwsError (any other HTTP status).
     err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
     c, _ = _groups_settings_client(None, exc=err)
+    assert c.get_group_settings("nonexistent@example.edu") is None
+
+
+def test_get_group_settings_non_404_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _groups_settings_client(None, exc=err)
     with pytest.raises(GwsError):
-        c.get_group_settings("nonexistent@example.edu")
+        c.get_group_settings("team@example.edu")
 
 
 def test_get_group_settings_auth_error_maps_to_gws_auth_error():
@@ -291,11 +299,17 @@ def test_get_group_returns_projected_metadata_and_passes_group_key():
     assert g.calls[0]["groupKey"] == "team@example.edu"
 
 
-def test_get_group_http_error_maps_to_gws_error():
+def test_get_group_not_found_returns_none():
     err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
     c, _ = _group_client(None, exc=err)
+    assert c.get_group("nonexistent@example.edu") is None
+
+
+def test_get_group_non_404_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "500", "reason": "boom"}), b"{}")
+    c, _ = _group_client(None, exc=err)
     with pytest.raises(GwsError):
-        c.get_group("nonexistent@example.edu")
+        c.get_group("team@example.edu")
 
 
 def test_get_group_auth_error_maps_to_gws_auth_error():
@@ -332,7 +346,43 @@ def test_list_group_members_caps_pages():
     assert capped is True  # stopped early with pages remaining
 
 
-def test_list_group_members_http_error_maps_to_gws_error():
+def test_list_group_members_not_found_on_first_page_returns_none():
+    # A 404 on the very first page means the group itself doesn't exist.
+    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
+    c, _ = _group_member_client(None, exc=err)
+    assert c.list_group_members("nonexistent@example.edu") is None
+
+
+def test_list_group_members_404_on_later_page_still_raises():
+    # A group that existed when listing started but was deleted mid-pagination
+    # is not "not found" -- it must stay a real error, not silently report a
+    # partial roster (or None) as though the group never existed.
+    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
+
+    class _FlakyMembersResource:
+        def __init__(self):
+            self.calls = 0
+
+        def list(self, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                return _Req({"members": [{"email": "a@example.edu"}], "nextPageToken": "tok"})
+            return _Req(None, err)
+
+    class _FlakyService:
+        def __init__(self, resource):
+            self._m = resource
+
+        def members(self):
+            return self._m
+
+    resource = _FlakyMembersResource()
+    c = DomainClient(CFG, directory_group_member_service=_FlakyService(resource))
+    with pytest.raises(GwsError):
+        c.list_group_members("team@example.edu")
+
+
+def test_list_group_members_non_404_http_error_maps_to_gws_error():
     err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
     c, _ = _group_member_client(None, exc=err)
     with pytest.raises(GwsError):

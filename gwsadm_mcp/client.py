@@ -131,6 +131,18 @@ def _rfc3339(dt: datetime.datetime) -> str:
     return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _is_not_found(e: HttpError) -> bool:
+    """True for a plain HTTP 404 -- the address does not name any group in
+    this domain (verified live: groupssettings.groups().get,
+    directory.groups().get, and directory.members().list all return exactly
+    this for a nonexistent group, not e.g. 400). Distinct from every other
+    HttpError, which stays a real ``GwsError`` -- a caller must be able to
+    tell "this group doesn't exist" (a normal, expected answer) apart from
+    "the API call itself failed" (a real problem)."""
+    status = getattr(getattr(e, "resp", None), "status", None)
+    return status == 404
+
+
 def _settings_bool(v) -> bool | None:
     """Groups Settings API booleans are the STRINGS "true"/"false", not JSON
     booleans (a longstanding quirk of this older REST API) -- normalize so
@@ -582,7 +594,7 @@ class DomainClient:
             "match_count_capped": bool(resp.get("nextPageToken")),
         }
 
-    def get_group_settings(self, group_email: str) -> dict:
+    def get_group_settings(self, group_email: str) -> dict | None:
         """Fetch one Google Group's own posting/delivery policy (Groups Settings API).
 
         A Group's access-control layer sits IN FRONT of Gmail delivery: when
@@ -601,12 +613,19 @@ class DomainClient:
         ``apps.groups.settings`` DWD scope -- a distinct API/product from the
         Directory API scopes ``get_group``/``list_group_members`` use, so
         either can be granted without the other.
+
+        Returns ``None`` when ``group_email`` does not name any group in this
+        domain (a plain HTTP 404, verified against production) -- a normal,
+        expected answer distinguished from a raised ``GwsError``/``GwsAuthError``,
+        which mean the call itself failed to work.
         """
         try:
             svc = self._groups_settings_service()
             http = self._new_http(self._groups_settings_creds)
             resp = self._execute(lambda: svc.groups().get(groupUniqueId=group_email), http)
         except HttpError as e:
+            if _is_not_found(e):
+                return None
             status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
             raise GwsError(f"[{self.domain}] groups settings API error (groups.get): HTTP {status}") from e
         except GoogleAuthError as e:
@@ -623,7 +642,7 @@ class DomainClient:
             "allow_web_posting": _settings_bool(resp.get("allowWebPosting")),
         }
 
-    def get_group(self, group_email: str) -> dict:
+    def get_group(self, group_email: str) -> dict | None:
         """Fetch one Google Group's basic metadata (Directory API ``groups().get()``).
 
         Deliberately independent of ``list_group_members`` below (not a
@@ -636,12 +655,18 @@ class DomainClient:
         the ``list_group_members`` MCP tool in ``server.py``).
 
         Read-only: only ``groups().get()`` is issued.
+
+        Returns ``None`` when ``group_email`` does not name any group in this
+        domain (a plain HTTP 404, verified against production) -- a normal,
+        expected answer distinguished from a raised ``GwsError``/``GwsAuthError``.
         """
         try:
             svc = self._directory_group_service()
             http = self._new_http(self._directory_group_creds)
             resp = self._execute(lambda: svc.groups().get(groupKey=group_email), http)
         except HttpError as e:
+            if _is_not_found(e):
+                return None
             status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
             raise GwsError(f"[{self.domain}] directory API error (groups.get): HTTP {status}") from e
         except GoogleAuthError as e:
@@ -656,7 +681,7 @@ class DomainClient:
             "direct_members_count": resp.get("directMembersCount"),
         }
 
-    def list_group_members(self, group_email: str, *, max_pages: int = 20) -> tuple[list[dict], bool]:
+    def list_group_members(self, group_email: str, *, max_pages: int = 20) -> tuple[list[dict], bool] | None:
         """Fetch a Google Group's member roster, paginated (Directory API ``members().list()``).
 
         Resolves membership directly -- unlike inferring it from Reports API
@@ -667,10 +692,13 @@ class DomainClient:
         a mutating call. Requires the ``admin.directory.group.member.readonly``
         DWD scope.
 
-        Returns ``(members, capped)``; ``capped=True`` means more pages
-        existed beyond ``max_pages`` (Directory API hard limit
-        ``GROUP_MEMBER_PAGE_SIZE`` per page) -- a caller must not mistake a
-        partial roster for the full one.
+        Returns ``(members, capped)``, or ``None`` when ``group_email`` does
+        not name any group in this domain (a plain HTTP 404 on the FIRST
+        page, verified against production) -- a normal, expected answer
+        distinguished from a raised ``GwsError``/``GwsAuthError``.
+        ``capped=True`` means more pages existed beyond ``max_pages``
+        (Directory API hard limit ``GROUP_MEMBER_PAGE_SIZE`` per page) -- a
+        caller must not mistake a partial roster for the full one.
         """
         members: list[dict] = []
         token = None
@@ -691,6 +719,13 @@ class DomainClient:
                 if not token or pages >= max_pages:
                     break
         except HttpError as e:
+            if pages == 0 and _is_not_found(e):
+                # 404 on the very first page: the group itself doesn't exist.
+                # A 404 on a LATER page (a group that existed when listing
+                # started but was deleted mid-pagination) is not this --
+                # that stays a real GwsError below rather than silently
+                # reporting a partial roster as "not found".
+                return None
             status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
             raise GwsError(f"[{self.domain}] directory API error (members.list): HTTP {status}") from e
         except GoogleAuthError as e:

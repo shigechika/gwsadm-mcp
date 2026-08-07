@@ -693,7 +693,9 @@ def group_delivery_policy(group_email: str, domain: str | None = None) -> dict:
     Returns ``who_can_post`` (e.g. ``ALL_IN_DOMAIN_CAN_POST`` blocks external
     senders entirely; ``ANYONE_CAN_POST`` allows them), ``allow_external_members``,
     ``is_archived``, ``message_moderation_level``, ``spam_moderation_level``,
-    ``allow_web_posting``.
+    ``allow_web_posting``. Sets ``found: false`` (no policy fields) when
+    ``group_email`` does not name any group in this domain — that is a
+    normal, expected answer for a bad/typo'd address, not an ``error``.
 
     Args:
         group_email: The group's address (e.g. "team.gen@example.edu").
@@ -712,7 +714,9 @@ def group_delivery_policy(group_email: str, domain: str | None = None) -> dict:
         policy = c.get_group_settings(group_email)
     except (GwsAuthError, GwsError) as e:
         return {"domain": c.domain, "group_email": group_email, "error": str(e)}
-    return {"domain": c.domain, "group_email": group_email, **policy}
+    if policy is None:
+        return {"domain": c.domain, "group_email": group_email, "found": False}
+    return {"domain": c.domain, "group_email": group_email, "found": True, **policy}
 
 
 @mcp.tool()
@@ -739,15 +743,23 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
     place rather than failing the whole call — only when BOTH fail does the
     tool return a single top-level ``error``.
 
+    Sets ``found: false`` (no ``group``/``members`` sections) only when
+    BOTH calls agree, with no error on either side, that ``group_email``
+    does not name any group in this domain — a normal, expected answer for
+    a bad/typo'd address, not an ``error``.
+
     Args:
         group_email: The group's address.
         domain: Configured ``[domain.*]`` section to route the lookup through.
             Default: resolved from the address's suffix.
         max_pages: Pagination cap for the member roster (Directory API hard
             limit 200 members per page). Default 20 (≤4,000 members) —
-            raise for an unusually large group. ``capped: true`` in the
-            result means more pages existed beyond this; a partial roster
-            must never be read as the full one.
+            raise for an unusually large group. ``capped: true`` means the
+            roster is NOT the complete one — either more pages existed
+            beyond this, or the member lookup failed outright (see
+            ``members_error``); either way it must never be read as the
+            full membership, and an empty ``members`` list must not be
+            mistaken for a confirmed-empty group when ``capped`` is true.
     """
     group_email = group_email.strip()
     try:
@@ -758,13 +770,23 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
         return {"group_email": group_email, "error": str(e)}
     c = picked[0]
 
-    group_err = members_err = None
+    group = None
+    group_err = None
     try:
-        group = c.get_group(group_email)
+        group = c.get_group(group_email)  # None means "no such group", not an error
     except (GwsAuthError, GwsError) as e:
         group_err = str(e)
+
+    members: list = []
+    capped = False
+    members_not_found = False
+    members_err = None
     try:
-        members, capped = c.list_group_members(group_email, max_pages=max_pages)
+        roster = c.list_group_members(group_email, max_pages=max_pages)
+        if roster is None:
+            members_not_found = True
+        else:
+            members, capped = roster
     except (GwsAuthError, GwsError) as e:
         members_err = str(e)
 
@@ -776,13 +798,26 @@ def list_group_members(group_email: str, domain: str | None = None, max_pages: i
             "group_email": group_email,
             "error": f"group lookup failed ({group_err}); member lookup failed ({members_err})",
         }
+    group_not_found = group_err is None and group is None
+    if group_not_found and members_not_found:
+        # Both independent lookups agree, with no error on either side, that
+        # this address is not a group at all -- a clean answer, not a partial
+        # failure, so it gets its own shape rather than an empty group/members
+        # pair that would look identical to "group exists but has 0 members".
+        return {"domain": c.domain, "group_email": group_email, "found": False}
     return {
         "domain": c.domain,
         "group_email": group_email,
-        "group": {"error": group_err} if group_err is not None else group,
+        "group": ({"error": group_err} if group_err is not None else ({"found": False} if group is None else group)),
         "member_count": 0 if members_err is not None else len(members),
         "members": [] if members_err is not None else members,
-        "capped": False if members_err is not None else capped,
+        # A member-lookup failure fetched NO roster at all -- strictly worse
+        # than a merely page-capped one, so it counts as partial coverage
+        # too (same convention drive_external_sharing uses: "a probe that
+        # errored out ... counts as partial coverage"). capped=False must
+        # mean "this IS the complete roster", never "we don't know" -- an
+        # empty group and an inaccessible one must not look identical here.
+        "capped": True if members_err is not None else capped,
         **({"members_error": members_err} if members_err is not None else {}),
     }
 

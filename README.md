@@ -80,8 +80,8 @@ with each other or with `gmail.readonly` above:
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
 | `https://www.googleapis.com/auth/apps.groups.settings` | `group_delivery_policy` | that tool degrades to an error; everything else keeps working |
-| `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members` (group metadata half) | that tool degrades to an error even if the member scope below is granted — the two calls share fate |
-| `https://www.googleapis.com/auth/admin.directory.group.member.readonly` | `list_group_members` (member roster half) | same as above |
+| `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members` (group metadata half) | that half reports its own error; the member roster half still works independently if its own scope below is granted |
+| `https://www.googleapis.com/auth/admin.directory.group.member.readonly` | `list_group_members` (member roster half) | same, independent of the metadata half above — the two calls never gate each other |
 
 The Groups Settings API is a distinct product from the Directory API, hence
 the separate scope; it has no readonly-only variant, but this server only
@@ -219,9 +219,21 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
 - `group_delivery_policy` normalizes the Groups Settings API's `"true"`/`"false"`
   string fields (a quirk of that API, not JSON booleans) into real booleans in
   its output; a field absent from Google's response stays `null`, never
-  coerced to `false`. `list_group_members` reports `capped: true` when the
-  member roster exceeded its page budget (default 20 pages × 200/page) — a
-  partial roster must not be read as the full one.
+  coerced to `false`. `list_group_members` runs its group-metadata and
+  member-roster lookups independently — a tenant with only one of the two
+  DWD scopes still gets that one section, the other reported as
+  `{"error": ...}` in its place. It reports `capped: true` both when the
+  member roster exceeded its page budget (default 20 pages × 200/page) and
+  when the member lookup failed outright (see `members_error`) — either
+  way the roster is not the full one, and an empty `members` list must
+  never be read as a confirmed-empty group when `capped` is true.
+  Both group tools distinguish "this address is not a group" (a plain HTTP
+  404, verified against production for all three underlying API calls) from
+  a real failure: `group_delivery_policy` sets `found: false`;
+  `list_group_members` sets it too, but only when BOTH its independent
+  lookups agree with no error on either side — a mixed state (one side
+  not-found, the other erroring or finding data) falls through to the
+  normal per-section shape instead.
 - Read-only by design: `activities().list` (Reports API), `users().list` /
   `tokens().list` / `groups().get` / `members().list` (Directory API),
   `groups().get` (Groups Settings API), and `messages().list` / `messages().get`

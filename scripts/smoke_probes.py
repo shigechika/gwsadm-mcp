@@ -116,20 +116,27 @@ async def _fake_message_and_recipient(call: Caller) -> dict[str, Any]:
     }
 
 
-async def _no_group_to_probe(call: Caller) -> dict[str, Any]:
-    """There is no tenant-agnostic way to name a real group at run time (no
-    group-listing tool exists in this server, unlike ``_some_account``'s
-    fallback onto suspended_accounts/login_audit for a real user), and a
-    synthetic nonexistent address does NOT substitute the way
-    ``_fake_message_and_recipient`` does for Gmail: this harness's own
-    ``evaluate()`` treats any top-level ``{"error": ...}`` as an automatic
-    FAIL (see smoke_harness.py), and a lookup against a guaranteed-missing
-    group always returns exactly that -- so a fabricated address would not
-    safely probe anything, it would just fail every run regardless of
-    whether the underlying DWD scopes actually work. Skip until this server
-    gains a real, tenant-agnostic way to name an existing group.
+async def _fake_group(call: Caller) -> dict[str, Any]:
+    """A syntactically valid but guaranteed-nonexistent group address, in a
+    real configured domain discovered at run time (reusing ``_some_account``).
+
+    Mirrors ``_fake_message_and_recipient``: this deliberately never finds a
+    match, exercising the full DWD-impersonation + API code path (auth, both
+    independent group/member calls, their not-found handling) without
+    depending on -- or naming -- any real group in the tenant. This only
+    works because ``group_delivery_policy``/``list_group_members`` map a
+    plain HTTP 404 to ``found: false`` rather than a top-level ``error`` --
+    this harness's own ``evaluate()`` treats ANY top-level ``{"error": ...}``
+    as an automatic FAIL (see smoke_harness.py) before a probe's own
+    ``must_match``/``must_not_match`` ever runs, so a tool that reported
+    "not found" the same way as "the API call itself failed" could never be
+    probed this way (verified live against production: groups().get() on
+    both APIs and members().list() all return a plain 404 for a nonexistent
+    group, never something else).
     """
-    raise SkipProbe("no tenant-agnostic way to discover a real group address to probe")
+    account = await _some_account(call)
+    suffix = account["username"].rsplit("@", 1)[-1]
+    return {"group_email": f"smoke-test-{secrets.token_hex(16)}@{suffix}"}
 
 
 async def _finished_job(call: Caller) -> dict[str, Any]:
@@ -205,19 +212,23 @@ PROBES: dict[str, Probe] = {
         # shape above; a raised exception or a malformed shape still fails
         # the probe through the harness's own checks.
     ),
-    # Skipped, not probed with a synthetic address: see _no_group_to_probe's
-    # docstring for why a fabricated group email cannot safely stand in here
-    # the way _fake_message_and_recipient does for gmail_message_trace.
     "group_delivery_policy": Probe(
-        args_factory=_no_group_to_probe,
-        require_keys=("domain", "group_email"),
+        args_factory=_fake_group,
+        require_keys=("domain", "group_email", "found"),
+        must_match=(r'"found": false',),
         allow_empty=True,
+        # An "auth failed" match here would mean the top-level shape somehow
+        # still carried it despite found:false -- belt-and-braces, since the
+        # must_match above already proves no error branch was taken.
+        must_not_match=(r"auth failed",),
     ),
     "list_group_members": Probe(
-        args_factory=_no_group_to_probe,
+        args_factory=_fake_group,
         args={"max_pages": 1},
-        require_keys=("domain", "group_email"),
+        require_keys=("domain", "group_email", "found"),
+        must_match=(r'"found": false',),
         allow_empty=True,
+        must_not_match=(r"auth failed",),
     ),
     # -- Drive exposure ------------------------------------------------------
     "drive_external_sharing": Probe(

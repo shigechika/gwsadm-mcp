@@ -510,9 +510,21 @@ def test_group_delivery_policy_resolves_domain_and_returns_policy(inject):
     out = server.group_delivery_policy("team@example.edu")
     assert out["domain"] == "example.edu"
     assert out["group_email"] == "team@example.edu"
+    assert out["found"] is True
     assert out["who_can_post"] == "ALL_IN_DOMAIN_CAN_POST"
     assert out["allow_external_members"] is False
     assert c.group_settings_calls == ["team@example.edu"]
+
+
+def test_group_delivery_policy_not_found_is_not_an_error(inject):
+    # None from the client means a plain HTTP 404 -- the address is not a
+    # group in this domain, a normal answer distinguished from a real error.
+    c = FakeDomainClient("example.edu", {}, group_settings={"nonexistent@example.edu": None})
+    inject([c], {"example.edu"})
+    out = server.group_delivery_policy("nonexistent@example.edu")
+    assert "error" not in out
+    assert out["found"] is False
+    assert out["domain"] == "example.edu"
 
 
 def test_group_delivery_policy_degrades_on_auth_error(inject):
@@ -606,7 +618,9 @@ def test_list_group_members_degrades_to_group_only_when_only_member_scope_missin
     assert out["group"] == {"email": "team@example.edu"}
     assert out["members"] == []
     assert out["member_count"] == 0
-    assert out["capped"] is False
+    # capped=True here means "coverage incomplete", not "confirmed empty" --
+    # a failed lookup and a genuinely empty group must not look identical.
+    assert out["capped"] is True
     assert "members_error" in out
 
 
@@ -628,6 +642,44 @@ def test_list_group_members_degrades_to_members_only_when_only_group_scope_missi
     assert "error" in out["group"]
     assert out["members"] == [{"email": "a@example.edu"}]
     assert out["member_count"] == 1
+
+
+def test_list_group_members_not_found_when_both_agree_with_no_error(inject):
+    # get_group and list_group_members both returning None (a plain 404, no
+    # exception) means this address isn't a group at all -- a clean answer,
+    # not a partial-coverage state, so it gets its own found:false shape
+    # rather than an empty group/members pair indistinguishable from a real
+    # group with zero members.
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta={"nonexistent@example.edu": None},
+        group_members={"nonexistent@example.edu": None},
+    )
+    inject([c], {"example.edu"})
+    out = server.list_group_members("nonexistent@example.edu")
+    assert "error" not in out
+    assert out["found"] is False
+    assert "group" not in out
+    assert "members" not in out
+
+
+def test_list_group_members_group_not_found_but_members_found_is_not_top_level_not_found(inject):
+    # Mixed state: get_group says not-found (no error) but list_group_members
+    # DOES find members -- inconsistent, but must not be misreported as a
+    # clean top-level found:false (that requires BOTH sides to agree).
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        group_meta={"team@example.edu": None},
+        group_members={"team@example.edu": ([{"email": "a@example.edu"}], False)},
+    )
+    inject([c], {"example.edu"})
+    out = server.list_group_members("team@example.edu")
+    assert "error" not in out
+    assert "found" not in out  # not the clean both-sides-agree shape
+    assert out["group"] == {"found": False}
+    assert out["members"] == [{"email": "a@example.edu"}]
 
 
 def test_list_group_members_top_level_error_only_when_both_scopes_fail(inject):

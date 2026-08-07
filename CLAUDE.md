@@ -122,7 +122,19 @@ to guard against stdio newline regressions).
   methods under two DIFFERENT DWD scopes — the `list_group_members` MCP tool
   in `server.py` calls both and degrades per-section (a scope missing on
   one side still returns the other), never letting one call's failure block
-  the other from even being attempted. The Groups Settings API returns its
+  the other from even being attempted. All three group methods
+  (`get_group_settings`, `get_group`, `list_group_members`) map a plain
+  HTTP 404 to `None` (via `_is_not_found`) instead of raising — verified
+  live that all three underlying calls return exactly 404, never some other
+  status, for a nonexistent group — so "not a group" is a normal return
+  value distinguished from a real `GwsError`; `list_group_members`
+  additionally only treats a 404 on the FIRST page as "not found" (a later
+  page 404ing means the group was deleted mid-pagination, which stays a
+  real error). The `group_delivery_policy` / `list_group_members` MCP tools
+  surface this as `found: false`; this is also why their smoke probes
+  (`scripts/smoke_probes.py`) can safely use a synthetic nonexistent address
+  — the smoke harness treats any top-level `{"error": ...}` as an automatic
+  FAIL, which a `found: false` response never triggers. The Groups Settings API returns its
   boolean fields as the strings `"true"` / `"false"`, not JSON booleans —
   `_settings_bool()` normalizes that before it reaches tool output.
 - `gwsadm_mcp/config.py` — `load_config()` parses the `GWSADM_CONFIG` INI
