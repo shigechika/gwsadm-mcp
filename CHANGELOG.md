@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.11.0...v0.12.0) (2026-08-08)
+
+
+### Features
+
+* add pr-gate.yml admission control caller ([#61](https://github.com/shigechika/gwsadm-mcp/issues/61)) ([02bb16b](https://github.com/shigechika/gwsadm-mcp/commit/02bb16b6d7b0b17dd71b7e6897ddd62aedd3a65e))
+
 ## [0.11.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.10.0...v0.11.0) (2026-08-07)
 
 
