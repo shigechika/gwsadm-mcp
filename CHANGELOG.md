@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.12.0...v0.12.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* add explicit workflow permissions to ci.yml and release.yml ([#63](https://github.com/shigechika/gwsadm-mcp/issues/63)) ([3606136](https://github.com/shigechika/gwsadm-mcp/commit/36061360058c820fa8658e6fef5cd3d5ef9e1d53))
+
 ## [0.12.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.11.0...v0.12.0) (2026-08-08)
 
 
