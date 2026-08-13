@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/shigechika/gwsadm-mcp/compare/v0.12.1...v0.12.2) (2026-08-13)
+
+
+### Bug Fixes
+
+* bump cryptography to 50.0.0 (Dependabot high-severity alert) ([#65](https://github.com/shigechika/gwsadm-mcp/issues/65)) ([e80f38b](https://github.com/shigechika/gwsadm-mcp/commit/e80f38ba63a55df570117b3792f16129ad3b09d6))
+
 ## [0.12.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.12.0...v0.12.1) (2026-08-11)
 
 
