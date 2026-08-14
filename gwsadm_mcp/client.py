@@ -519,6 +519,16 @@ class DomainClient:
             raise GwsError(f"[{self.domain}] directory API error (users.get): HTTP {status}") from e
         except GoogleAuthError as e:
             # Typical: DWD scope not granted for this client, or wrong subject.
+            #
+            # Keeping the message is a deliberate call, not the accidental one
+            # REVIEW.md warns about: the message names WHICH grant is missing,
+            # which is the whole diagnostic. What can reach here is bounded --
+            # a key file that cannot be read or parsed raises OSError/ValueError
+            # inside _directory_service(), which already reduces it to the
+            # exception type precisely because it embeds the key path, so this
+            # handler only ever sees a refresh/transport failure whose text is
+            # the token endpoint's own response (e.g. "unauthorized_client").
+            # Same call, for the same reason, as the two existing sites above.
             raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (users.get): {type(e).__name__}") from e

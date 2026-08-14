@@ -99,17 +99,22 @@ async def _some_account(call: Caller) -> dict[str, Any]:
     return {"username": address}
 
 
-async def _fake_account(call: Caller) -> dict[str, Any]:
-    """A syntactically valid but guaranteed-nonexistent account address, built
-    on a domain suffix discovered at run time (reusing ``_some_account``).
+async def _configured_domain(call: Caller) -> str | None:
+    """A domain the server is actually configured for, taken from health_check.
 
-    The suffix is only *probably* a configured domain: ``_some_account`` prefers
-    a suspended account's address, but falls back to one scraped from the
-    ``login_audit`` failure top -- and that is whatever somebody typed at a
-    login prompt, so it can carry a typo'd domain with no ``[domain.*]``
-    section. When that happens the probe reports ``unknown domain`` and the
-    harness fails it before ``must_match`` runs: a red that is about the probe's
-    input, not about the tool. Same caveat as ``_fake_group`` below.
+    Needed because ``_some_account`` can fall back to an address scraped from the
+    login_audit failure top, whose suffix is whatever somebody typed at a login
+    prompt -- building a synthetic address on that suffix makes the probe fail on
+    ``unknown domain``, which is a red about the probe's own input rather than the
+    tool. health_check reports the configured domains, so use those instead.
+    """
+    health = await call("health_check", {})
+    return _first_field(health, "domain", r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+async def _fake_account(call: Caller) -> dict[str, Any]:
+    """A syntactically valid but guaranteed-nonexistent account address, in a
+    domain the server is actually configured for (taken from ``health_check``).
 
     Deliberately never finds a match — the point is to exercise the whole
     per-user lookup path (auth, the ``users().get`` call, the not-found
@@ -131,8 +136,14 @@ async def _fake_account(call: Caller) -> dict[str, Any]:
     asserting the found-account shape would flake on precisely the tenants
     that hit that fallback.
     """
-    account = await _some_account(call)
-    suffix = account["username"].rsplit("@", 1)[-1]
+    # A CONFIGURED domain, not the suffix of whatever _some_account found: that
+    # can come from the login-failure top, i.e. whatever somebody typed at a
+    # login prompt, and an unconfigured suffix makes get_user answer
+    # "unknown domain" -- which evaluate() turns into a FAIL before must_match
+    # ever runs, reporting a working tool as broken.
+    suffix = await _configured_domain(call)
+    if not suffix:
+        raise SkipProbe("health_check reported no configured domain to build an address on")
     return {"username": f"smoke-test-{secrets.token_hex(16)}@{suffix}"}
 
 
