@@ -446,6 +446,16 @@ def _user_entry(u: dict) -> dict:
     ``group_delivery_policy`` follows. That matters most for ``suspended`` and
     ``archived``: defaulting a missing boolean to ``False`` would report "this
     account is fine" from a response that never said so.
+
+    ``suspension_time`` and ``archival_time`` are CONDITIONAL, not unsupported:
+    Google omits each on an account the state does not apply to, so ``None``
+    there reads as "not in that state", never as "the API cannot say". Verified
+    against a live tenant through this exact path (``projection="basic"``, the
+    read-only directory scope): a genuinely suspended account came back carrying
+    ``suspensionTime``, and the same response omitted ``archivalTime`` because
+    that account was not archived. ``projection="basic"`` narrows CUSTOM schema
+    fields only — the parameter's own enum wording — and leaves standard
+    output-only fields like these two alone.
     """
     # name is an object (givenName/familyName/fullName); guard the whole thing
     # rather than assume it is present, since every field here is optional.
