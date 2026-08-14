@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.12.2...v0.13.0) (2026-08-14)
+
+
+### Features
+
+* add get_user, a single-account lookup ([#69](https://github.com/shigechika/gwsadm-mcp/issues/69)) ([898887c](https://github.com/shigechika/gwsadm-mcp/commit/898887c26e03f7f8bff43238643f7498070cd749))
+
 ## [0.12.2](https://github.com/shigechika/gwsadm-mcp/compare/v0.12.1...v0.12.2) (2026-08-13)
 
 
