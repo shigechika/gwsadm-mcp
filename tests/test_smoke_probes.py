@@ -158,6 +158,29 @@ def test_every_exercised_probe_asserts_something():
     )
 
 
+def test_configured_domain_accepts_an_internationalised_domain():
+    """A punycode TLD must not silently skip the whole per-account probe.
+
+    ``_configured_domain`` scrapes health_check's rendered output, and its own
+    pattern decides whether ``_fake_account`` can build an address at all: a
+    domain it fails to recognise raises ``SkipProbe``, so the tool is reported
+    as skipped rather than broken and nobody looks. An internationalised domain
+    reaches the API as ``xn--...`` -- digits and hyphens in the final label,
+    which the obvious ``[A-Za-z]{2,}`` tail rejects.
+    """
+
+    async def call(tool, args):
+        assert tool == "health_check"
+        return {"domains": [{"domain": "example.xn--p1ai"}]}
+
+    assert asyncio.run(smoke_probes._configured_domain(call)) == "example.xn--p1ai"
+
+    async def plain(tool, args):
+        return {"domains": [{"domain": "example.com"}]}
+
+    assert asyncio.run(smoke_probes._configured_domain(plain)) == "example.com"
+
+
 def test_address_shapes_catch_what_they_claim_to():
     """The guard below is only as good as these patterns, so pin them.
 

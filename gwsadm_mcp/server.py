@@ -5,6 +5,8 @@ Phase 1 tools:
 - ``health_check``            — fleet-standard status/service/version + per-domain auth probe
 - ``login_audit``             — Google-side auto-disabled accounts, suspicious logins, failure top-N
 - ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
+- ``get_user``                — one named account's state: suspended/archived/2SV/last login
+  (Directory API; same ``admin.directory.user.readonly`` scope as ``suspended_accounts``)
 - ``user_oauth_tokens``       — third-party OAuth app grants for one user (Directory API)
 - ``gmail_message_trace``     — did a known Message-ID reach specific mailboxes, and where
   (Gmail API; requires the separate ``gmail.readonly`` DWD scope — see its docstring)
@@ -426,6 +428,124 @@ def suspended_accounts(domain: str | None = None, max_pages: int = 20) -> dict:
         except (GwsAuthError, GwsError) as e:
             out[c.domain] = {"error": str(e)}
     return {"domains": out}
+
+
+def _user_entry(u: dict) -> dict:
+    """Project a Directory user record to the fields that explain a sign-in problem.
+
+    Deliberately not the raw resource: a user record also carries addresses,
+    phone numbers, custom schemas, photo URLs and recovery contacts, none of
+    which a sign-in triage needs and all of which this tool would otherwise
+    hand to a caller (and to whatever model is reading its output).
+
+    Field names match ``_suspended_entry`` wherever the two overlap (``email``,
+    ``suspension_reason``, ``last_login``, ``created``, ``org_unit``), so the
+    per-user and domain-wide views of the same underlying record read alike.
+
+    An absent field stays ``None`` rather than being coerced — the same rule
+    ``group_delivery_policy`` follows. That matters most for ``suspended`` and
+    ``archived``: defaulting a missing boolean to ``False`` would report "this
+    account is fine" from a response that never said so.
+
+    ``suspension_time`` and ``archival_time`` are CONDITIONAL, not unsupported:
+    Google omits each on an account the state does not apply to, so ``None``
+    there reads as "not in that state", never as "the API cannot say". Verified
+    against a live tenant through this exact path (``projection="basic"``, the
+    read-only directory scope): a genuinely suspended account came back carrying
+    ``suspensionTime``, and the same response omitted ``archivalTime`` because
+    that account was not archived. ``projection="basic"`` narrows CUSTOM schema
+    fields only — the parameter's own enum wording — and leaves standard
+    output-only fields like these two alone.
+    """
+    # name is an object (givenName/familyName/fullName); guard the whole thing
+    # rather than assume it is present, since every field here is optional.
+    name = u.get("name") or {}
+    return {
+        "id": u.get("id"),
+        # Google's canonical primaryEmail, which differs from the address that
+        # was asked about when an alias was looked up — that difference is
+        # itself worth seeing in a triage answer.
+        "email": u.get("primaryEmail"),
+        "name": name.get("fullName"),
+        "suspended": u.get("suspended"),
+        "suspension_reason": u.get("suspensionReason"),
+        "suspension_time": u.get("suspensionTime"),
+        "archived": u.get("archived"),
+        "archival_time": u.get("archivalTime"),
+        "last_login": u.get("lastLoginTime"),
+        "created": u.get("creationTime"),
+        "change_password_at_next_login": u.get("changePasswordAtNextLogin"),
+        "is_enrolled_in_2sv": u.get("isEnrolledIn2Sv"),
+        "is_enforced_in_2sv": u.get("isEnforcedIn2Sv"),
+        "org_unit": u.get("orgUnitPath"),
+    }
+
+
+@mcp.tool()
+def get_user(username: str, domain: str | None = None) -> dict:
+    """Look up ONE named account's current state — the "why can't this person sign in" tool.
+
+    Answers a helpdesk ticket that already names the exact address: is the
+    account suspended (and for what reason, since when), archived, enrolled in
+    or enforced into 2-step verification, when did it last log in, which org
+    unit is it in, is a password change pending. One Directory API request, no
+    pagination.
+
+    Use this — not ``suspended_accounts`` — whenever the address is known.
+    That tool lists only accounts that ARE suspended, so it can never confirm
+    that a given address is *not* suspended, and once that list exceeds its
+    page cap absence stops being evidence either way — after spending far more
+    API calls than this. ``suspended_accounts`` is for the domain-wide sweep it
+    is actually named for.
+
+    This directory is downstream of the identity provider, not the master. Read
+    the answer as "what Google Workspace currently believes about this account"
+    and compare it against the IdP's own record, which is authoritative for who
+    the account is. A disagreement is usually drift on this side rather than a
+    mistyped address — an account the IdP still authenticates can be suspended
+    or archived here, and an address the IdP does not assert at all will simply
+    come back ``found: false``.
+
+    An address that names no account returns ``found: false`` with no state
+    fields. That is a normal, expected answer — a typo'd or long-deleted
+    address — and is itself the diagnostic result, NOT a failure. A missing
+    DWD scope, a rejected credential or a transient API failure is reported as
+    ``{"error": ...}`` instead. The two are deliberately distinct: never read
+    ``found: false`` as "the lookup did not work", and never read an ``error``
+    as evidence about whether the account exists.
+
+    Read-only (Directory API ``users().get``; no mutating method exists in
+    this package). Requires the ``admin.directory.user.readonly`` DWD scope —
+    the same one ``suspended_accounts`` uses, so a tenant already running that
+    tool needs no additional grant.
+
+    Args:
+        username: Exact user email, passed through as the Directory API
+            ``userKey`` (primary or alias address both work on Google's side;
+            the returned ``email`` is the account's canonical primary one).
+        domain: Configured ``[domain.*]`` section to route the lookup through.
+            Default: resolved from the username's suffix. Set it explicitly
+            when the address uses an alias/secondary domain that has no
+            config section of its own (common when copying addresses from
+            mail headers or IdP logs).
+    """
+    username = username.strip()
+    try:
+        # Validate the input shape before touching config: a typo'd email on a
+        # server with a broken config should report the typo, not ConfigError.
+        suffix = _domain_of(username)
+        clients, _ = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"username": username, "error": str(e)}
+    c = picked[0]
+    try:
+        user = c.get_user(username)  # None means "no such account", not a failure
+    except (GwsAuthError, GwsError) as e:
+        return {"domain": c.domain, "username": username, "error": str(e)}
+    if user is None:
+        return {"domain": c.domain, "username": username, "found": False}
+    return {"domain": c.domain, "username": username, "found": True, **_user_entry(user)}
 
 
 def _token_entry(t: dict) -> dict:

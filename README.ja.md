@@ -17,6 +17,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `health_check` | サーバーバージョン・設定パス・ドメインごとの認証確認 — セッション開始時やタイムアウト後に呼ぶ |
 | `login_audit` | Reports API `login` — **Google により自動無効化されたアカウント**（`account_disabled_*`： 漏洩パスワード・乗っ取り・スパム送信）、不審なログイン、失敗の多い順トップN |
 | `suspended_accounts` | Directory API — **停止中**アカウントの現在スナップショット（`isSuspended=true`）。下流 IdP（KeyCloak 等）と突合し、停止済みなのに IdP 側で有効なままのアカウントを洗い出す |
+| `get_user` | Directory API `users().get` — **アドレスを指定した1アカウント**の現在の状態： `suspended`（理由・停止日時付き）、`archived`、`last_login`、2段階認証の登録/強制、組織部門、作成日時、次回ログイン時のパスワード変更要求。「なぜこの人はログインできないのか」に1リクエスト・ページングなしで答える。アドレスが既に分かっているときは `suspended_accounts` ではなくこちらを使う： あちらは停止中のアカウントだけを列挙するので、指定アドレスが停止**されていない**ことは確認できない（さらにその一覧がページ上限を超えると、載っていないこと自体が根拠にならなくなる）。`suspended_accounts` が既に使っているスコープ以外は不要 |
 | `user_oauth_tokens` | Directory API `tokens().list` — **特定ユーザー1名**の第三者OAuthアプリ連携一覧。既存トークンはログイン不要で使えるため `login_audit` では検知できない侵害経路。ドメインはユーザー名のサフィックスから解決（エイリアス/セカンダリドメインのアドレス用に `domain` で明示指定も可） |
 | `drive_external_sharing` | Reports API `drive` — 外部アドレス/ドメインへの ACL **付与**（取り消しは別集計）、リンク公開/一般公開への可視性**遷移** |
 | `drive_doc_activity` | Reports API `drive` をサーバー側 `doc_id` フィルタで — **特定1文書**の所有者・ACL 変更・ライフサイクル履歴。`drive_external_sharing` の検知トリアージ用： 所有者（個人か共有ドライブ名か）で「共有ドライブ内のファイル作成が既存メンバーへの ACL 伝播として一括外部共有に見える」誤検知クラスを切り分ける |
@@ -43,7 +44,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
-| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`、`get_user` | その2つのツールだけエラーに縮退（`suspended_accounts` はドメイン単位）。他は動作を続ける |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
 `health_check` はスコープが一切無くても応答する。グラント漏れが疑われるときこそ呼ぶツールで、
@@ -79,11 +80,13 @@ Groups Settings API は Directory API とは別プロダクトなのでスコー
 読み取り専用バリアントは存在しないが、本サーバーが呼ぶのは `groups().get()` のみで、
 変更系メソッドは一切呼ばない。
 
-`suspended_accounts` と `user_oauth_tokens` はどちらも Reports 系ツール（顧客テナント全体）と異なり、
+`suspended_accounts`・`get_user`・`user_oauth_tokens` はいずれも Reports 系ツール（顧客テナント全体）と異なり、
 設定済みドメイン単位で動作する（Directory の `domain=`/`userKey=`）。突合したいドメイン
 （例：学生用の別ドメイン）はそれぞれ `[domain.*]` セクションの設定が必要。
 なお失敗の仕方が異なる点に注意：未設定ドメインを `suspended_accounts` は**黙って結果から省く**が、
-`user_oauth_tokens` は unknown-domain エラーで明示的に失敗する。
+`get_user` と `user_oauth_tokens` は unknown-domain エラーで明示的に失敗する
+（どちらもサフィックスに対応するセクションが無いエイリアス/セカンダリドメインのアドレス用に
+`domain` の明示指定を受け付ける）。
 
 ## セットアップ
 
@@ -206,6 +209,12 @@ gwsadm-mcp             # MCP サーバを起動（STDIO、既定）
   だけを表しており、複数件を統合した答えではない点に注意。検索はページングしないため、
   一定件数以上マッチした場合は `match_count` が正確な件数ではなく下限値であることを示す
   `match_count_capped` も併せて立つ。
+- `get_user` は「このアドレスに該当するアカウントが無い」ことと「取得に失敗した」ことを
+  区別する： 単純な HTTP 404 は状態フィールドを付けずに `found: false` を返す。これは
+  タイプミスや削除済みアドレスという**診断結果**であって `error` ではない。DWDスコープ未付与や
+  一時的な失敗は `found` キーを付けずに `{"error": ...}` を返すので、どちらの方向にも
+  取り違えは起きない。Google の応答に無いフィールドは `null` のままで丸めない —
+  `suspended` が欠落しているのを「このアカウントは問題なし」と読んではいけない。
 - `group_delivery_policy` は Groups Settings API の `"true"`/`"false"` 文字列
   フィールド（JSON boolean ではなく、この API 固有の癖）を実際の boolean に
   正規化して返す。Google の応答に無いフィールドは `null` のままで、`false`
@@ -228,8 +237,8 @@ gwsadm-mcp             # MCP サーバを起動（STDIO、既定）
   データを見つけた、という真の混在状態だけが通常のセクション別の形に
   フォールバックする。
 - 設計上 read-only — このパッケージが発行する API 呼び出しは `activities().list`
-  （Reports API）、`users().list` / `tokens().list` / `groups().get` /
-  `members().list`（Directory API）、`groups().get`（Groups Settings API）、
+  （Reports API）、`users().list` / `users().get` / `tokens().list` /
+  `groups().get` / `members().list`（Directory API）、`groups().get`（Groups Settings API）、
   `messages().list` / `messages().get`（Gmail API、メタデータのみ）に限られる。
 - 出力にはアカウントアドレスが含まれる（監査ツールの目的上当然） —
   権限のあるセキュリティ担当者にアクセスを限定すること。`gmail_message_trace`

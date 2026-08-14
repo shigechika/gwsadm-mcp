@@ -123,6 +123,72 @@ def test_list_suspended_users_http_error_maps_to_gws_error():
         c.list_suspended_users()
 
 
+class FakeDirectoryUsersResource:
+    def __init__(self, resp, exc=None):
+        self.resp, self.exc, self.calls = resp, exc, []
+
+    def get(self, **kw):
+        self.calls.append(kw)
+        return _Req(self.resp, self.exc)
+
+
+class FakeDirectoryUserService:
+    def __init__(self, resp, exc=None):
+        self._u = FakeDirectoryUsersResource(resp, exc)
+
+    def users(self):
+        return self._u
+
+
+def _user_client(resp, exc=None):
+    svc = FakeDirectoryUserService(resp, exc)
+    return DomainClient(CFG, directory_service=svc), svc._u
+
+
+def test_get_user_returns_raw_record_and_passes_user_key():
+    # Guards the wiring get_user is entirely made of: the full email reaches
+    # the API as userKey (not just the local part), the response comes back
+    # unprojected for server.py to shape, and projection stays pinned to
+    # "basic" so a tenant's custom user schemas are never pulled in.
+    c, u = _user_client({"primaryEmail": "user@example.edu", "suspended": True})
+    assert c.get_user("user@example.edu") == {"primaryEmail": "user@example.edu", "suspended": True}
+    assert u.calls[0]["userKey"] == "user@example.edu"
+    assert u.calls[0]["projection"] == "basic"
+
+
+def test_get_user_not_found_returns_none():
+    # The headline behaviour of issue #68: a 404 means the address names no
+    # account -- a normal, expected answer, not a failure. Raising here would
+    # make "this account does not exist" indistinguishable from "the lookup
+    # broke", which is the whole diagnostic value of the tool.
+    err = HttpError(httplib2.Response({"status": "404", "reason": "not found"}), b"{}")
+    c, _ = _user_client(None, exc=err)
+    assert c.get_user("nonexistent@example.edu") is None
+
+
+def test_get_user_non_404_http_error_maps_to_gws_error():
+    # A permission 403 must NOT be swallowed as "not found" -- that would
+    # report a missing DWD scope as a confirmed-nonexistent account and send
+    # an operator hunting for a typo that isn't there.
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _user_client(None, exc=err)
+    with pytest.raises(GwsError):
+        c.get_user("user@example.edu")
+
+
+def test_get_user_auth_error_maps_to_gws_auth_error():
+    # Same split the other per-user lookups keep: a credential/scope failure
+    # is GwsAuthError (the whole domain is unusable), never a bare GwsError
+    # and never a None that would read as not-found.
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _user_client(None, exc=RefreshError("unauthorized_client"))
+    with pytest.raises(GwsAuthError):
+        c.get_user("user@example.edu")
+
+
 class FakeTokens:
     def __init__(self, resp, exc=None):
         self.resp, self.exc, self.calls = resp, exc, []

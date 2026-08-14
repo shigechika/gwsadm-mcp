@@ -20,6 +20,7 @@ anything.
 | `health_check` | Server version, config path, and per-domain auth probe — call at session start or after a timeout |
 | `login_audit` | Reports API `login` — accounts **auto-disabled by Google** (`account_disabled_*`: leaked password, hijacked, spamming), suspicious logins, failure top-N |
 | `suspended_accounts` | Directory API — current snapshot of **suspended** accounts (`isSuspended=true`); cross-reference against a downstream IdP (e.g. KeyCloak) to find suspended-but-still-enabled accounts |
+| `get_user` | Directory API `users().get` — **one named account's** current state: `suspended` (with reason and time), `archived`, `last_login`, 2SV enrolled/enforced, org unit, creation time, pending password change. The "why can't this person sign in" lookup: one request, no pagination, for an address you already know — unlike `suspended_accounts`, which lists only accounts that ARE suspended, so it can never confirm that a given address is *not* suspended (and once that list exceeds its page cap, absence stops being evidence either way). Needs no scope beyond the one `suspended_accounts` already uses |
 | `user_oauth_tokens` | Directory API `tokens().list` — third-party OAuth app grants for **one user**; a compromise vector `login_audit` is blind to, since a previously-granted token needs no fresh login. Domain resolved from the username's suffix, with an optional `domain` override for alias/secondary-domain addresses |
 | `drive_external_sharing` | Reports API `drive` — ACL **grants** to external addresses or domains (revocations reported separately) and visibility **transitions** into link/public exposure |
 | `drive_doc_activity` | Reports API `drive` with a server-side `doc_id` filter — **one document's** owner, ACL changes, and lifecycle events. Triage companion to `drive_external_sharing`: the owner (an individual vs. a shared drive's name) disambiguates the shared-drive false-positive class, where files created inside a shared drive propagate member ACLs and read as bulk external sharing |
@@ -47,7 +48,7 @@ degrading — one place, one pass, avoids the trap:
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
-| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts` | that tool degrades to a per-domain error; everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user` | those two tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
 
 `health_check` needs no scope at all to respond: it is the tool to call when
@@ -87,12 +88,14 @@ The Groups Settings API is a distinct product from the Directory API, hence
 the separate scope; it has no readonly-only variant, but this server only
 ever calls `groups().get()`, never a mutating method.
 
-`suspended_accounts` and `user_oauth_tokens` both operate per configured
-domain (Directory `domain=`/`userKey=`), unlike the customer-wide Reports
-tools — so every domain you want covered (e.g. a separate student domain)
-needs its own `[domain.*]` config section. Note the failure modes differ:
-`suspended_accounts` **silently omits** an unconfigured domain from its
-result, while `user_oauth_tokens` fails loudly with an unknown-domain error.
+`suspended_accounts`, `get_user` and `user_oauth_tokens` all operate per
+configured domain (Directory `domain=`/`userKey=`), unlike the customer-wide
+Reports tools — so every domain you want covered (e.g. a separate student
+domain) needs its own `[domain.*]` config section. Note the failure modes
+differ: `suspended_accounts` **silently omits** an unconfigured domain from
+its result, while `get_user` and `user_oauth_tokens` fail loudly with an
+unknown-domain error (both take a `domain` override for an alias/secondary
+address whose suffix has no section of its own).
 
 ## Setup
 
@@ -216,6 +219,13 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
   first match, not a combined answer. `match_count_capped` is set alongside
   it when the mailbox has enough matches that `match_count` is a lower
   bound rather than exact (the search does not paginate).
+- `get_user` distinguishes "this address names no account" from "the lookup
+  failed": a plain HTTP 404 answers `found: false` with no state fields,
+  which is a diagnostic result — a typo'd or deleted address — and never an
+  `error`. A missing DWD scope or a transient failure answers `{"error": ...}`
+  with no `found` key instead, so the two can never be confused in either
+  direction. Fields Google omits stay `null` rather than being coerced:
+  a missing `suspended` must not read as "the account is fine".
 - `group_delivery_policy` normalizes the Groups Settings API's `"true"`/`"false"`
   string fields (a quirk of that API, not JSON booleans) into real booleans in
   its output; a field absent from Google's response stays `null`, never
@@ -238,7 +248,7 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
   Only a genuine mixed state (one side not-found, the other actually
   finding data) falls through to the normal per-section shape instead.
 - Read-only by design: `activities().list` (Reports API), `users().list` /
-  `tokens().list` / `groups().get` / `members().list` (Directory API),
+  `users().get` / `tokens().list` / `groups().get` / `members().list` (Directory API),
   `groups().get` (Groups Settings API), and `messages().list` / `messages().get`
   (Gmail API, metadata only) are the only API calls issued anywhere in this
   package.
