@@ -482,11 +482,19 @@ def get_user(username: str, domain: str | None = None) -> dict:
     pagination.
 
     Use this — not ``suspended_accounts`` — whenever the address is known.
-    That tool enumerates every suspended account in the domain and stops at
-    its page cap, so on a large tenant it can return without ever reaching the
-    account being asked about, which reads as "cannot be determined" after
-    spending far more API calls than this. ``suspended_accounts`` is for the
-    domain-wide sweep it is actually named for.
+    That tool lists only accounts that ARE suspended, so it can never confirm
+    that a given address is *not* suspended, and once that list exceeds its
+    page cap absence stops being evidence either way — after spending far more
+    API calls than this. ``suspended_accounts`` is for the domain-wide sweep it
+    is actually named for.
+
+    This directory is downstream of the identity provider, not the master. Read
+    the answer as "what Google Workspace currently believes about this account"
+    and compare it against the IdP's own record, which is authoritative for who
+    the account is. A disagreement is usually drift on this side rather than a
+    mistyped address — an account the IdP still authenticates can be suspended
+    or archived here, and an address the IdP does not assert at all will simply
+    come back ``found: false``.
 
     An address that names no account returns ``found: false`` with no state
     fields. That is a normal, expected answer — a typo'd or long-deleted

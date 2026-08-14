@@ -100,8 +100,16 @@ async def _some_account(call: Caller) -> dict[str, Any]:
 
 
 async def _fake_account(call: Caller) -> dict[str, Any]:
-    """A syntactically valid but guaranteed-nonexistent account address, in a
-    real configured domain discovered at run time (reusing ``_some_account``).
+    """A syntactically valid but guaranteed-nonexistent account address, built
+    on a domain suffix discovered at run time (reusing ``_some_account``).
+
+    The suffix is only *probably* a configured domain: ``_some_account`` prefers
+    a suspended account's address, but falls back to one scraped from the
+    ``login_audit`` failure top -- and that is whatever somebody typed at a
+    login prompt, so it can carry a typo'd domain with no ``[domain.*]``
+    section. When that happens the probe reports ``unknown domain`` and the
+    harness fails it before ``must_match`` runs: a red that is about the probe's
+    input, not about the tool. Same caveat as ``_fake_group`` below.
 
     Deliberately never finds a match — the point is to exercise the whole
     per-user lookup path (auth, the ``users().get`` call, the not-found

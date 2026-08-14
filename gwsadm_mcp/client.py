@@ -479,19 +479,21 @@ class DomainClient:
     def get_user(self, user_key: str) -> dict | None:
         """Fetch ONE user's account record (Directory API ``users().get``).
 
-        The per-account counterpart to ``list_suspended_users``: that method
-        can only answer "is this account suspended?" by enumerating the whole
-        domain, and on a large tenant its page cap is reached long before a
-        particular address is. This is one request, no pagination, for a
-        caller who already knows the address.
+        The per-account counterpart to ``list_suspended_users``. That method
+        cannot answer "is THIS account suspended?" at all: it queries
+        ``isSuspended=true``, so a non-suspended account is filtered out
+        server-side and can never appear at any page count -- and when the
+        suspended set itself exceeds the page cap, "absent" stops being
+        evidence even for a suspended one. This is one request, no pagination,
+        for a caller who already knows the address.
 
         Shares ``list_suspended_users``' DWD scope exactly --
         ``admin.directory.user.readonly`` covers ``users().get`` (checked
         against the Directory API's own discovery document, which lists that
         scope on ``directory.users.get``) -- so this deliberately reuses the
         same lazily-built, per-domain-cached ``_directory_service()`` rather
-        than adding a fifth credential: a tenant already running
-        ``suspended_accounts`` needs no new grant for this.
+        than adding another credential object and another grant to provision:
+        a tenant already running ``suspended_accounts`` needs no new scope.
 
         Read-only: only ``users().get()`` is issued, never a mutating method.
         ``projection="basic"`` matches ``list_suspended_users``, pinning the
