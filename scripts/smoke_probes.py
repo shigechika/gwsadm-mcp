@@ -99,6 +99,35 @@ async def _some_account(call: Caller) -> dict[str, Any]:
     return {"username": address}
 
 
+async def _fake_account(call: Caller) -> dict[str, Any]:
+    """A syntactically valid but guaranteed-nonexistent account address, in a
+    real configured domain discovered at run time (reusing ``_some_account``).
+
+    Deliberately never finds a match — the point is to exercise the whole
+    per-user lookup path (auth, the ``users().get`` call, the not-found
+    return) against a real tenant without naming, or reading the state of,
+    anybody's actual account. A "found" result here would be the surprise.
+
+    This is also the live half of the 404 check the client's ``_is_not_found``
+    makes on documented behaviour: if ``users().get`` ever answered an unknown
+    ``userKey`` with something other than a plain 404, this probe is what
+    would show it, because the harness's ``evaluate()`` treats ANY top-level
+    ``{"error": ...}`` as an automatic FAIL before a probe's own
+    ``must_match``/``must_not_match`` ever runs. Probing this way only works
+    because ``get_user`` reports a missing account as ``found: false`` rather
+    than as a failure — the same property ``_fake_group`` relies on.
+
+    Picking a real account instead would be worse than it looks: the address
+    ``_some_account`` discovers can come from the login-failure top, where a
+    typo'd or nonexistent login name is exactly what shows up — so a probe
+    asserting the found-account shape would flake on precisely the tenants
+    that hit that fallback.
+    """
+    account = await _some_account(call)
+    suffix = account["username"].rsplit("@", 1)[-1]
+    return {"username": f"smoke-test-{secrets.token_hex(16)}@{suffix}"}
+
+
 async def _fake_message_and_recipient(call: Caller) -> dict[str, Any]:
     """A syntactically valid but guaranteed-nonexistent Message-ID, paired
     with a real account discovered at run time (reusing ``_some_account``).
@@ -189,6 +218,16 @@ PROBES: dict[str, Probe] = {
         must_match=(DOMAINS_NOT_EMPTY,),
         allow_empty=True,
         must_not_match=NO_DOMAIN_ERROR,
+    ),
+    "get_user": Probe(
+        args_factory=_fake_account,
+        require_keys=("domain", "username", "found"),
+        must_match=(r'"found": false',),
+        allow_empty=True,
+        # An "auth failed" match would mean the top-level shape carried an
+        # auth failure despite found:false — belt-and-braces, since the
+        # must_match above already proves no error branch was taken.
+        must_not_match=(r"auth failed",),
     ),
     "user_oauth_tokens": Probe(
         args_factory=_some_account,

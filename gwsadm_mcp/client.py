@@ -6,6 +6,7 @@ fully non-interactive, so the server can run unattended behind a gateway.
 
 Read-only by design: only ``activities().list`` (Admin SDK Reports API),
 ``users().list`` (Directory API, for suspended-account snapshots),
+``users().get`` (Directory API, for a single account's state),
 ``tokens().list`` (Directory API, for per-user OAuth app grants),
 ``messages().list`` / ``messages().get`` (Gmail API, for message-trace),
 ``groups().get`` (Groups Settings API, for a group's own posting policy), and
@@ -132,13 +133,18 @@ def _rfc3339(dt: datetime.datetime) -> str:
 
 
 def _is_not_found(e: HttpError) -> bool:
-    """True for a plain HTTP 404 -- the address does not name any group in
-    this domain (verified live: groupssettings.groups().get,
-    directory.groups().get, and directory.members().list all return exactly
-    this for a nonexistent group, not e.g. 400). Distinct from every other
-    HttpError, which stays a real ``GwsError`` -- a caller must be able to
-    tell "this group doesn't exist" (a normal, expected answer) apart from
-    "the API call itself failed" (a real problem)."""
+    """True for a plain HTTP 404 -- the key does not name any such resource in
+    this domain (verified live for the three group lookups:
+    groupssettings.groups().get, directory.groups().get, and
+    directory.members().list all return exactly this for a nonexistent group,
+    not e.g. 400). ``directory.users().get`` is documented to answer an
+    unknown ``userKey`` the same way and is read here on that basis, not on a
+    live check of this tenant -- the smoke probe in ``scripts/smoke_probes.py``
+    looks up a synthetic address against the real tenant, so a run of that is
+    what would catch a different status. Distinct from every other HttpError,
+    which stays a real ``GwsError`` -- a caller must be able to tell "this
+    doesn't exist" (a normal, expected answer) apart from "the API call itself
+    failed" (a real problem)."""
     status = getattr(getattr(e, "resp", None), "status", None)
     return status == 404
 
@@ -469,6 +475,52 @@ class DomainClient:
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (users.list): {type(e).__name__}") from e
         return users, bool(token)
+
+    def get_user(self, user_key: str) -> dict | None:
+        """Fetch ONE user's account record (Directory API ``users().get``).
+
+        The per-account counterpart to ``list_suspended_users``: that method
+        can only answer "is this account suspended?" by enumerating the whole
+        domain, and on a large tenant its page cap is reached long before a
+        particular address is. This is one request, no pagination, for a
+        caller who already knows the address.
+
+        Shares ``list_suspended_users``' DWD scope exactly --
+        ``admin.directory.user.readonly`` covers ``users().get`` (checked
+        against the Directory API's own discovery document, which lists that
+        scope on ``directory.users.get``) -- so this deliberately reuses the
+        same lazily-built, per-domain-cached ``_directory_service()`` rather
+        than adding a fifth credential: a tenant already running
+        ``suspended_accounts`` needs no new grant for this.
+
+        Read-only: only ``users().get()`` is issued, never a mutating method.
+        ``projection="basic"`` matches ``list_suspended_users``, pinning the
+        response to the standard fields -- a tenant with large custom user
+        schemas must not have them pulled into an audit answer that has no
+        use for them.
+
+        Returns the raw user resource, or ``None`` when ``user_key`` does not
+        name a user in this tenant (a plain HTTP 404) -- a typo'd or deleted
+        address is a normal, expected answer and is itself diagnostic, so it
+        must stay distinguishable from a raised ``GwsError``/``GwsAuthError``,
+        which mean the call failed and say nothing about whether the account
+        exists.
+        """
+        try:
+            svc = self._directory_service()
+            http = self._new_http(self._directory_creds)
+            resp = self._execute(lambda: svc.users().get(userKey=user_key, projection="basic"), http)
+        except HttpError as e:
+            if _is_not_found(e):
+                return None
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] directory API error (users.get): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: DWD scope not granted for this client, or wrong subject.
+            raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (users.get): {type(e).__name__}") from e
+        return resp
 
     def list_user_oauth_tokens(self, user_key: str) -> list[dict]:
         """List third-party OAuth app grants for one user (Directory API ``tokens().list``).

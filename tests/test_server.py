@@ -15,6 +15,7 @@ class FakeDomainClient:
         canned,
         auth="ok",
         suspended=None,
+        user=None,
         tokens=None,
         gmail_messages=None,
         group_settings=None,
@@ -25,6 +26,11 @@ class FakeDomainClient:
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
         self._auth = auth
         self._suspended = suspended  # (users, capped) | Exception | None
+        # user: dict (found) | Exception | None (not found) -- None is the
+        # not-found answer here rather than "unset", matching the real
+        # client's 404 return, so the default double reports a lookup for an
+        # account no test has canned as not-found instead of inventing one.
+        self._user = user
         self._tokens = tokens  # list[dict] | Exception | None
         # gmail_messages: dict[user_email, dict | None | Exception] | Exception
         # (a bare Exception applies to every recipient, for the "whole domain
@@ -38,6 +44,7 @@ class FakeDomainClient:
         self._group_meta = group_meta
         self._group_members = group_members
         self.calls = []
+        self.user_calls = []
         self.token_calls = []
         self.gmail_calls = []
         self.group_settings_calls = []
@@ -58,6 +65,12 @@ class FakeDomainClient:
         if isinstance(self._suspended, Exception):
             raise self._suspended
         return self._suspended
+
+    def get_user(self, user_key):
+        self.user_calls.append(user_key)
+        if isinstance(self._user, Exception):
+            raise self._user
+        return self._user  # a dict (found) or None (no such account)
 
     def list_user_oauth_tokens(self, user_key):
         self.token_calls.append(user_key)
@@ -245,6 +258,166 @@ def test_suspended_accounts_degrades_per_domain_on_auth_error(inject):
 def test_suspended_accounts_unknown_domain_is_error(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
     assert "error" in server.suspended_accounts(domain="nope.example")
+
+
+_USER_RECORD = {
+    "id": "112233445566778899000",
+    "primaryEmail": "user@example.edu",
+    "name": {"givenName": "A", "familyName": "B", "fullName": "A B"},
+    "suspended": True,
+    "suspensionReason": "ADMIN",
+    "suspensionTime": "2026-06-01T09:00:00.000Z",
+    "archived": False,
+    "archivalTime": None,
+    "lastLoginTime": "2026-05-30T01:02:03.000Z",
+    "creationTime": "2019-04-01T00:00:00.000Z",
+    "changePasswordAtNextLogin": False,
+    "isEnrolledIn2Sv": False,
+    "isEnforcedIn2Sv": True,
+    "orgUnitPath": "/Students",
+}
+
+
+def test_get_user_projects_state_fields_and_resolves_domain_from_username(inject):
+    # The tool exists to answer "why can't this person sign in", so every
+    # field that answers it must survive projection -- an earlier per-user
+    # tool (user_oauth_tokens) shows how easily a projection drops one.
+    # Also guards suffix-based routing and that the full email reaches the
+    # API as userKey, not just the local part.
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    out = server.get_user("user@example.edu")
+    assert out["domain"] == "example.edu"
+    assert out["found"] is True
+    assert out["suspended"] is True
+    assert out["suspension_reason"] == "ADMIN"
+    assert out["suspension_time"] == "2026-06-01T09:00:00.000Z"
+    assert out["archived"] is False
+    assert out["last_login"] == "2026-05-30T01:02:03.000Z"
+    assert out["created"] == "2019-04-01T00:00:00.000Z"
+    assert out["change_password_at_next_login"] is False
+    assert out["is_enrolled_in_2sv"] is False
+    assert out["is_enforced_in_2sv"] is True
+    assert out["org_unit"] == "/Students"
+    assert out["id"] == "112233445566778899000"
+    assert out["email"] == "user@example.edu"
+    assert out["name"] == "A B"
+    assert c.user_calls == ["user@example.edu"]  # full email passed through
+
+
+def test_get_user_not_found_is_found_false_not_error(inject):
+    # Issue #68's headline behaviour: an address that names no account is the
+    # diagnostic ANSWER (typo, deleted account), not a failure. It must carry
+    # found:false with no "error" key -- the smoke probe also depends on this,
+    # since the harness fails any top-level error outright.
+    c = FakeDomainClient("example.edu", {}, user=None)
+    inject([c], {"example.edu"})
+    out = server.get_user("ghost@example.edu")
+    assert out["found"] is False
+    assert "error" not in out
+    assert out["domain"] == "example.edu"
+    assert out["username"] == "ghost@example.edu"
+    assert "suspended" not in out  # no state fields invented for an account that isn't there
+
+
+def test_get_user_error_carries_no_found_key(inject):
+    # The other half of the same distinction: a permission/transport failure
+    # must never be reported as found:false, which would read as "this account
+    # does not exist" and send an operator chasing a typo instead of a scope.
+    from gwsadm_mcp.client import GwsAuthError
+
+    inject([FakeDomainClient("example.edu", {}, user=GwsAuthError("no directory scope"))], {"example.edu"})
+    out = server.get_user("user@example.edu")
+    assert "error" in out
+    assert "found" not in out
+    assert out["domain"] == "example.edu"  # domain still identifiable even though the call failed
+
+
+def test_get_user_absent_booleans_stay_none_not_false(inject):
+    # A field Google omitted must stay unresolved. Coercing a missing
+    # "suspended" to False would report a working account from a response that
+    # never said so -- the same not-coerced rule group_delivery_policy keeps.
+    inject([FakeDomainClient("example.edu", {}, user={"primaryEmail": "user@example.edu"})], {"example.edu"})
+    out = server.get_user("user@example.edu")
+    assert out["found"] is True
+    assert out["suspended"] is None
+    assert out["archived"] is None
+    assert out["name"] is None  # the whole name object can be absent, not just fullName
+
+
+def test_get_user_does_not_dump_the_raw_record(inject):
+    # A Directory user record also carries phone numbers, recovery contacts
+    # and custom schemas. The tool answers a sign-in question, so those must
+    # not ride along into output an assistant will read back.
+    record = dict(
+        _USER_RECORD,
+        recoveryPhone="+15550100",
+        recoveryEmail="personal@example.invalid",
+        customSchemas={"HR": {"employeeId": "E1234"}},
+        thumbnailPhotoUrl="https://example.invalid/photo",
+    )
+    inject([FakeDomainClient("example.edu", {}, user=record)], {"example.edu"})
+    out = server.get_user("user@example.edu")
+    assert "recoveryPhone" not in out
+    assert "recoveryEmail" not in out
+    assert "customSchemas" not in out
+    assert "thumbnailPhotoUrl" not in out
+
+
+def test_get_user_unresolvable_domain_error_carries_username(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    out = server.get_user("user@nope.example")
+    assert "error" in out
+    assert out["username"] == "user@nope.example"  # errors always identify the request
+
+
+def test_get_user_strips_whitespace(inject):
+    # A pasted address often carries surrounding whitespace; the untrimmed
+    # value would reach the API as an invalid userKey.
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    out = server.get_user("  user@example.edu  ")
+    assert out["username"] == "user@example.edu"
+    assert c.user_calls == ["user@example.edu"]  # not the untrimmed value
+
+
+def test_get_user_explicit_domain_routes_alias_address(inject):
+    # An alias/secondary-domain address has no [domain.*] section of its own;
+    # the explicit domain param routes the lookup through the configured
+    # section while the alias address passes through as userKey untouched.
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    out = server.get_user("user@alias.edu", domain="example.edu")
+    assert "error" not in out
+    assert out["domain"] == "example.edu"
+    assert c.user_calls == ["user@alias.edu"]
+    # The canonical address Google reports, not the alias that was asked about.
+    assert out["email"] == "user@example.edu"
+
+
+def test_get_user_rejects_non_email():
+    # Validation fires before _clients(), so no client injection is needed —
+    # a malformed input must never surface as a config error.
+    out = server.get_user("not-an-email")
+    assert "not an email address" in out["error"]
+
+
+def test_get_user_rejects_empty_domain_part():
+    # "user@" has an "@" but no domain; must be rejected as a malformed email,
+    # not misdiagnosed as "unknown domain ''".
+    out = server.get_user("user@")
+    assert "not an email address" in out["error"]
+
+
+def test_get_user_rejects_internal_whitespace(inject):
+    # "user@ example.edu": the domain suffix would match config after a strip,
+    # but the raw string is an invalid userKey — reject it instead of sending
+    # it to the API and reporting a misleading "directory API error".
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    out = server.get_user("user@ example.edu")
+    assert "not an email address" in out["error"]
+    assert c.user_calls == []  # never reached the API
 
 
 def test_user_oauth_tokens_projects_and_resolves_domain_from_username(inject):

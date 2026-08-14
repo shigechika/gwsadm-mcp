@@ -5,6 +5,9 @@
 MCP (Model Context Protocol) server for Google Workspace security auditing.
 Exposes `login_audit` (Google-side account locks, suspicious logins),
 `suspended_accounts` (current suspended-account snapshot),
+`get_user` (one named account's state — suspended/archived/2SV/last login —
+via `users().get`, on the same `admin.directory.user.readonly` scope
+`suspended_accounts` uses; a 404 answers `found: false`, never an error),
 `user_oauth_tokens` (one user's third-party OAuth app grants),
 `drive_external_sharing` (ACL grants to external targets, new link/public
 exposure), `drive_doc_activity` (one document's owner + ACL/lifecycle
@@ -21,7 +24,8 @@ combining the Reports-based tools, to AI assistants via STDIO transport,
 built on the official `mcp` Python SDK's `FastMCP`. Read-only: the only
 Admin SDK / Groups Settings / Gmail API methods called anywhere in this
 package are `activities().list` (Reports API), `users().list` (Directory
-API, for `suspended_accounts`), `tokens().list` (Directory API, for
+API, for `suspended_accounts`), `users().get` (Directory API, for
+`get_user`), `tokens().list` (Directory API, for
 `user_oauth_tokens`), `groups().get` / `members().list` (Directory API, for
 `list_group_members`), `groups().get` (Groups Settings API, for
 `group_delivery_policy`), and `messages().list` / `messages().get` (Gmail
@@ -46,7 +50,7 @@ to guard against stdio newline regressions).
 ## Architecture
 
 - `gwsadm_mcp/server.py` — FastMCP server with `health_check`,
-  `login_audit`, `suspended_accounts`, `user_oauth_tokens`,
+  `login_audit`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
   `drive_external_sharing`, `drive_doc_activity`,
   `shared_drive_membership_changes`, `gmail_message_trace`,
   `group_delivery_policy`, `list_group_members`, `daily_brief`,
@@ -134,7 +138,17 @@ to guard against stdio newline regressions).
   surface this as `found: false`; this is also why their smoke probes
   (`scripts/smoke_probes.py`) can safely use a synthetic nonexistent address
   — the smoke harness treats any top-level `{"error": ...}` as an automatic
-  FAIL, which a `found: false` response never triggers. The Groups Settings API returns its
+  FAIL, which a `found: false` response never triggers. `get_user`
+  (`users().get`, issue #68) follows exactly that pattern for accounts rather
+  than groups: 404 → `None` → `found: false`, its probe likewise a synthetic
+  address. Unlike the group methods it adds NO new service — `users().get` is
+  covered by `admin.directory.user.readonly` (confirmed against the Directory
+  API discovery document, which lists that scope on `directory.users.get`),
+  so it reuses `_directory_service()` / `_directory_creds` alongside
+  `list_suspended_users`, and a tenant already running `suspended_accounts`
+  needs no extra grant. Its 404 mapping rests on Google's documented
+  behaviour rather than the live verification the three group calls had; the
+  smoke probe is what would surface a different status. The Groups Settings API returns its
   boolean fields as the strings `"true"` / `"false"`, not JSON booleans —
   `_settings_bool()` normalizes that before it reaches tool output.
 - `gwsadm_mcp/config.py` — `load_config()` parses the `GWSADM_CONFIG` INI
