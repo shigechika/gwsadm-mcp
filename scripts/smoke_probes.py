@@ -109,7 +109,11 @@ async def _configured_domain(call: Caller) -> str | None:
     tool. health_check reports the configured domains, so use those instead.
     """
     health = await call("health_check", {})
-    return _first_field(health, "domain", r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    # The final label allows the punycode form as well as a plain alphabetic TLD:
+    # an internationalised domain reaches the API as "xn--..." (digits and hyphens),
+    # which an [A-Za-z]{2,} tail rejects -- and a rejection here is a silent skip of
+    # the whole probe, i.e. a tenant whose per-account lookup is never exercised.
+    return _first_field(health, "domain", r"[A-Za-z0-9.-]+\.(?:xn--[A-Za-z0-9-]+|[A-Za-z]{2,})")
 
 
 async def _fake_account(call: Caller) -> dict[str, Any]:
