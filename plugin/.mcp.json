@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gwsadm-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["gwsadm-mcp"],
+      "env": {
+        "GWSADM_CONFIG": "${GWSADM_CONFIG:-~/.config/gwsadm-mcp/config.ini}"
+      }
+    }
+  }
+}

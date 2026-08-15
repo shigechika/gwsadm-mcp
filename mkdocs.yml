@@ -1,0 +1,59 @@
+site_name: gwsadm-mcp
+site_description: >-
+  MCP server for Google Workspace security auditing — login audit, suspended
+  accounts, OAuth grants, Drive external sharing, group delivery policy, and
+  Gmail message tracing, through a domain-wide-delegation service account.
+site_url: https://shigechika.github.io/gwsadm-mcp/
+repo_url: https://github.com/shigechika/gwsadm-mcp
+repo_name: shigechika/gwsadm-mcp
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: suffix
+      languages:
+        - locale: en
+          name: English
+          default: true
+          build: true
+        - locale: ja
+          name: 日本語
+          build: true
+
+nav:
+  - Home: index.md
+  - Setup: setup.md
+  - Reference: reference.md

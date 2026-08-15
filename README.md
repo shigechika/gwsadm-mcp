@@ -141,7 +141,28 @@ the allowlist used to classify sharing targets as internal vs external.
 
 ## Usage
 
-### Claude Code
+### Claude Code (plugin)
+
+This repository doubles as a single-plugin marketplace, so Claude Code can
+install the server for you:
+
+```
+/plugin marketplace add shigechika/gwsadm-mcp
+/plugin install gwsadm-mcp@gwsadm-mcp
+```
+
+The plugin launches `uvx gwsadm-mcp` and reads `GWSADM_CONFIG` (falls back to
+`~/.config/gwsadm-mcp/config.ini`), the same variable described in
+[Configuration](#configuration). `/plugin install` only wires up the server
+process — it cannot create the config INI or the Google Cloud service-account
+JSON key(s) it points at; both must already exist on the machine running the
+plugin before any tool call will succeed.
+
+`uvx` must be on the `PATH` of the process that runs Claude Code — a login
+shell usually has it, but a GUI-launched app may not; install
+[uv](https://docs.astral.sh/uv/) system-wide if the plugin fails to start.
+
+### Claude Code (manual)
 
 Add to `.mcp.json` (no `env` needed when the config lives at the default path;
 add `"env": { "GWSADM_CONFIG": "..." }` only for a non-default location):
