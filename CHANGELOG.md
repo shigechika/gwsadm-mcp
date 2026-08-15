@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.13.0...v0.14.0) (2026-08-15)
+
+
+### Features
+
+* package the server as a Claude Code plugin ([#71](https://github.com/shigechika/gwsadm-mcp/issues/71)) ([21b6eee](https://github.com/shigechika/gwsadm-mcp/commit/21b6eee5d4cf3e83d2873cbca3661b42972193a3))
+
 ## [0.13.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.12.2...v0.13.0) (2026-08-14)
 
 
