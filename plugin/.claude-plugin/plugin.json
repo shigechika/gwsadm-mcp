@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "gwsadm-mcp",
+  "displayName": "gwsadm-mcp",
+  "description": "Google Workspace security-audit MCP for Claude Code, through a service account with domain-wide delegation. Investigate suspicious/disabled logins, suspended accounts, third-party OAuth grants, Drive external sharing, group delivery policy, and Gmail message tracing across one or more Workspace domains, plus a one-shot daily_brief. Read-only — no Directory/Reports/Gmail write calls anywhere in this package. Needs a local GWSADM_CONFIG INI file, and the Google Cloud service-account JSON key(s) it references, already present on the machine; the plugin cannot create or supply those files for you.",
+  "author": {
+    "name": "AIKAWA Shigechika",
+    "url": "https://github.com/shigechika"
+  },
+  "homepage": "https://shigechika.github.io/gwsadm-mcp/",
+  "repository": "https://github.com/shigechika/gwsadm-mcp",
+  "license": "MIT",
+  "keywords": [
+    "google-workspace",
+    "admin-sdk",
+    "directory",
+    "gmail",
+    "drive",
+    "audit",
+    "security"
+  ]
+}

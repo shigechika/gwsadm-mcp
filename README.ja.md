@@ -132,7 +132,28 @@ customer_id = C0xxxxxxx
 
 ## 使い方
 
-### Claude Code
+### Claude Code（プラグイン）
+
+このリポジトリはプラグイン1個のマーケットプレイスも兼ねているので、Claude Code から
+そのまま導入できる:
+
+```
+/plugin marketplace add shigechika/gwsadm-mcp
+/plugin install gwsadm-mcp@gwsadm-mcp
+```
+
+プラグインは `uvx gwsadm-mcp` を起動し、上の「設定」節と同じ `GWSADM_CONFIG`
+（未設定なら `~/.config/gwsadm-mcp/config.ini`）を読む。`/plugin install` は
+サーバープロセスの配線を行うだけで、設定 INI やその参照先の Google Cloud
+サービスアカウント JSON 鍵までは作ってくれない。どちらもプラグインを動かす
+マシン上にあらかじめ用意しておく必要がある。
+
+プラグインは `uvx` を起動するため、Claude Code を実行するプロセスの `PATH` に
+`uvx` が通っている必要がある。ログインシェルなら通常問題ないが、GUI から起動した
+場合は通っていないことがある。プラグインが起動しない場合は
+[uv](https://docs.astral.sh/uv/) をシステム全体にインストールすること。
+
+### Claude Code（手動）
 
 `.mcp.json` に追加する（設定ファイルが既定パスにある場合は `env` 不要。
 既定以外のパスの場合のみ `"env": { "GWSADM_CONFIG": "..." }` を追加）:
