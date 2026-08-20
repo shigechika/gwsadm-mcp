@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.14.0...v0.14.1) (2026-08-20)
+
+
+### Bug Fixes
+
+* **login_audit:** name the account Google itself acted on ([#73](https://github.com/shigechika/gwsadm-mcp/issues/73)) ([a887184](https://github.com/shigechika/gwsadm-mcp/commit/a8871844e8773957f8ab885b45a4e90333bfa087))
+
 ## [0.14.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.13.0...v0.14.0) (2026-08-15)
 
 
