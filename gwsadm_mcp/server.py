@@ -228,7 +228,10 @@ def _window(hours: int) -> datetime.datetime:
 def _entry(item: dict, event: dict) -> dict:
     """Project one audit activity to ``{time, user, ip, event}``.
 
-    ``user`` is the account the entry is ABOUT, which is not always the actor.
+    ``user`` is normally the actor. On the Drive call sites it always is, and
+    the account acted upon is reported separately as ``target_user``.
+
+    The login call sites add one case where no actor exists to name.
     Google-initiated security events (``account_disabled_*``,
     ``suspicious_login``, ``gov_attack_warning``) carry
     ``actor = {"callerType": "KEY", "key": "Google"}`` — no email and no
@@ -237,15 +240,24 @@ def _entry(item: dict, event: dict) -> dict:
     alone therefore anonymises exactly the entries that matter most: on
     2026-08-20 the disable event for a compromised mailbox was collected and
     reported with ``user: null``, so it could not be matched to the helpdesk
-    ticket asking about that same mailbox.
+    ticket asking about that same mailbox. Drive events carry no
+    ``affected_email_address``, so this fallback cannot fire there.
     """
     actor = item.get("actor", {})
     return {
         "time": item.get("id", {}).get("time"),
         # profileId is a numeric fallback: some restricted/system-initiated
-        # events omit actor.email. affected_email_address comes last and is the
-        # only one populated for Google-initiated security events.
-        "user": (actor.get("email") or actor.get("profileId") or event_parameters(event).get("affected_email_address")),
+        # events omit actor.email. affected_email_address comes last, so an
+        # event that has an actor still names the actor -- it only resolves the
+        # Google-initiated events, which have neither field. Ordering checked
+        # against 30 days of this tenant's security events: every one was
+        # callerType=KEY with no email and no profileId, so nothing observed is
+        # shadowed by putting it last.
+        "user": (
+            actor.get("email")
+            or actor.get("profileId")
+            or _scalar(event_parameters(event).get("affected_email_address"))
+        ),
         # ipAddress lives on the activity item itself, not under actor, and
         # is populated far more reliably than actor.email — keep it even
         # when user is unresolvable so the entry is still investigable.

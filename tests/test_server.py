@@ -259,6 +259,29 @@ def test_login_audit_prefers_the_actor_over_affected_email(inject):
     assert entries[0]["user"] == "admin@example.edu"
 
 
+def test_login_audit_tolerates_a_multivalued_affected_email(inject):
+    # event_parameters() passes a multiValue parameter through verbatim, so an
+    # unexpected multi-valued delivery would make user a list and break the
+    # keying and grouping downstream. Every other consumer in this module
+    # guards with _scalar; this one must too.
+    multi = {
+        "id": {"time": "2026-08-19T11:22:22.195Z"},
+        "actor": {"callerType": "KEY", "key": "Google"},
+        "ipAddress": "203.0.113.79",
+        "events": [
+            {
+                "name": "account_disabled_spamming",
+                "parameters": [{"name": "affected_email_address", "multiValue": ["victim@example.edu"]}],
+            }
+        ],
+    }
+    canned = {("login", "account_disabled_spamming"): ([multi], False)}
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    entries = server.login_audit(hours=24)["domains"]["example.edu"]["account_disabled"]["entries"]
+
+    assert entries[0]["user"] == "victim@example.edu"  # collapsed, not a list
+
+
 def test_login_audit_capped_probe_yields_no_phantom_entries(inject):
     canned = {("login", "account_disabled_spamming"): ([], True)}
     inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
