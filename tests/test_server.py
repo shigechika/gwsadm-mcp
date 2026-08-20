@@ -208,6 +208,80 @@ def test_login_audit_entry_surfaces_ip_and_falls_back_to_profile_id(inject):
     assert entries[2]["ip"] == "198.51.100.42"  # IP still recoverable
 
 
+def test_login_audit_names_the_account_google_itself_acted_on(inject):
+    # Google-initiated security events carry actor {"callerType": "KEY", "key":
+    # "Google"} -- no email, no profileId, because Google acted -- and name the
+    # affected account in affected_email_address. Reading only the actor
+    # anonymised exactly these entries: a real compromise (2026-08-20) was
+    # collected and shown as user: null, so it could not be matched to the
+    # ticket asking about that mailbox. Shape copied from a production activity.
+    google_disabled = {
+        "id": {"time": "2026-08-19T11:22:22.195Z"},
+        "actor": {"callerType": "KEY", "key": "Google"},
+        "ipAddress": "203.0.113.77",
+        "events": [
+            {
+                "type": "account_warning",
+                "name": "account_disabled_spamming",
+                "parameters": [{"name": "affected_email_address", "value": "victim@example.edu"}],
+            }
+        ],
+    }
+    canned = {("login", "account_disabled_spamming"): ([google_disabled], False)}
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    entries = server.login_audit(hours=24)["domains"]["example.edu"]["account_disabled"]["entries"]
+
+    assert entries[0]["user"] == "victim@example.edu"  # the account, not the actor
+    assert entries[0]["ip"] == "203.0.113.77"
+    assert entries[0]["event"] == "account_disabled_spamming"
+
+
+def test_login_audit_prefers_the_actor_over_affected_email(inject):
+    # Guards the precedence: affected_email_address is a last resort, so an
+    # event that has both must still report the actor. Otherwise a
+    # human-initiated event carrying an affected address (an admin acting on
+    # someone else) would silently start naming the target instead of the admin.
+    both = {
+        "id": {"time": "2026-08-19T11:22:22.195Z"},
+        "actor": {"email": "admin@example.edu"},
+        "ipAddress": "203.0.113.78",
+        "events": [
+            {
+                "name": "suspicious_login",
+                "parameters": [{"name": "affected_email_address", "value": "target@example.edu"}],
+            }
+        ],
+    }
+    canned = {("login", "suspicious_login"): ([both], False)}
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    entries = server.login_audit(hours=24)["domains"]["example.edu"]["suspicious_logins"]["entries"]
+
+    assert entries[0]["user"] == "admin@example.edu"
+
+
+def test_login_audit_tolerates_a_multivalued_affected_email(inject):
+    # event_parameters() passes a multiValue parameter through verbatim, so an
+    # unexpected multi-valued delivery would make user a list and break the
+    # keying and grouping downstream. Every other consumer in this module
+    # guards with _scalar; this one must too.
+    multi = {
+        "id": {"time": "2026-08-19T11:22:22.195Z"},
+        "actor": {"callerType": "KEY", "key": "Google"},
+        "ipAddress": "203.0.113.79",
+        "events": [
+            {
+                "name": "account_disabled_spamming",
+                "parameters": [{"name": "affected_email_address", "multiValue": ["victim@example.edu"]}],
+            }
+        ],
+    }
+    canned = {("login", "account_disabled_spamming"): ([multi], False)}
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    entries = server.login_audit(hours=24)["domains"]["example.edu"]["account_disabled"]["entries"]
+
+    assert entries[0]["user"] == "victim@example.edu"  # collapsed, not a list
+
+
 def test_login_audit_capped_probe_yields_no_phantom_entries(inject):
     canned = {("login", "account_disabled_spamming"): ([], True)}
     inject([FakeDomainClient("example.edu", canned)], {"example.edu"})

@@ -226,12 +226,38 @@ def _window(hours: int) -> datetime.datetime:
 
 
 def _entry(item: dict, event: dict) -> dict:
+    """Project one audit activity to ``{time, user, ip, event}``.
+
+    ``user`` is normally the actor. On the Drive call sites it always is, and
+    the account acted upon is reported separately as ``target_user``.
+
+    The login call sites add one case where no actor exists to name.
+    Google-initiated security events (``account_disabled_*``,
+    ``suspicious_login``, ``gov_attack_warning``) carry
+    ``actor = {"callerType": "KEY", "key": "Google"}`` — no email and no
+    profileId, because Google itself acted — and name the affected account in
+    the event's ``affected_email_address`` parameter instead. Reading the actor
+    alone therefore anonymises exactly the entries that matter most: on
+    2026-08-20 the disable event for a compromised mailbox was collected and
+    reported with ``user: null``, so it could not be matched to the helpdesk
+    ticket asking about that same mailbox. Drive events carry no
+    ``affected_email_address``, so this fallback cannot fire there.
+    """
     actor = item.get("actor", {})
     return {
         "time": item.get("id", {}).get("time"),
         # profileId is a numeric fallback: some restricted/system-initiated
-        # events (observed on suspicious_login) omit actor.email entirely.
-        "user": actor.get("email") or actor.get("profileId"),
+        # events omit actor.email. affected_email_address comes last, so an
+        # event that has an actor still names the actor -- it only resolves the
+        # Google-initiated events, which have neither field. Ordering checked
+        # against 30 days of this tenant's security events: every one was
+        # callerType=KEY with no email and no profileId, so nothing observed is
+        # shadowed by putting it last.
+        "user": (
+            actor.get("email")
+            or actor.get("profileId")
+            or _scalar(event_parameters(event).get("affected_email_address"))
+        ),
         # ipAddress lives on the activity item itself, not under actor, and
         # is populated far more reliably than actor.email — keep it even
         # when user is unresolvable so the entry is still investigable.
@@ -361,10 +387,27 @@ def _login_audit(clients: list[DomainClient], hours: int, include_failures: bool
 def login_audit(hours: int = 24, domain: str | None = None, include_failures: bool = True, top: int = 10) -> dict:
     """Audit the login log: Google-auto-disabled accounts, suspicious logins, failure top-N.
 
-    account_disabled_* events are how Google reports that IT locked an account
-    (leaked password, hijacking, spamming). Combine with a Directory
-    suspended-users snapshot (Phase 2) for current state. Each section carries
-    ``capped`` (window not fully scanned) — treat counts as lower bounds then.
+    Answers "did Google itself decide something was wrong with an account here,
+    and with which account?" — the question a "my mail suddenly stopped working"
+    ticket usually turns out to be. ``account_disabled_*`` is Google reporting
+    that it locked an account (leaked password, hijacking, spamming);
+    ``suspicious_login`` and ``gov_attack_warning`` are warnings without a lock.
+
+    In both sections ``user`` is the account the event is ABOUT, not an actor
+    who did something: Google raised these itself, so the actor is Google and
+    the account is read from the event's ``affected_email_address``. Treat a
+    hit as evidence about that account, and reach for ``get_user`` next for its
+    current state.
+
+    An ``account_disabled_spamming`` entry means Google observed outbound spam,
+    which is a compromise finding, not a delivery problem — the account was
+    almost certainly being used by someone else. The IdP upstream is a separate
+    system and is NOT disabled by this: an account locked here can still
+    authenticate there until it is disabled there too.
+
+    Combine with a Directory suspended-users snapshot (Phase 2) for current
+    state. Each section carries ``capped`` (window not fully scanned) — treat
+    counts as lower bounds then.
     """
     try:
         clients, _ = _clients()
