@@ -26,6 +26,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Kept as a matrix key (even though runs-on is now hardcoded below) so
+        # this job keeps reporting as "test (ubuntu-latest, 3.1X)" -- the exact
+        # string the branch ruleset requires. Dropping it would rename the
+        # check and re-trigger the same required-status-check breakage this
+        # PR just fixed for the Windows leg.
         os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
