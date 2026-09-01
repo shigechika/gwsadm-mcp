@@ -10,11 +10,16 @@ pointed to by ``GWSADM_CONFIG`` (default ``~/.config/gwsadm-mcp/config.ini``)::
     service_account_file = /path/to/service-account.json
     subject = audit-admin@example.edu
     customer_id = C0xxxxxxx
+    dmarc_rua_mailbox = postmaster@example.edu   ; optional, default: postmaster@<domain>
 
 Each ``[domain.*]`` section is one Google Workspace domain audited with its own
 service account (domain-wide delegation) and impersonation subject.
 ``internal_domains`` is the allowlist used to classify sharing targets as
-internal vs external.
+internal vs external. ``dmarc_rua_mailbox`` is the mailbox ``dmarc_rua_summary``
+impersonates to read DMARC aggregate reports -- usually the same inbox as
+``subject`` receives mail addressed to a ``postmaster+rua@`` Gmail
+plus-subaddress, which is why the default assumes ``postmaster@`` rather than
+requiring every deployment to spell it out.
 """
 
 import configparser
@@ -36,6 +41,7 @@ class DomainConfig:
     service_account_file: str
     subject: str
     customer_id: str
+    dmarc_rua_mailbox: str
 
 
 def config_path() -> str:
@@ -75,6 +81,12 @@ def load_config(path: str | None = None) -> tuple[list[DomainConfig], set[str]]:
                 service_account_file=os.path.expanduser(s["service_account_file"].strip()),
                 subject=s["subject"].strip(),
                 customer_id=s["customer_id"].strip(),
+                # Optional: unlike the four keys above, a domain with no DMARC
+                # tooling need not set this. postmaster@ is RFC 2142's mandatory
+                # role mailbox, so it is a safe zero-config default rather than
+                # a guess -- an org that routes RUA reports elsewhere sets this
+                # explicitly instead.
+                dmarc_rua_mailbox=(s.get("dmarc_rua_mailbox", "").strip() or f"postmaster@{name}"),
             )
         )
     if not domains:

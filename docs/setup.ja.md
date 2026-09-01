@@ -67,10 +67,13 @@ internal_domains = example.edu, mail.example.edu
 service_account_file = /path/to/service-account.json
 subject = audit-admin@example.edu
 customer_id = C0xxxxxxx
+dmarc_rua_mailbox = postmaster@example.edu   # 省略可。既定値: postmaster@<domain>
 ```
 
 監査対象の Workspace ドメインごとに1つの `[domain.*]` セクションを置く。
 `internal_domains` は共有先を内部/外部に分類するための許可リスト。
+`dmarc_rua_mailbox`（省略可）は `dmarc_rua_summary` がDMARC集約レポートを
+読むためになりすますメールボックス。
 
 `GWSADM_CONFIG` そのものが設定サーフェス全体であり、環境変数だけで
 サーバーを設定する方法は存在しない。各 `service_account_file` はさらに

@@ -23,10 +23,18 @@ Gmail's credentials/service are cached per user_email instead
 (see ``_gmail_service``).
 """
 
+import base64
+import binascii
+import concurrent.futures
 import datetime
+import gzip
+import io
 import random
 import threading
 import time
+import xml.etree.ElementTree as ET
+import zipfile
+import zlib
 
 import google_auth_httplib2
 import httplib2
@@ -100,6 +108,115 @@ _GMAIL_CACHE_MAX = 500
 # len(matches) >= this constant, which is also true of a mailbox with
 # EXACTLY this many matches and nothing more) and sets match_count_capped.
 _MESSAGE_LIST_MAX_RESULTS = 5
+
+# messages().list page size for a DMARC RUA mailbox search. Gmail's hard cap
+# is 500; kept far below that so one page's worth of per-message fetches
+# (see fetch_dmarc_rua_records) stays a bounded, predictable unit of work
+# rather than a single 500-message batch.
+_DMARC_MESSAGE_LIST_PAGE_SIZE = 100
+
+# Bounded worker count for fetching+parsing one page's messages concurrently
+# in fetch_dmarc_rua_records. Doing this serially is what made an earlier
+# ad-hoc script (a personal-account Python loop, not this server) take
+# several minutes for ~200 messages -- two Gmail API round trips each, one
+# at a time. This mirrors the boxadm-mcp _SCAN_CONCURRENCY_DEFAULT rationale:
+# I/O-bound work, a handful of concurrent requests captures most of the win
+# without provoking per-user Gmail API rate limits.
+_DMARC_FETCH_WORKERS_DEFAULT = 8
+
+
+def _find_attachment_id(payload: dict) -> str | None:
+    """Depth-first search of a Gmail message payload for the first attachment id.
+
+    A DMARC RUA report email is near-universally a single attachment (the
+    compressed report XML) with no other parts worth inspecting, so the
+    first attachment found is taken without disambiguating multi-attachment
+    messages -- an RUA sender that also attaches something else is not a
+    case this has ever needed to handle.
+    """
+    attachment_id = payload.get("body", {}).get("attachmentId")
+    if attachment_id:
+        return attachment_id
+    for part in payload.get("parts", []) or []:
+        found = _find_attachment_id(part)
+        if found:
+            return found
+    return None
+
+
+def _decode_report_payload(raw: bytes) -> bytes:
+    """Decompress a DMARC aggregate-report attachment.
+
+    RUA senders overwhelmingly gzip the report XML (the RFC 7489-recommended
+    form); a shrinking minority zip it instead. Anything that is neither is
+    returned as-is on the assumption it is already plain XML -- the caller's
+    XML parse is what actually validates that assumption, not this function.
+    """
+    try:
+        return gzip.decompress(raw)
+    except OSError:
+        pass
+    except EOFError:
+        # A truncated gzip stream (cut off mid-transfer) raises EOFError, not
+        # OSError -- gzip.decompress's docs/source don't advertise this
+        # separately from BadGzipFile (an OSError subclass), but it is a real,
+        # distinct exception a corrupted/truncated attachment can raise.
+        pass
+    except zlib.error:
+        # A gzip-magic-valid header with a corrupted deflate body raises this
+        # from the underlying zlib layer, not gzip's own OSError subclass.
+        pass
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+            if not names:
+                return raw
+            return zf.read(names[0])
+    except zipfile.BadZipFile:
+        return raw
+
+
+def _parse_dmarc_records(xml_bytes: bytes) -> list[dict]:
+    """Parse one DMARC aggregate-report XML document into its per-source-IP records.
+
+    Each returned dict is ``{policy_domain, source_ip, count, dkim, spf,
+    disposition, header_from}`` -- the raw fields a caller needs to judge
+    DMARC pass/fail correctly. This function does NOT itself decide
+    pass/fail: ``dkim``/``spf`` here are Google's *aligned* policy_evaluated
+    values, and a record with EITHER one (not necessarily both) reading
+    "pass" is a DMARC pass -- treating any non-"pass" dkim as a failure
+    regardless of spf overcounts dramatically, since a lot of legitimate
+    mail passes DMARC via SPF alignment alone. That judgment belongs to the
+    caller (see ``server.py``'s aggregation), which is also better placed to
+    decide what "reject candidate" means for its own purposes.
+
+    A ``<record>`` with a missing/unparsable ``<count>`` is skipped rather
+    than raising: one malformed record in an otherwise-valid report must not
+    lose every other record in it.
+    """
+    root = ET.fromstring(xml_bytes)
+    policy_domain = root.findtext(".//policy_published/domain") or ""
+    records: list[dict] = []
+    for rec in root.findall(".//record"):
+        count_text = rec.findtext("row/count")
+        try:
+            count = int(count_text) if count_text is not None else None
+        except ValueError:
+            count = None
+        if count is None:
+            continue
+        records.append(
+            {
+                "policy_domain": policy_domain,
+                "source_ip": rec.findtext("row/source_ip") or "",
+                "count": count,
+                "dkim": rec.findtext("row/policy_evaluated/dkim") or "",
+                "spf": rec.findtext("row/policy_evaluated/spf") or "",
+                "disposition": rec.findtext("row/policy_evaluated/disposition") or "",
+                "header_from": rec.findtext(".//identifiers/header_from") or "",
+            }
+        )
+    return records
 
 
 def _is_retryable(e: HttpError) -> bool:
@@ -657,6 +774,134 @@ class DomainClient:
             # the true count.
             "match_count_capped": bool(resp.get("nextPageToken")),
         }
+
+    def fetch_dmarc_rua_records(
+        self,
+        *,
+        start: datetime.datetime,
+        mailbox: str | None = None,
+        max_pages: int = 5,
+        max_workers: int = _DMARC_FETCH_WORKERS_DEFAULT,
+    ) -> tuple[list[dict], bool, int, str]:
+        """Fetch and parse DMARC aggregate (RUA) reports delivered to one mailbox.
+
+        Impersonates ``mailbox`` (default ``cfg.dmarc_rua_mailbox``) via the
+        same ``gmail.readonly`` DWD scope and per-user credential cache as
+        ``find_message_by_id`` -- see the class docstring for why Gmail auth
+        is architecturally different from this client's other services.
+
+        Searches for messages addressed to ``mailbox`` received on or after
+        ``start`` (Gmail's ``after:`` search operator, second-precision unix
+        timestamp), then for each matching message walks its MIME parts for
+        the first attachment, decompresses it, and parses every ``<record>``
+        element -- see ``_find_attachment_id``/``_decode_report_payload``/
+        ``_parse_dmarc_records``. A message with no attachment, or whose
+        attachment fails to decode or parse, is skipped and counted in the
+        returned message-error count rather than aborting the whole fetch --
+        one malformed report must not blind the caller to every other report
+        in the window.
+
+        Per-page message fetches run concurrently (bounded by ``max_workers``)
+        because this step is two Gmail API round trips PER MESSAGE
+        (``messages().get`` then ``attachments().get``) with no server-side
+        aggregation to fall back on -- doing this serially made a comparable
+        ad-hoc script take minutes for ~200 messages, which risks outrunning
+        an MCP client's own gateway timeout. Each worker builds its own
+        ``httplib2.Http`` (see ``_new_http``'s docstring on why one instance
+        cannot be shared across threads).
+
+        Read-only: only ``messages().list``, ``messages().get`` (``format=
+        "full"`` -- the only way to see attachment ids; there is no way to
+        fetch just the MIME tree without headers too) and
+        ``messages().attachments().get`` are issued.
+
+        Returns ``(records, capped, message_errors, mailbox)`` -- the last is
+        the mailbox actually used (the resolved ``cfg.dmarc_rua_mailbox``
+        default when the ``mailbox`` argument was not given), so a caller can
+        report which address the summary covers without reaching into this
+        client's config. ``capped=True`` means the mailbox had more pages of
+        matching messages than ``max_pages`` covered -- unlike
+        ``fetch_activities``, every matching message must be walked (there is
+        no server-side count to report instead), so a capped fetch
+        under-counts real report volume, not just a lower bound on some other
+        total.
+        """
+        mailbox = mailbox or self.cfg.dmarc_rua_mailbox
+        svc, creds = self._gmail_service(mailbox)
+        list_http = self._new_http(creds)
+        query = f"to:{mailbox} after:{int(start.timestamp())}"
+
+        def _fetch_one(message_id: str) -> list[dict] | None:
+            """Fetch+parse one message's attachment; None on a tolerated per-message failure."""
+            http = self._new_http(creds)
+            full = self._execute(lambda: svc.users().messages().get(userId="me", id=message_id, format="full"), http)
+            attachment_id = _find_attachment_id(full.get("payload", {}))
+            if not attachment_id:
+                return None
+            att = self._execute(
+                lambda: svc.users().messages().attachments().get(userId="me", messageId=message_id, id=attachment_id),
+                http,
+            )
+            data = att.get("data") or ""
+            if not data:
+                return None
+            padded = data + "=" * (-len(data) % 4)
+            xml_bytes = _decode_report_payload(base64.urlsafe_b64decode(padded))
+            return _parse_dmarc_records(xml_bytes)
+
+        records: list[dict] = []
+        message_errors = 0
+        token = None
+        pages = 0
+        try:
+            while True:
+                resp = self._execute(
+                    lambda tok=token: (
+                        svc.users()
+                        .messages()
+                        .list(userId="me", q=query, maxResults=_DMARC_MESSAGE_LIST_PAGE_SIZE, pageToken=tok)
+                    ),
+                    list_http,
+                )
+                message_ids = [m["id"] for m in resp.get("messages", [])]
+                if message_ids:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(message_ids))) as ex:
+                        futs = [ex.submit(_fetch_one, mid) for mid in message_ids]
+                        for fut in concurrent.futures.as_completed(futs):
+                            # HttpError/transport/parse failures on ONE message are
+                            # tolerated (counted, not raised). A GoogleAuthError is
+                            # NOT in this tuple -- it isn't a subclass of any of these
+                            # (verified: GoogleAuthError.__mro__ is (..., Exception,
+                            # BaseException, object), no OSError/HttpError in it) -- so
+                            # it propagates out of fut.result() uncaught, out of this
+                            # loop, to the outer `except GoogleAuthError` below. That is
+                            # deliberate: the whole mailbox/scope is broken identically
+                            # for every message, so it should fail the fetch outright
+                            # instead of being silently counted as hundreds of
+                            # individual message errors.
+                            try:
+                                result = fut.result()
+                            except (HttpError, httplib2.HttpLib2Error, OSError, ET.ParseError, binascii.Error):
+                                message_errors += 1
+                                continue
+                            if result is None:
+                                message_errors += 1
+                            else:
+                                records.extend(result)
+                token = resp.get("nextPageToken")
+                pages += 1
+                if not token or pages >= max_pages:
+                    break
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] gmail API error (messages.list, {mailbox}): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: gmail.readonly DWD scope not granted for this client, or a
+            # per-message auth failure re-raised from the worker loop above.
+            raise GwsAuthError(f"[{self.domain}] auth failed for {mailbox}: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (gmail, {mailbox}): {type(e).__name__}") from e
+        return records, bool(token), message_errors, mailbox
 
     def get_group_settings(self, group_email: str) -> dict | None:
         """Fetch one Google Group's own posting/delivery policy (Groups Settings API).

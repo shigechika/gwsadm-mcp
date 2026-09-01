@@ -21,6 +21,7 @@ class FakeDomainClient:
         group_settings=None,
         group_meta=None,
         group_members=None,
+        dmarc_rua=None,
     ):
         self.domain = domain
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
@@ -43,6 +44,10 @@ class FakeDomainClient:
         self._group_settings = group_settings
         self._group_meta = group_meta
         self._group_members = group_members
+        # dmarc_rua: (records, capped, message_errors, mailbox) | Exception | None
+        # (None means "no records, not capped, no errors, mailbox defaults to
+        # postmaster@<domain>" -- matching the real client's config default).
+        self._dmarc_rua = dmarc_rua
         self.calls = []
         self.user_calls = []
         self.token_calls = []
@@ -50,6 +55,7 @@ class FakeDomainClient:
         self.group_settings_calls = []
         self.group_meta_calls = []
         self.group_members_calls = []
+        self.dmarc_rua_calls = []
 
     def fetch_activities(self, application_name, *, start, end=None, event_name=None, filters=None, max_pages=5):
         self.calls.append((application_name, event_name, max_pages, filters))
@@ -90,6 +96,14 @@ class FakeDomainClient:
         if isinstance(got, Exception):
             raise got
         return got  # a dict (found) or None (not found) — caller's choice per user
+
+    def fetch_dmarc_rua_records(self, *, start, mailbox=None, max_pages=5, max_workers=8):
+        self.dmarc_rua_calls.append((start, mailbox, max_pages))
+        if self._dmarc_rua is None:
+            return [], False, 0, mailbox or f"postmaster@{self.domain}"
+        if isinstance(self._dmarc_rua, Exception):
+            raise self._dmarc_rua
+        return self._dmarc_rua
 
     def get_group_settings(self, group_email):
         self.group_settings_calls.append(group_email)
@@ -694,6 +708,177 @@ def test_gmail_message_trace_rejects_over_limit_recipients(inject):
     assert "error" in out
     assert "exceeds" in out["error"]
     assert c.gmail_calls == []  # rejected before any per-recipient work
+
+
+# -- dmarc_rua_summary -------------------------------------------------------
+
+
+def _dmarc_record(**kw):
+    base = {
+        "policy_domain": "example.edu",
+        "source_ip": "1.2.3.4",
+        "count": 1,
+        "dkim": "pass",
+        "spf": "pass",
+        "disposition": "none",
+        "header_from": "example.edu",
+    }
+    base.update(kw)
+    return base
+
+
+def test_aggregate_dmarc_rua_pass_via_spf_alone_is_not_a_failure():
+    # Regression test for the exact bug found in an ad-hoc script on
+    # 2026-09-01: counting any dkim != "pass" as a failure regardless of spf
+    # overcounts dramatically, since a lot of legitimate mail passes DMARC
+    # via SPF alignment alone with DKIM unaligned or absent.
+    recs = [_dmarc_record(count=100, dkim="fail", spf="pass")]
+    out = server._aggregate_dmarc_rua(recs, top=5)
+    assert out["example.edu"] == {
+        "pass": 100,
+        "quarantined": 0,
+        "rejected": 0,
+        "undisposed_fail": 0,
+        "reject_candidate_ips": [],
+    }
+
+
+def test_aggregate_dmarc_rua_both_fail_undisposed_is_a_reject_candidate():
+    recs = [_dmarc_record(count=7, dkim="fail", spf="fail", disposition="none", source_ip="5.6.7.8")]
+    out = server._aggregate_dmarc_rua(recs, top=5)
+    dom = out["example.edu"]
+    assert dom["undisposed_fail"] == 7
+    assert dom["pass"] == 0 and dom["quarantined"] == 0
+    assert dom["reject_candidate_ips"] == [
+        {"source_ip": "5.6.7.8", "count": 7, "dispositions": ["none"], "header_from": ["example.edu"]}
+    ]
+
+
+def test_aggregate_dmarc_rua_quarantined_counted_separately_from_undisposed():
+    recs = [
+        _dmarc_record(count=3, dkim="fail", spf="fail", disposition="quarantine", source_ip="9.9.9.9"),
+        _dmarc_record(count=4, dkim="fail", spf="fail", disposition="none", source_ip="9.9.9.9"),
+    ]
+    out = server._aggregate_dmarc_rua(recs, top=5)
+    dom = out["example.edu"]
+    assert dom["quarantined"] == 3
+    assert dom["undisposed_fail"] == 4
+    # Same source IP seen under both dispositions is aggregated into one entry.
+    assert dom["reject_candidate_ips"] == [
+        {"source_ip": "9.9.9.9", "count": 7, "dispositions": ["none", "quarantine"], "header_from": ["example.edu"]}
+    ]
+
+
+def test_aggregate_dmarc_rua_rejected_disposition_counted_separately():
+    # Regression test for a Copilot review finding on PR #79: disposition can
+    # be "reject" (not just "quarantine") in DMARC aggregate reports -- a
+    # tenant already running p=reject enforces this TODAY, so it must not be
+    # folded into undisposed_fail (which means "not yet blocked").
+    recs = [
+        _dmarc_record(count=2, dkim="fail", spf="fail", disposition="reject", source_ip="1.2.3.4"),
+        _dmarc_record(count=3, dkim="fail", spf="fail", disposition="quarantine", source_ip="1.2.3.4"),
+        _dmarc_record(count=4, dkim="fail", spf="fail", disposition="none", source_ip="1.2.3.4"),
+    ]
+    out = server._aggregate_dmarc_rua(recs, top=5)
+    dom = out["example.edu"]
+    assert dom["rejected"] == 2
+    assert dom["quarantined"] == 3
+    assert dom["undisposed_fail"] == 4
+    assert dom["pass"] == 0
+    # All three dispositions for the same source IP fold into one reject-candidate entry.
+    assert dom["reject_candidate_ips"] == [
+        {
+            "source_ip": "1.2.3.4",
+            "count": 9,
+            "dispositions": ["none", "quarantine", "reject"],
+            "header_from": ["example.edu"],
+        }
+    ]
+
+
+def test_aggregate_dmarc_rua_top_ips_ordered_by_count_and_truncated():
+    recs = [
+        _dmarc_record(count=5, dkim="fail", spf="fail", source_ip="1.1.1.1"),
+        _dmarc_record(count=50, dkim="fail", spf="fail", source_ip="2.2.2.2"),
+        _dmarc_record(count=20, dkim="fail", spf="fail", source_ip="3.3.3.3"),
+    ]
+    out = server._aggregate_dmarc_rua(recs, top=2)
+    ips = [e["source_ip"] for e in out["example.edu"]["reject_candidate_ips"]]
+    assert ips == ["2.2.2.2", "3.3.3.3"]
+
+
+def test_aggregate_dmarc_rua_groups_by_policy_domain_separately():
+    recs = [
+        _dmarc_record(policy_domain="a.example.edu", source_ip="1.1.1.1"),
+        _dmarc_record(policy_domain="b.example.edu", source_ip="2.2.2.2", count=2),
+    ]
+    out = server._aggregate_dmarc_rua(recs, top=5)
+    assert set(out.keys()) == {"a.example.edu", "b.example.edu"}
+    assert out["a.example.edu"]["pass"] == 1
+    assert out["b.example.edu"]["pass"] == 2
+
+
+def test_aggregate_dmarc_rua_empty_input_returns_empty_dict():
+    assert server._aggregate_dmarc_rua([], top=5) == {}
+
+
+def test_dmarc_rua_summary_reports_per_domain_mailbox_and_counts(inject):
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        dmarc_rua=([_dmarc_record(count=10)], False, 0, "postmaster@example.edu"),
+    )
+    inject([c], {"example.edu"})
+    out = server.dmarc_rua_summary(hours=72)
+    dom = out["domains"]["example.edu"]
+    assert dom["mailbox"] == "postmaster@example.edu"
+    assert dom["capped"] is False
+    assert dom["message_errors"] == 0
+    assert dom["policy_domains"]["example.edu"]["pass"] == 10
+    assert out["window_hours"] == 72
+
+
+def test_dmarc_rua_summary_degrades_only_the_failing_domain(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    ok = FakeDomainClient(
+        "ok.example.edu",
+        {},
+        dmarc_rua=([_dmarc_record(policy_domain="ok.example.edu")], False, 0, "postmaster@ok.example.edu"),
+    )
+    broken = FakeDomainClient("broken.example.edu", {}, dmarc_rua=GwsAuthError("gmail.readonly not granted"))
+    inject([ok, broken], {"ok.example.edu", "broken.example.edu"})
+    out = server.dmarc_rua_summary(hours=24)
+    assert "error" not in out["domains"]["ok.example.edu"]
+    assert out["domains"]["broken.example.edu"]["error"] == "gmail.readonly not granted"
+
+
+def test_dmarc_rua_summary_forwards_mailbox_override_and_max_pages(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    server.dmarc_rua_summary(hours=48, mailbox="dmarc-reports@example.edu", max_pages=2)
+    assert len(c.dmarc_rua_calls) == 1
+    _start, mailbox, max_pages = c.dmarc_rua_calls[0]
+    assert mailbox == "dmarc-reports@example.edu"
+    assert max_pages == 2
+
+
+def test_dmarc_rua_summary_unknown_domain_is_error(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    out = server.dmarc_rua_summary(domain="not-configured.edu")
+    assert "error" in out
+
+
+def test_dmarc_rua_summary_rejects_malformed_mailbox_override(inject):
+    # Regression test for a Copilot review finding on PR #79: mailbox is
+    # interpolated directly into a Gmail search query ("to:{mailbox}"), so an
+    # adversarial value (whitespace, a smuggled search operator) must be
+    # rejected before it ever reaches fetch_dmarc_rua_records.
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.dmarc_rua_summary(mailbox="not-an-email newer_than:1d")
+    assert "error" in out
+    assert c.dmarc_rua_calls == []  # rejected before any per-domain work
 
 
 def test_gmail_message_trace_rejects_empty_recipients(inject):

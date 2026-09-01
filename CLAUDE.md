@@ -15,6 +15,10 @@ history via a server-side `doc_id` filter), `shared_drive_membership_changes`
 (shared-drive member add/remove/role history), `gmail_message_trace` (did a
 known Message-ID reach specific mailboxes, and where — Gmail API, requires
 the separate `gmail.readonly` DWD scope, see its docstring),
+`dmarc_rua_summary` (DMARC aggregate/RUA report pass/fail summary and top
+reject-candidate source IPs, per domain — Gmail API against the domain's
+configured `dmarc_rua_mailbox`, shares `gmail_message_trace`'s
+`gmail.readonly` DWD scope but reads attachment content, not just metadata),
 `group_delivery_policy` (a Google Group's own posting/delivery policy —
 Groups Settings API, requires the separate `apps.groups.settings` DWD
 scope), `list_group_members` (a Google Group's metadata + member roster —
@@ -28,9 +32,13 @@ API, for `suspended_accounts`), `users().get` (Directory API, for
 `get_user`), `tokens().list` (Directory API, for
 `user_oauth_tokens`), `groups().get` / `members().list` (Directory API, for
 `list_group_members`), `groups().get` (Groups Settings API, for
-`group_delivery_policy`), and `messages().list` / `messages().get` (Gmail
-API, `format="metadata"` only, for `gmail_message_trace`) — all read-only;
-no mutating call exists.
+`group_delivery_policy`), `messages().list` / `messages().get` (Gmail
+API, `format="metadata"` only, for `gmail_message_trace`), and
+`messages().list` / `messages().get` (`format="full"`) /
+`messages().attachments().get()` (Gmail API, for `dmarc_rua_summary` --
+this one DOES read message/attachment content, not just metadata, since a
+DMARC report's data lives in its attachment) — all read-only; no mutating
+call exists.
 The underlying `googleapiclient.discovery.build()` setup call also fetches
 Google's discovery document over HTTP, separately from this guarantee.
 
@@ -53,7 +61,7 @@ to guard against stdio newline regressions).
   `login_audit`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
   `drive_external_sharing`, `drive_doc_activity`,
   `shared_drive_membership_changes`, `gmail_message_trace`,
-  `group_delivery_policy`, `list_group_members`, `daily_brief`,
+  `dmarc_rua_summary`, `group_delivery_policy`, `list_group_members`, `daily_brief`,
   and the background pair `daily_brief_start` / `daily_brief_result` (plus
   an env-gated `timeout_probe` diagnostic). `gmail_message_trace` fans its
   per-recipient `DomainClient.find_message_by_id` calls across a
