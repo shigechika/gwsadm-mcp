@@ -459,8 +459,33 @@ def _recent_dates(days: int) -> list[str]:
     return [(today - datetime.timedelta(days=d)).isoformat() for d in range(1, days + 1)]
 
 
+def _fetch_one_date_usage(c: DomainClient, date: str):
+    """One (client, date) usage-report fetch. Runs in a worker thread -- see
+    ``_gmail_usage_report``'s ``ThreadPoolExecutor`` fan-out."""
+    return c.fetch_customer_usage(date=date, parameters=GMAIL_USAGE_PARAMETERS)
+
+
 def _gmail_usage_report(clients: list[DomainClient], days: int) -> dict:
     dates = _recent_dates(days)
+    # Fan every (domain x date) fetch out concurrently, same rationale as
+    # _parallel_fetch/_fetch_drive_per_domain elsewhere in this file: this API
+    # is inherently one blocking call per day, so running `len(clients) *
+    # days` of them serially risks outrunning an MCP client's own tool-call
+    # timeout on anything but a tiny window. Errors are captured per task
+    # (not raised) so the aggregation below can apply its own domain-wide-vs-
+    # per-date distinction after every fetch has already completed.
+    tasks = [(c, date) for c in clients for date in dates]
+    results: dict[tuple[str, str], tuple[list[dict], bool] | GwsError] = {}
+    if tasks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(tasks))) as ex:
+            futs = {ex.submit(_fetch_one_date_usage, c, date): (c.domain, date) for c, date in tasks}
+            for fut in concurrent.futures.as_completed(futs):
+                key = futs[fut]
+                try:
+                    results[key] = fut.result()
+                except (GwsAuthError, GwsError) as e:
+                    results[key] = e
+
     out: dict = {}
     for c in clients:
         daily: list[dict] = []
@@ -468,30 +493,37 @@ def _gmail_usage_report(clients: list[DomainClient], days: int) -> dict:
         domain_error: str | None = None
         capped = False
         for date in dates:
-            try:
-                reports, date_capped = c.fetch_customer_usage(date=date, parameters=GMAIL_USAGE_PARAMETERS)
-            except GwsAuthError as e:
+            r = results[(c.domain, date)]
+            if isinstance(r, GwsAuthError):
                 # The whole domain lacks this scope -- identical for every
-                # remaining date, so stop here instead of repeating the same
-                # failure `days` times under date_errors.
-                domain_error = str(e)
-                break
-            except GwsError as e:
-                # A single date's fetch failing (e.g. Google's processing for
-                # that day isn't finished yet -- a known Reports API lag) is
-                # NOT domain-wide: record it and keep trying the other dates.
-                date_errors.append({"date": date, "error": str(e)})
+                # date, so one representative message is surfaced instead of
+                # `days` duplicate entries under date_errors.
+                domain_error = str(r)
+                continue
+            if isinstance(r, GwsError):
+                # A single date's fetch failing for some other reason (e.g.
+                # Google's processing for that day isn't finished yet -- a
+                # known Reports API lag) is NOT domain-wide.
+                date_errors.append({"date": date, "error": str(r)})
+                continue
+            reports, date_capped = r
+            try:
+                for rep in reports:
+                    p = event_parameters(rep)
+                    daily.append(
+                        {
+                            "date": rep.get("date") or date,
+                            "num_emails_sent": _int_or_none(p.get("gmail:num_emails_sent")),
+                            "num_emails_received": _int_or_none(p.get("gmail:num_emails_received")),
+                        }
+                    )
+            except (AttributeError, TypeError) as e:
+                # A malformed usageReports entry (not a plain dict, or a
+                # parameters item that isn't one) must not crash the whole
+                # tool call for every domain -- degrade just this one date.
+                date_errors.append({"date": date, "error": f"malformed usage report entry: {e}"})
                 continue
             capped = capped or date_capped
-            for r in reports:
-                p = event_parameters(r)
-                daily.append(
-                    {
-                        "date": r.get("date") or date,
-                        "num_emails_sent": _int_or_none(p.get("gmail:num_emails_sent")),
-                        "num_emails_received": _int_or_none(p.get("gmail:num_emails_received")),
-                    }
-                )
         if domain_error is not None:
             out[c.domain] = {"error": domain_error}
         else:
@@ -537,9 +569,14 @@ def gmail_usage_report(days: int = 7, domain: str | None = None) -> dict:
         days: How many days back to report, ending YESTERDAY (not today --
             the current day's data is not final until it ends) in the
             Reports API's own UTC-8:00/Pacific-Standard-Time date anchor.
+            Must be positive -- ``0``/negative would otherwise silently
+            return a well-formed, error-free empty result indistinguishable
+            from "queried correctly, zero Gmail traffic that window".
         domain: Configured ``[domain.*]`` section to report on. Default: all
             configured domains.
     """
+    if days <= 0:
+        return {"error": f"days must be a positive integer, got {days}"}
     try:
         clients, _ = _clients()
         picked = _select(clients, domain)

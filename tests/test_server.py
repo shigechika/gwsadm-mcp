@@ -385,7 +385,13 @@ def test_gmail_usage_report_capped_when_any_date_is_capped(inject):
     assert out["domains"]["example.edu"]["capped"] is True
 
 
-def test_gmail_usage_report_domain_wide_auth_error_stops_further_dates(inject):
+def test_gmail_usage_report_domain_wide_auth_error_reports_one_error(inject):
+    # All (domain x date) fetches now run concurrently (fixed for a
+    # /code-review finding on PR #81 -- the original sequential loop
+    # violated this repo's own documented fan-out architecture and risked a
+    # tool-call timeout), so an auth failure on even one date -- identical
+    # for every date, since it's the same missing scope -- still collapses
+    # to a single domain-wide error rather than `days` duplicate entries.
     from gwsadm_mcp.client import GwsAuthError
 
     dates = server._recent_dates(3)
@@ -393,8 +399,9 @@ def test_gmail_usage_report_domain_wide_auth_error_stops_further_dates(inject):
     inject([c], {"example.edu"})
     out = server.gmail_usage_report(days=3)
     assert out["domains"]["example.edu"] == {"error": "no usage scope"}
-    # Stopped at the first (auth) failure instead of repeating it 3 times.
-    assert len(c.usage_calls) == 1
+    # Every date was attempted (no early-exit optimization once fetches run
+    # concurrently) -- this is a deliberate tradeoff for the parallelism.
+    assert len(c.usage_calls) == 3
 
 
 def test_gmail_usage_report_per_date_error_is_tolerated_and_recorded(inject):
@@ -414,6 +421,45 @@ def test_gmail_usage_report_per_date_error_is_tolerated_and_recorded(inject):
     assert dom["daily"] == [{"date": dates[1], "num_emails_sent": 5, "num_emails_received": 5}]
     # Both dates were still attempted -- a per-date error doesn't stop the rest.
     assert len(c.usage_calls) == 2
+
+
+def test_gmail_usage_report_malformed_report_entry_degrades_one_date_not_the_call(inject):
+    # Regression test for a /code-review finding on PR #81: the parsing step
+    # (event_parameters + dict access) sat outside the per-date try/except,
+    # so a usageReports entry that isn't a plain dict (event_parameters does
+    # `.get(...)` on it) raised an uncaught AttributeError that would crash
+    # the ENTIRE tool call for every configured domain, not just this one
+    # date -- violating the module's own "a failure in one domain degrades
+    # only that domain's section" coverage contract.
+    dates = server._recent_dates(2)
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        usage_by_date={
+            dates[0]: (["not-a-dict"], False),  # malformed usageReports entry
+            dates[1]: ([_usage_report(dates[1], sent=5, received=5)], False),
+        },
+    )
+    inject([c], {"example.edu"})
+    out = server.gmail_usage_report(days=2)  # must not raise
+    dom = out["domains"]["example.edu"]
+    assert dom["daily"] == [{"date": dates[1], "num_emails_sent": 5, "num_emails_received": 5}]
+    assert len(dom["date_errors"]) == 1
+    assert dom["date_errors"][0]["date"] == dates[0]
+
+
+def test_gmail_usage_report_rejects_non_positive_days(inject):
+    # Regression test for a /code-review finding on PR #81: days<=0 silently
+    # produced a well-formed, error-free EMPTY result (range(1, days+1) is
+    # []) indistinguishable from "queried correctly, zero Gmail traffic that
+    # window" -- an LLM caller passing a bad/negative value derived from date
+    # arithmetic could misread that as a real finding instead of bad input.
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    for bad in (0, -3):
+        out = server.gmail_usage_report(days=bad)
+        assert "error" in out
+    assert c.usage_calls == []  # rejected before any per-domain work
 
 
 def test_gmail_usage_report_unknown_domain_is_error(inject):
