@@ -737,6 +737,21 @@ def test_decode_report_payload_zip_roundtrip():
     assert client._decode_report_payload(buf.getvalue()) == xml
 
 
+def test_decode_report_payload_empty_zip_does_not_raise():
+    # Regression test for a Copilot review finding on PR #79: a valid ZIP
+    # with zero entries made zf.namelist()[0] raise IndexError, which would
+    # escape the per-message exception handling in fetch_dmarc_rua_records
+    # and abort the whole domain's fetch instead of counting one message
+    # error. Treated the same as "not a zip at all" -- returned as-is.
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w"):
+        pass  # zero entries
+    assert client._decode_report_payload(buf.getvalue()) == buf.getvalue()
+
+
 def test_decode_report_payload_plain_xml_passthrough():
     xml = b"<feedback>plain</feedback>"
     assert client._decode_report_payload(xml) == xml

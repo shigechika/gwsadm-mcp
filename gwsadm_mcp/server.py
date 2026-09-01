@@ -852,14 +852,22 @@ def _aggregate_dmarc_rua(records: list[dict], top: int) -> dict:
     counting any non-"pass" dkim as a failure regardless of spf overcounts
     dramatically, since a lot of legitimate mail passes DMARC via SPF
     alignment alone with DKIM unaligned or absent. A reject candidate is
-    ``disposition == "quarantine"`` OR both dkim and spf failing; anything
-    else counts as pass. This mirrors the fix applied to an ad-hoc script
-    that miscounted using the naive "dkim != pass" rule on 2026-09-01.
+    ``disposition`` already being ``"quarantine"`` or ``"reject"`` (RFC 7489's
+    other two enforcement dispositions besides ``"none"``), OR both dkim and
+    spf failing; anything else counts as pass. This mirrors the fix applied
+    to an ad-hoc script that miscounted using the naive "dkim != pass" rule
+    on 2026-09-01.
 
     Returns one entry per ``policy_domain`` seen across the input records:
-    ``{pass, quarantined, undisposed_fail, reject_candidate_ips}`` where the
-    last is the top-``top`` source IPs among reject candidates (by count),
-    each with its own count, dispositions seen, and header_from values seen
+    ``{pass, quarantined, rejected, undisposed_fail, reject_candidate_ips}``.
+    ``quarantined``/``rejected`` are records a tenant's OWN CURRENT policy is
+    already enforcing (relevant on a tenant already running `p=quarantine` or
+    `p=reject`); ``undisposed_fail`` is a failing record `disposition="none"`
+    let through -- what moving to a stricter policy would newly start
+    blocking. Conflating ``rejected`` into ``undisposed_fail`` would misreport
+    already-enforced blocking as still-pending. ``reject_candidate_ips`` is
+    the top-``top`` source IPs among ALL reject candidates (by count), each
+    with its own count, dispositions seen, and header_from values seen
     (multiple header_from values under one source IP usually means it also
     sends subdomain mail, whose true disposition depends on that
     subdomain's OWN ``sp=`` policy, not the parent domain's ``p=``).
@@ -868,10 +876,11 @@ def _aggregate_dmarc_rua(records: list[dict], top: int) -> dict:
     reject_agg: dict[tuple[str, str], dict] = {}
     for r in records:
         pd = r["policy_domain"] or "(unknown)"
-        bucket = per_domain.setdefault(pd, {"pass": 0, "quarantined": 0, "undisposed_fail": 0})
-        is_reject_candidate = r["disposition"] == "quarantine" or (r["dkim"] != "pass" and r["spf"] != "pass")
-        if r["disposition"] == "quarantine":
-            bucket["quarantined"] += r["count"]
+        bucket = per_domain.setdefault(pd, {"pass": 0, "quarantined": 0, "rejected": 0, "undisposed_fail": 0})
+        disposition = r["disposition"]
+        is_reject_candidate = disposition in ("quarantine", "reject") or (r["dkim"] != "pass" and r["spf"] != "pass")
+        if disposition in ("quarantine", "reject"):
+            bucket["quarantined" if disposition == "quarantine" else "rejected"] += r["count"]
         elif is_reject_candidate:
             bucket["undisposed_fail"] += r["count"]
         else:
@@ -943,11 +952,14 @@ def dmarc_rua_summary(
 
     A record counts as PASS when either its aligned DKIM or SPF check reads
     "pass" (DMARC's own OR semantics) — NOT when both do. A record counts as
-    a reject candidate when it is already quarantined, or when BOTH checks
-    fail; everything else is a pass. This distinction matters a lot in
-    practice: a large share of legitimate mail (mailing-list forwards, some
-    relays) passes DMARC via SPF alignment alone with DKIM unaligned, so
-    counting on DKIM alone overstates the failure rate severalfold.
+    a reject candidate when it is already quarantined or rejected (a tenant
+    already running `p=quarantine`/`p=reject` enforces this today), or when
+    BOTH checks fail with `disposition="none"` (what a stricter policy would
+    newly start blocking); everything else is a pass. This distinction
+    matters a lot in practice: a large share of legitimate mail (mailing-list
+    forwards, some relays) passes DMARC via SPF alignment alone with DKIM
+    unaligned, so counting on DKIM alone overstates the failure rate
+    severalfold.
 
     ``reject_candidate_ips`` (the top ``top`` per domain by volume) is where
     to actually look before flipping a policy to ``p=reject``: a header_from
@@ -973,7 +985,9 @@ def dmarc_rua_summary(
             configured domains.
         mailbox: Override the configured ``dmarc_rua_mailbox`` for every
             selected domain. Set this only for an ad-hoc check against a
-            different address than the one in config.
+            different address than the one in config. Validated as an
+            email-shaped address (rejected otherwise) before use, since it
+            is interpolated into a Gmail search query.
         max_pages: Gmail ``messages().list`` pages (100 messages each) to
             walk per domain. ``capped=true`` in the result means more pages
             existed — a capped fetch UNDER-counts real report volume, not
@@ -982,11 +996,19 @@ def dmarc_rua_summary(
             fall back on).
         top: How many reject-candidate source IPs to return per domain
             (highest volume first). The per-domain pass/quarantined/
-            undisposed_fail totals themselves are never truncated.
+            rejected/undisposed_fail totals themselves are never truncated.
     """
     try:
         clients, _ = _clients()
         picked = _select(clients, domain)
+        if mailbox is not None:
+            # mailbox is interpolated directly into a Gmail search query
+            # ("to:{mailbox}"); a caller-supplied value is adversarial input
+            # like any other tool argument, so it is validated as email-shaped
+            # (reusing _domain_of purely for its shape check) BEFORE use --
+            # unvalidated whitespace or a search operator smuggled in here
+            # could change the query's meaning and scan unrelated messages.
+            _domain_of(mailbox)
     except (ConfigError, GwsError) as e:
         return {"error": str(e)}
     return {"window_hours": hours, "domains": _dmarc_rua_report(picked, hours, mailbox, max_pages, top)}

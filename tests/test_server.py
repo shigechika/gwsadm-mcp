@@ -734,7 +734,13 @@ def test_aggregate_dmarc_rua_pass_via_spf_alone_is_not_a_failure():
     # via SPF alignment alone with DKIM unaligned or absent.
     recs = [_dmarc_record(count=100, dkim="fail", spf="pass")]
     out = server._aggregate_dmarc_rua(recs, top=5)
-    assert out["example.edu"] == {"pass": 100, "quarantined": 0, "undisposed_fail": 0, "reject_candidate_ips": []}
+    assert out["example.edu"] == {
+        "pass": 100,
+        "quarantined": 0,
+        "rejected": 0,
+        "undisposed_fail": 0,
+        "reject_candidate_ips": [],
+    }
 
 
 def test_aggregate_dmarc_rua_both_fail_undisposed_is_a_reject_candidate():
@@ -760,6 +766,33 @@ def test_aggregate_dmarc_rua_quarantined_counted_separately_from_undisposed():
     # Same source IP seen under both dispositions is aggregated into one entry.
     assert dom["reject_candidate_ips"] == [
         {"source_ip": "9.9.9.9", "count": 7, "dispositions": ["none", "quarantine"], "header_from": ["example.edu"]}
+    ]
+
+
+def test_aggregate_dmarc_rua_rejected_disposition_counted_separately():
+    # Regression test for a Copilot review finding on PR #79: disposition can
+    # be "reject" (not just "quarantine") in DMARC aggregate reports -- a
+    # tenant already running p=reject enforces this TODAY, so it must not be
+    # folded into undisposed_fail (which means "not yet blocked").
+    recs = [
+        _dmarc_record(count=2, dkim="fail", spf="fail", disposition="reject", source_ip="1.2.3.4"),
+        _dmarc_record(count=3, dkim="fail", spf="fail", disposition="quarantine", source_ip="1.2.3.4"),
+        _dmarc_record(count=4, dkim="fail", spf="fail", disposition="none", source_ip="1.2.3.4"),
+    ]
+    out = server._aggregate_dmarc_rua(recs, top=5)
+    dom = out["example.edu"]
+    assert dom["rejected"] == 2
+    assert dom["quarantined"] == 3
+    assert dom["undisposed_fail"] == 4
+    assert dom["pass"] == 0
+    # All three dispositions for the same source IP fold into one reject-candidate entry.
+    assert dom["reject_candidate_ips"] == [
+        {
+            "source_ip": "1.2.3.4",
+            "count": 9,
+            "dispositions": ["none", "quarantine", "reject"],
+            "header_from": ["example.edu"],
+        }
     ]
 
 
@@ -834,6 +867,18 @@ def test_dmarc_rua_summary_unknown_domain_is_error(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
     out = server.dmarc_rua_summary(domain="not-configured.edu")
     assert "error" in out
+
+
+def test_dmarc_rua_summary_rejects_malformed_mailbox_override(inject):
+    # Regression test for a Copilot review finding on PR #79: mailbox is
+    # interpolated directly into a Gmail search query ("to:{mailbox}"), so an
+    # adversarial value (whitespace, a smuggled search operator) must be
+    # rejected before it ever reaches fetch_dmarc_rua_records.
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.dmarc_rua_summary(mailbox="not-an-email newer_than:1d")
+    assert "error" in out
+    assert c.dmarc_rua_calls == []  # rejected before any per-domain work
 
 
 def test_gmail_message_trace_rejects_empty_recipients(inject):

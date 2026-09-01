@@ -157,7 +157,10 @@ def _decode_report_payload(raw: bytes) -> bytes:
         pass
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            return zf.read(zf.namelist()[0])
+            names = zf.namelist()
+            if not names:
+                return raw
+            return zf.read(names[0])
     except zipfile.BadZipFile:
         return raw
 
