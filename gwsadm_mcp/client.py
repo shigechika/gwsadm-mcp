@@ -5,13 +5,15 @@ domain-wide delegation impersonating an audit-capable admin (``subject``) —
 fully non-interactive, so the server can run unattended behind a gateway.
 
 Read-only by design: only ``activities().list`` (Admin SDK Reports API),
-``users().list`` (Directory API, for suspended-account snapshots),
-``users().get`` (Directory API, for a single account's state),
-``tokens().list`` (Directory API, for per-user OAuth app grants),
-``messages().list`` / ``messages().get`` (Gmail API, for message-trace),
-``groups().get`` (Groups Settings API, for a group's own posting policy), and
-``groups().get`` / ``members().list`` (Directory API, for a group's roster)
-are issued; no mutating call exists in this package.
+``customerUsageReports().get()`` (Admin SDK Reports API, a DIFFERENT DWD
+scope from ``activities().list`` despite the same discovery document --
+see :data:`SCOPE_REPORTS_USAGE`), ``users().list`` (Directory API, for
+suspended-account snapshots), ``users().get`` (Directory API, for a single
+account's state), ``tokens().list`` (Directory API, for per-user OAuth app
+grants), ``messages().list`` / ``messages().get`` (Gmail API, for
+message-trace), ``groups().get`` (Groups Settings API, for a group's own
+posting policy), and ``groups().get`` / ``members().list`` (Directory API,
+for a group's roster) are issued; no mutating call exists in this package.
 
 Gmail access is architecturally different from the other services: it
 impersonates whichever RECIPIENT is being investigated -- a different
@@ -46,6 +48,13 @@ from googleapiclient.errors import HttpError
 from gwsadm_mcp.config import DomainConfig
 
 SCOPE_REPORTS = "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+# Same Admin SDK Reports API product as SCOPE_REPORTS, but the "Usage"
+# report family (customerUsageReports, entityUsageReports, userUsageReport)
+# and the "Audit" activity stream (activities().list, everything login_audit/
+# drive_external_sharing/etc. use) are gated by two DIFFERENT scopes even
+# though both live under the same "reports_v1" discovery document -- having
+# one does not imply the other.
+SCOPE_REPORTS_USAGE = "https://www.googleapis.com/auth/admin.reports.usage.readonly"
 SCOPE_DIRECTORY = "https://www.googleapis.com/auth/admin.directory.user.readonly"
 # Tokens().list (third-party OAuth app grants) lives under the Directory API but
 # is NOT covered by admin.directory.user.readonly -- it needs this separate
@@ -283,6 +292,7 @@ class DomainClient:
         cfg: DomainConfig,
         *,
         reports_service=None,
+        reports_usage_service=None,
         directory_service=None,
         directory_security_service=None,
         groups_settings_service=None,
@@ -292,6 +302,7 @@ class DomainClient:
     ):
         self.cfg = cfg
         self._reports = reports_service  # injectable for tests
+        self._reports_usage = reports_usage_service  # injectable for tests
         self._directory = directory_service  # injectable for tests
         self._directory_security = directory_security_service  # injectable for tests
         self._groups_settings = groups_settings_service  # injectable for tests
@@ -304,6 +315,7 @@ class DomainClient:
         # the whole domain).
         self._gmail_service_factory = gmail_service_factory
         self._creds = None
+        self._reports_usage_creds = None
         self._directory_creds = None
         self._directory_security_creds = None
         self._groups_settings_creds = None
@@ -342,6 +354,31 @@ class DomainClient:
                     self._creds = creds
                     self._reports = build("admin", "reports_v1", credentials=creds, cache_discovery=False)
         return self._reports
+
+    def _reports_usage_service(self):
+        """Separate credentials/service from ``_reports_service`` -- SAME Admin
+        SDK Reports API discovery document (``admin``/``reports_v1``,
+        ``customerUsageReports`` vs. ``activities``), DIFFERENT DWD scope
+        (``admin.reports.usage.readonly`` vs. ``admin.reports.audit.readonly``).
+        Kept as its own credential builder for the same reason every other
+        scope in this file gets one: a combined request fails entirely on a
+        tenant that granted only one of the two, breaking this tool's
+        independent degradation from ``login_audit``/``drive_external_sharing``/etc.
+        """
+        if self._reports_usage is None:
+            with self._build_lock:
+                if self._reports_usage is None:  # re-check under lock
+                    try:
+                        creds = service_account.Credentials.from_service_account_file(
+                            self.cfg.service_account_file, scopes=[SCOPE_REPORTS_USAGE], subject=self.cfg.subject
+                        )
+                    except (OSError, ValueError) as e:
+                        raise GwsAuthError(
+                            f"[{self.domain}] cannot load service account key ({type(e).__name__})"
+                        ) from e
+                    self._reports_usage_creds = creds
+                    self._reports_usage = build("admin", "reports_v1", credentials=creds, cache_discovery=False)
+        return self._reports_usage
 
     def _directory_service(self):
         if self._directory is None:
@@ -553,6 +590,62 @@ class DomainClient:
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error ({application_name}): {type(e).__name__}") from e
         return items, bool(token)
+
+    def fetch_customer_usage(
+        self, *, date: str, parameters: str | None = None, max_pages: int = 3
+    ) -> tuple[list[dict], bool]:
+        """Fetch ONE day's customer-level usage report (Reports API ``customerUsageReports``).
+
+        Unlike :meth:`fetch_activities` (a time-range activity stream),
+        ``customerUsageReports`` is inherently per-day: ``date`` names a
+        single ``yyyy-mm-dd`` day, evaluated in the API's own UTC-8:00
+        (Pacific Standard Time) anchor. A caller wanting a multi-day report
+        calls this once per day.
+
+        Returns ``(usage_reports, capped)`` -- each item is one ``UsageReport``
+        dict exactly as Google returns it (``parameters`` unflattened; pass
+        one through :func:`event_parameters` to get a plain
+        ``{param_name: value}`` dict). ``capped=True`` means more pages
+        existed beyond ``max_pages``; in practice a single date's customer
+        report is one record and this should never trigger, but the API
+        does support pagination so this does not silently assume otherwise.
+
+        ``parameters`` is passed through as the API's own comma-separated
+        ``app_name:param_name`` filter (e.g.
+        ``"gmail:num_emails_sent,gmail:num_emails_received"``) to avoid
+        pulling every application's counters when only a few are wanted --
+        callers own constructing this string themselves, since it names
+        Google's own parameter identifiers, not free text.
+
+        Requires the ``admin.reports.usage.readonly`` DWD scope -- see
+        :data:`SCOPE_REPORTS_USAGE`'s docstring for why this is a distinct
+        grant from :data:`SCOPE_REPORTS` despite both being Reports API.
+        """
+        params: dict = {"customerId": self.cfg.customer_id, "date": date, "maxResults": PAGE_SIZE}
+        if parameters:
+            params["parameters"] = parameters
+        reports: list[dict] = []
+        token = None
+        pages = 0
+        try:
+            svc = self._reports_usage_service()
+            http = self._new_http(self._reports_usage_creds)
+            while True:
+                resp = self._execute(lambda tok=token: svc.customerUsageReports().get(pageToken=tok, **params), http)
+                reports.extend(resp.get("usageReports", []))
+                token = resp.get("nextPageToken")
+                pages += 1
+                if not token or pages >= max_pages:
+                    break
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] reports API error (customerUsageReports, {date}): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: DWD scope not granted for this client, or wrong subject.
+            raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (customerUsageReports, {date}): {type(e).__name__}") from e
+        return reports, bool(token)
 
     def list_suspended_users(self, *, max_pages: int = 20) -> tuple[list[dict], bool]:
         """List currently suspended users in this domain (Directory API).

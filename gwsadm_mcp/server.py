@@ -4,6 +4,9 @@ Phase 1 tools:
 
 - ``health_check``            — fleet-standard status/service/version + per-domain auth probe
 - ``login_audit``             — Google-side auto-disabled accounts, suspicious logins, failure top-N
+- ``gmail_usage_report``      — daily Gmail send/receive counts per domain (Reports API
+  ``customerUsageReports``; requires the separate ``admin.reports.usage.readonly`` DWD scope —
+  see its docstring)
 - ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
 - ``get_user``                — one named account's state: suspended/archived/2SV/last login
   (Directory API; same ``admin.directory.user.readonly`` scope as ``suspended_accounts``)
@@ -418,6 +421,126 @@ def login_audit(hours: int = 24, domain: str | None = None, include_failures: bo
     except (ConfigError, GwsError) as e:
         return {"error": str(e)}
     return {"window_hours": hours, "domains": _login_audit(picked, hours, include_failures, top)}
+
+
+# Comma-separated app_name:param_name filter for customerUsageReports.get,
+# restricting a call to just the Gmail traffic counters this tool reports --
+# without it, one call pulls every application's counters (accounts, drive,
+# calendar, ...), most of which nothing here uses.
+GMAIL_USAGE_PARAMETERS = "gmail:num_emails_sent,gmail:num_emails_received"
+
+# The Reports API's own date anchor for usage reports (UTC-8:00, i.e. Pacific
+# Standard Time, year-round -- NOT PDT-adjusted). A plain fixed-offset
+# timezone, not zoneinfo, since the API itself does not observe DST.
+_REPORTS_USAGE_DATE_TZ = datetime.timezone(datetime.timedelta(hours=-8))
+
+
+def _int_or_none(value) -> int | None:
+    """Parse a Reports API parameter value (a JSON string, e.g. intValue) as int.
+
+    Returns None on anything unparsable rather than raising -- one malformed
+    or absent counter must not lose the rest of a day's report.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _recent_dates(days: int) -> list[str]:
+    """Return ``days`` consecutive ``yyyy-mm-dd`` dates, most recent first,
+    ending YESTERDAY in the Reports API's own date anchor (:data:`_REPORTS_USAGE_DATE_TZ`)
+    -- not today, since the current day's usage data is not final until the
+    day itself has ended in that timezone.
+    """
+    today = datetime.datetime.now(_REPORTS_USAGE_DATE_TZ).date()
+    return [(today - datetime.timedelta(days=d)).isoformat() for d in range(1, days + 1)]
+
+
+def _gmail_usage_report(clients: list[DomainClient], days: int) -> dict:
+    dates = _recent_dates(days)
+    out: dict = {}
+    for c in clients:
+        daily: list[dict] = []
+        date_errors: list[dict] = []
+        domain_error: str | None = None
+        for date in dates:
+            try:
+                reports, _capped = c.fetch_customer_usage(date=date, parameters=GMAIL_USAGE_PARAMETERS)
+            except GwsAuthError as e:
+                # The whole domain lacks this scope -- identical for every
+                # remaining date, so stop here instead of repeating the same
+                # failure `days` times under date_errors.
+                domain_error = str(e)
+                break
+            except GwsError as e:
+                # A single date's fetch failing (e.g. Google's processing for
+                # that day isn't finished yet -- a known Reports API lag) is
+                # NOT domain-wide: record it and keep trying the other dates.
+                date_errors.append({"date": date, "error": str(e)})
+                continue
+            for r in reports:
+                p = event_parameters(r)
+                daily.append(
+                    {
+                        "date": r.get("date") or date,
+                        "num_emails_sent": _int_or_none(p.get("gmail:num_emails_sent")),
+                        "num_emails_received": _int_or_none(p.get("gmail:num_emails_received")),
+                    }
+                )
+        if domain_error is not None:
+            out[c.domain] = {"error": domain_error}
+        else:
+            out[c.domain] = {"daily": daily, "date_errors": date_errors}
+    return out
+
+
+@mcp.tool()
+def gmail_usage_report(days: int = 7, domain: str | None = None) -> dict:
+    """Daily Gmail send/receive counts per domain (Admin SDK customerUsageReports).
+
+    Answers "how much Gmail traffic did this domain send/receive on day X" --
+    a customer-level daily counter, NOT a per-user or per-message breakdown
+    (the Reports API has no such thing; ``login_audit``'s activity stream is
+    the per-event alternative for that, at the cost of no volume total).
+
+    Each day's fetch is independent: a domain missing the DWD scope reports
+    one whole-domain ``error`` (there is no point retrying `days` times for
+    an identical scope failure), but a single date's fetch failing for some
+    other reason (Google's processing for that day not finished yet is a
+    known lag on this API family; a transient error) only skips that one
+    date, recorded in ``date_errors`` -- the rest of the window still comes
+    back.
+
+    Requires the ``admin.reports.usage.readonly`` DWD scope, granted PER
+    SERVICE ACCOUNT CLIENT ID in the Admin console (Security > API controls >
+    Domain-wide delegation) -- a DIFFERENT scope from
+    ``admin.reports.audit.readonly`` (the one ``login_audit``,
+    ``drive_external_sharing``, ``drive_doc_activity``,
+    ``shared_drive_membership_changes`` and ``daily_brief`` use), even though
+    both live under the same Admin SDK Reports API. Having one does not
+    imply the other; grant this one separately.
+
+    Read-only: only ``customerUsageReports().get()`` is issued, restricted to
+    the two Gmail counters this tool reports via the API's own ``parameters``
+    filter (:data:`GMAIL_USAGE_PARAMETERS`) rather than pulling every
+    application's counters.
+
+    Args:
+        days: How many days back to report, ending YESTERDAY (not today --
+            the current day's data is not final until it ends) in the
+            Reports API's own UTC-8:00/Pacific-Standard-Time date anchor.
+        domain: Configured ``[domain.*]`` section to report on. Default: all
+            configured domains.
+    """
+    try:
+        clients, _ = _clients()
+        picked = _select(clients, domain)
+    except (ConfigError, GwsError) as e:
+        return {"error": str(e)}
+    return {"days": days, "domains": _gmail_usage_report(picked, days)}
 
 
 def _suspended_entry(u: dict) -> dict:

@@ -96,6 +96,79 @@ def test_fetch_activities_caps_pages():
     assert len(items) == 2 and capped is True  # stopped early with pages remaining
 
 
+class FakeCustomerUsageReports:
+    def __init__(self, pages, exc=None):
+        self.pages, self.exc, self.calls = pages, exc, []
+
+    def get(self, **kw):
+        self.calls.append(kw)
+        if self.exc:
+            return _Req(None, self.exc)
+        return _Req(self.pages[min(len(self.calls) - 1, len(self.pages) - 1)])
+
+
+class FakeReportsUsage:
+    def __init__(self, pages, exc=None):
+        self._u = FakeCustomerUsageReports(pages, exc)
+
+    def customerUsageReports(self):
+        return self._u
+
+
+def _usage_client(pages, exc=None):
+    svc = FakeReportsUsage(pages, exc)
+    return DomainClient(CFG, reports_usage_service=svc), svc._u
+
+
+def test_fetch_customer_usage_paginates_and_passes_params():
+    c, u = _usage_client(
+        [
+            {
+                "usageReports": [
+                    {"date": "2026-08-30", "parameters": [{"name": "gmail:num_emails_sent", "intValue": "10"}]}
+                ],
+                "nextPageToken": "tok",
+            },
+            {"usageReports": [{"date": "2026-08-30", "parameters": []}]},
+        ]
+    )
+    reports, capped = c.fetch_customer_usage(date="2026-08-30", parameters="gmail:num_emails_sent")
+    assert len(reports) == 2 and capped is False
+    assert u.calls[0]["date"] == "2026-08-30"
+    assert u.calls[0]["customerId"] == "C0abc"
+    assert u.calls[0]["parameters"] == "gmail:num_emails_sent"
+    assert u.calls[1]["pageToken"] == "tok"
+
+
+def test_fetch_customer_usage_omits_parameters_filter_when_not_given():
+    c, u = _usage_client([{"usageReports": []}])
+    c.fetch_customer_usage(date="2026-08-30")
+    assert "parameters" not in u.calls[0]
+
+
+def test_fetch_customer_usage_caps_pages():
+    c, _ = _usage_client([{"usageReports": [{}], "nextPageToken": "more"}] * 5)
+    reports, capped = c.fetch_customer_usage(date="2026-08-30", max_pages=2)
+    assert len(reports) == 2 and capped is True
+
+
+def test_fetch_customer_usage_http_error_maps_to_gws_error():
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _usage_client([], exc=err)
+    with pytest.raises(GwsError):
+        c.fetch_customer_usage(date="2026-08-30")
+
+
+def test_fetch_customer_usage_auth_error_maps_to_gws_auth_error():
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _usage_client([], exc=RefreshError("unauthorized_client"))
+    with pytest.raises(GwsAuthError):
+        c.fetch_customer_usage(date="2026-08-30")
+
+
 def test_list_suspended_users_paginates_and_passes_params():
     c, u = _dir_client(
         [

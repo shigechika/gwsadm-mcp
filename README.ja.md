@@ -16,6 +16,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 |------|------|
 | `health_check` | サーバーバージョン・設定パス・ドメインごとの認証確認 — セッション開始時やタイムアウト後に呼ぶ |
 | `login_audit` | Reports API `login` — **Google により自動無効化されたアカウント**（`account_disabled_*`： 漏洩パスワード・乗っ取り・スパム送信）、不審なログイン、失敗の多い順トップN |
+| `gmail_usage_report` | Reports API `customerUsageReports` — ドメイン別・日次のGmail送受信通数。1日1回のAPI呼び出しで、対象は昨日まで（APIの日付基準はUTC-8:00／PST）。別付与の `admin.reports.usage.readonly` DWD スコープが必要（下記「認証方式」参照）— `admin.reports.audit.readonly` とは同じReports APIでも別のグラント |
 | `suspended_accounts` | Directory API — **停止中**アカウントの現在スナップショット（`isSuspended=true`）。下流 IdP（KeyCloak 等）と突合し、停止済みなのに IdP 側で有効なままのアカウントを洗い出す |
 | `get_user` | Directory API `users().get` — **アドレスを指定した1アカウント**の現在の状態： `suspended`（理由・停止日時付き）、`archived`、`last_login`、2段階認証の登録/強制、組織部門、作成日時、次回ログイン時のパスワード変更要求。「なぜこの人はログインできないのか」に1リクエスト・ページングなしで答える。アドレスが既に分かっているときは `suspended_accounts` ではなくこちらを使う： あちらは停止中のアカウントだけを列挙するので、指定アドレスが停止**されていない**ことは確認できない（さらにその一覧がページ上限を超えると、載っていないこと自体が根拠にならなくなる）。`suspended_accounts` が既に使っているスコープ以外は不要 |
 | `user_oauth_tokens` | Directory API `tokens().list` — **特定ユーザー1名**の第三者OAuthアプリ連携一覧。既存トークンはログイン不要で使えるため `login_audit` では検知できない侵害経路。ドメインはユーザー名のサフィックスから解決（エイリアス/セカンダリドメインのアドレス用に `domain` で明示指定も可） |
@@ -50,6 +51,15 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 
 `health_check` はスコープが一切無くても応答する。グラント漏れが疑われるときこそ呼ぶツールで、
 自身が失敗する代わりにドメインごとの認証失敗を構造化された結果として報告する。
+
+`gmail_usage_report` にも専用のスコープが要る。上のまとめ付与と同じAdmin SDK Reports API
+配下だが、「使用量レポート」系（`customerUsageReports`）と「監査」アクティビティストリーム
+（`activities().list`、上のまとめ付与の他ツールが使うもの）は別スコープで、片方を
+持っていてももう片方は付与されない:
+
+| スコープ | 必要とするツール | 未付与の場合 |
+|------|------|------|
+| `https://www.googleapis.com/auth/admin.reports.usage.readonly` | `gmail_usage_report` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
 `gmail_message_trace` と `dmarc_rua_summary` にはもう1つスコープが要るが、これは
 意図的に上のまとめ付与とは**別立て**にしてある:

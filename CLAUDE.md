@@ -4,6 +4,11 @@
 
 MCP (Model Context Protocol) server for Google Workspace security auditing.
 Exposes `login_audit` (Google-side account locks, suspicious logins),
+`gmail_usage_report` (daily Gmail send/receive counts per domain via Reports
+API `customerUsageReports`, one date at a time ending yesterday in the
+API's own UTC-8:00/PST anchor -- requires the separate
+`admin.reports.usage.readonly` DWD scope, a DIFFERENT grant from
+`admin.reports.audit.readonly` despite both being Reports API),
 `suspended_accounts` (current suspended-account snapshot),
 `get_user` (one named account's state — suspended/archived/2SV/last login —
 via `users().get`, on the same `admin.directory.user.readonly` scope
@@ -27,7 +32,9 @@ Directory API, requires the separate `admin.directory.group.readonly` and
 combining the Reports-based tools, to AI assistants via STDIO transport,
 built on the official `mcp` Python SDK's `FastMCP`. Read-only: the only
 Admin SDK / Groups Settings / Gmail API methods called anywhere in this
-package are `activities().list` (Reports API), `users().list` (Directory
+package are `activities().list` (Reports API), `customerUsageReports().get()`
+(Reports API, for `gmail_usage_report` -- same discovery document as
+`activities().list` but a DIFFERENT DWD scope), `users().list` (Directory
 API, for `suspended_accounts`), `users().get` (Directory API, for
 `get_user`), `tokens().list` (Directory API, for
 `user_oauth_tokens`), `groups().get` / `members().list` (Directory API, for
@@ -58,7 +65,7 @@ to guard against stdio newline regressions).
 ## Architecture
 
 - `gwsadm_mcp/server.py` — FastMCP server with `health_check`,
-  `login_audit`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
+  `login_audit`, `gmail_usage_report`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
   `drive_external_sharing`, `drive_doc_activity`,
   `shared_drive_membership_changes`, `gmail_message_trace`,
   `dmarc_rua_summary`, `group_delivery_policy`, `list_group_members`, `daily_brief`,

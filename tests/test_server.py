@@ -22,6 +22,7 @@ class FakeDomainClient:
         group_meta=None,
         group_members=None,
         dmarc_rua=None,
+        usage_by_date=None,
     ):
         self.domain = domain
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
@@ -48,6 +49,11 @@ class FakeDomainClient:
         # (None means "no records, not capped, no errors, mailbox defaults to
         # postmaster@<domain>" -- matching the real client's config default).
         self._dmarc_rua = dmarc_rua
+        # usage_by_date: dict[date_str, (usage_reports, capped) | Exception] | None
+        # (a date not present in the dict defaults to ([], False) -- an empty,
+        # uncapped day; a bare Exception at a specific date key applies only
+        # to that call, letting a test cover "one date fails, others don't")
+        self._usage_by_date = usage_by_date
         self.calls = []
         self.user_calls = []
         self.token_calls = []
@@ -56,6 +62,16 @@ class FakeDomainClient:
         self.group_meta_calls = []
         self.group_members_calls = []
         self.dmarc_rua_calls = []
+        self.usage_calls = []
+
+    def fetch_customer_usage(self, *, date, parameters=None, max_pages=3):
+        self.usage_calls.append((date, parameters, max_pages))
+        if self._usage_by_date is None:
+            return [], False
+        got = self._usage_by_date.get(date, ([], False))
+        if isinstance(got, Exception):
+            raise got
+        return got
 
     def fetch_activities(self, application_name, *, start, end=None, event_name=None, filters=None, max_pages=5):
         self.calls.append((application_name, event_name, max_pages, filters))
@@ -307,6 +323,81 @@ def test_login_audit_capped_probe_yields_no_phantom_entries(inject):
 def test_login_audit_unknown_domain_is_error(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
     assert "error" in server.login_audit(domain="nope.example")
+
+
+# -- gmail_usage_report -------------------------------------------------------
+
+
+def _usage_report(date, sent=None, received=None):
+    params = []
+    if sent is not None:
+        params.append({"name": "gmail:num_emails_sent", "intValue": str(sent)})
+    if received is not None:
+        params.append({"name": "gmail:num_emails_received", "intValue": str(received)})
+    return {"date": date, "parameters": params}
+
+
+def test_recent_dates_ends_yesterday_not_today():
+    import datetime
+
+    dates = server._recent_dates(3)
+    today_pst = datetime.datetime.now(server._REPORTS_USAGE_DATE_TZ).date()
+    assert dates[0] == (today_pst - datetime.timedelta(days=1)).isoformat()
+    assert len(dates) == 3
+    assert today_pst.isoformat() not in dates
+
+
+def test_gmail_usage_report_reports_daily_counts(inject):
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        usage_by_date={
+            server._recent_dates(1)[0]: ([_usage_report(server._recent_dates(1)[0], sent=10, received=20)], False)
+        },
+    )
+    inject([c], {"example.edu"})
+    out = server.gmail_usage_report(days=1)
+    dom = out["domains"]["example.edu"]
+    assert dom["daily"] == [{"date": server._recent_dates(1)[0], "num_emails_sent": 10, "num_emails_received": 20}]
+    assert dom["date_errors"] == []
+    assert out["days"] == 1
+
+
+def test_gmail_usage_report_domain_wide_auth_error_stops_further_dates(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    dates = server._recent_dates(3)
+    c = FakeDomainClient("example.edu", {}, usage_by_date={dates[0]: GwsAuthError("no usage scope")})
+    inject([c], {"example.edu"})
+    out = server.gmail_usage_report(days=3)
+    assert out["domains"]["example.edu"] == {"error": "no usage scope"}
+    # Stopped at the first (auth) failure instead of repeating it 3 times.
+    assert len(c.usage_calls) == 1
+
+
+def test_gmail_usage_report_per_date_error_is_tolerated_and_recorded(inject):
+    dates = server._recent_dates(2)
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        usage_by_date={
+            dates[0]: server.GwsError("data not yet available"),
+            dates[1]: ([_usage_report(dates[1], sent=5, received=5)], False),
+        },
+    )
+    inject([c], {"example.edu"})
+    out = server.gmail_usage_report(days=2)
+    dom = out["domains"]["example.edu"]
+    assert dom["date_errors"] == [{"date": dates[0], "error": "data not yet available"}]
+    assert dom["daily"] == [{"date": dates[1], "num_emails_sent": 5, "num_emails_received": 5}]
+    # Both dates were still attempted -- a per-date error doesn't stop the rest.
+    assert len(c.usage_calls) == 2
+
+
+def test_gmail_usage_report_unknown_domain_is_error(inject):
+    inject([FakeDomainClient("example.edu", {})], {"example.edu"})
+    out = server.gmail_usage_report(domain="nope.example")
+    assert "error" in out
 
 
 def test_suspended_accounts_projects_and_counts(inject):
