@@ -34,6 +34,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 
 import google_auth_httplib2
 import httplib2
@@ -154,6 +155,16 @@ def _decode_report_payload(raw: bytes) -> bytes:
     try:
         return gzip.decompress(raw)
     except OSError:
+        pass
+    except EOFError:
+        # A truncated gzip stream (cut off mid-transfer) raises EOFError, not
+        # OSError -- gzip.decompress's docs/source don't advertise this
+        # separately from BadGzipFile (an OSError subclass), but it is a real,
+        # distinct exception a corrupted/truncated attachment can raise.
+        pass
+    except zlib.error:
+        # A gzip-magic-valid header with a corrupted deflate body raises this
+        # from the underlying zlib layer, not gzip's own OSError subclass.
         pass
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:

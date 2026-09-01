@@ -726,6 +726,34 @@ def test_decode_report_payload_gzip_roundtrip():
     assert client._decode_report_payload(gzip.compress(xml)) == xml
 
 
+def test_decode_report_payload_truncated_gzip_does_not_raise():
+    # Regression test for a /code-review high finding on PR #79: a truncated
+    # gzip stream (e.g. cut off mid-transfer) raises EOFError from
+    # gzip.decompress(), not OSError -- the original except OSError clause
+    # let this escape uncaught, which would abort fetch_dmarc_rua_records'
+    # whole domain fetch instead of counting one message error like every
+    # other malformed-attachment case.
+    import gzip
+
+    xml = b"<feedback>gzip</feedback>"
+    truncated = gzip.compress(xml)[:-4]  # chop the end-of-stream trailer
+    assert client._decode_report_payload(truncated) == truncated
+
+
+def test_decode_report_payload_corrupted_gzip_body_does_not_raise():
+    # Same finding, the zlib.error trigger: a gzip-magic-valid header with a
+    # corrupted deflate body raises zlib.error from the underlying zlib
+    # layer, also not an OSError subclass.
+    import gzip
+
+    xml = b"<feedback>gzip corrupted body test payload</feedback>"
+    compressed = bytearray(gzip.compress(xml))
+    mid = len(compressed) // 2
+    compressed[mid] ^= 0xFF  # flip a byte inside the deflate-compressed body
+    corrupted = bytes(compressed)
+    assert client._decode_report_payload(corrupted) == corrupted
+
+
 def test_decode_report_payload_zip_roundtrip():
     import io
     import zipfile
