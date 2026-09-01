@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.14.1...v0.15.0) (2026-09-01)
+
+
+### Features
+
+* add dmarc_rua_summary tool ([#79](https://github.com/shigechika/gwsadm-mcp/issues/79)) ([0e37703](https://github.com/shigechika/gwsadm-mcp/commit/0e3770330ee27a05f1bce4a3d5643e3a2abe4cd9))
+* add gmail_usage_report tool ([#81](https://github.com/shigechika/gwsadm-mcp/issues/81)) ([c54ec0d](https://github.com/shigechika/gwsadm-mcp/commit/c54ec0de803b475bcee079424195be0bb9cd26aa))
+
 ## [0.14.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.14.0...v0.14.1) (2026-08-20)
 
 
