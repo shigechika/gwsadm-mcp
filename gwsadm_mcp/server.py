@@ -4,6 +4,9 @@ Phase 1 tools:
 
 - ``health_check``            — fleet-standard status/service/version + per-domain auth probe
 - ``login_audit``             — Google-side auto-disabled accounts, suspicious logins, failure top-N
+- ``gmail_usage_report``      — daily Gmail send/receive counts per domain (Reports API
+  ``customerUsageReports``; requires the separate ``admin.reports.usage.readonly`` DWD scope —
+  see its docstring)
 - ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
 - ``get_user``                — one named account's state: suspended/archived/2SV/last login
   (Directory API; same ``admin.directory.user.readonly`` scope as ``suspended_accounts``)
@@ -418,6 +421,179 @@ def login_audit(hours: int = 24, domain: str | None = None, include_failures: bo
     except (ConfigError, GwsError) as e:
         return {"error": str(e)}
     return {"window_hours": hours, "domains": _login_audit(picked, hours, include_failures, top)}
+
+
+# Comma-separated app_name:param_name filter for customerUsageReports.get,
+# restricting a call to just the Gmail traffic counters this tool reports --
+# without it, one call pulls every application's counters (accounts, drive,
+# calendar, ...), most of which nothing here uses.
+GMAIL_USAGE_PARAMETERS = "gmail:num_emails_sent,gmail:num_emails_received"
+
+# `days` drives a (domain x date) fan-out -- one blocking Reports API call per
+# task, even though they now run concurrently (see _gmail_usage_report). An
+# unbounded value could still queue an excessive number of tasks through the
+# bounded worker pool and run for a long time. 90 covers a full quarter of
+# daily reporting in one call, comfortably past any real use of this tool
+# (compare MAX_TRACE_RECIPIENTS for the same style of caller-input bound).
+MAX_USAGE_REPORT_DAYS = 90
+
+# The Reports API's own date anchor for usage reports (UTC-8:00, i.e. Pacific
+# Standard Time, year-round -- NOT PDT-adjusted). A plain fixed-offset
+# timezone, not zoneinfo, since the API itself does not observe DST.
+_REPORTS_USAGE_DATE_TZ = datetime.timezone(datetime.timedelta(hours=-8))
+
+
+def _int_or_none(value) -> int | None:
+    """Parse a Reports API parameter value (a JSON string, e.g. intValue) as int.
+
+    Returns None on anything unparsable rather than raising -- one malformed
+    or absent counter must not lose the rest of a day's report.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _recent_dates(days: int) -> list[str]:
+    """Return ``days`` consecutive ``yyyy-mm-dd`` dates, most recent first,
+    ending YESTERDAY in the Reports API's own date anchor (:data:`_REPORTS_USAGE_DATE_TZ`)
+    -- not today, since the current day's usage data is not final until the
+    day itself has ended in that timezone.
+    """
+    today = datetime.datetime.now(_REPORTS_USAGE_DATE_TZ).date()
+    return [(today - datetime.timedelta(days=d)).isoformat() for d in range(1, days + 1)]
+
+
+def _fetch_one_date_usage(c: DomainClient, date: str):
+    """One (client, date) usage-report fetch. Runs in a worker thread -- see
+    ``_gmail_usage_report``'s ``ThreadPoolExecutor`` fan-out."""
+    return c.fetch_customer_usage(date=date, parameters=GMAIL_USAGE_PARAMETERS)
+
+
+def _gmail_usage_report(clients: list[DomainClient], days: int) -> dict:
+    dates = _recent_dates(days)
+    # Fan every (domain x date) fetch out concurrently, same rationale as
+    # _parallel_fetch/_fetch_drive_per_domain elsewhere in this file: this API
+    # is inherently one blocking call per day, so running `len(clients) *
+    # days` of them serially risks outrunning an MCP client's own tool-call
+    # timeout on anything but a tiny window. Errors are captured per task
+    # (not raised) so the aggregation below can apply its own domain-wide-vs-
+    # per-date distinction after every fetch has already completed.
+    tasks = [(c, date) for c in clients for date in dates]
+    results: dict[tuple[str, str], tuple[list[dict], bool] | GwsError] = {}
+    if tasks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(tasks))) as ex:
+            futs = {ex.submit(_fetch_one_date_usage, c, date): (c.domain, date) for c, date in tasks}
+            for fut in concurrent.futures.as_completed(futs):
+                key = futs[fut]
+                try:
+                    results[key] = fut.result()
+                except (GwsAuthError, GwsError) as e:
+                    results[key] = e
+
+    out: dict = {}
+    for c in clients:
+        daily: list[dict] = []
+        date_errors: list[dict] = []
+        domain_error: str | None = None
+        capped = False
+        for date in dates:
+            r = results[(c.domain, date)]
+            if isinstance(r, GwsAuthError):
+                # The whole domain lacks this scope -- identical for every
+                # date, so one representative message is surfaced instead of
+                # `days` duplicate entries under date_errors.
+                domain_error = str(r)
+                continue
+            if isinstance(r, GwsError):
+                # A single date's fetch failing for some other reason (e.g.
+                # Google's processing for that day isn't finished yet -- a
+                # known Reports API lag) is NOT domain-wide.
+                date_errors.append({"date": date, "error": str(r)})
+                continue
+            reports, date_capped = r
+            try:
+                for rep in reports:
+                    p = event_parameters(rep)
+                    daily.append(
+                        {
+                            "date": rep.get("date") or date,
+                            "num_emails_sent": _int_or_none(p.get("gmail:num_emails_sent")),
+                            "num_emails_received": _int_or_none(p.get("gmail:num_emails_received")),
+                        }
+                    )
+            except (AttributeError, TypeError) as e:
+                # A malformed usageReports entry (not a plain dict, or a
+                # parameters item that isn't one) must not crash the whole
+                # tool call for every domain -- degrade just this one date.
+                date_errors.append({"date": date, "error": f"malformed usage report entry: {e}"})
+                continue
+            capped = capped or date_capped
+        if domain_error is not None:
+            out[c.domain] = {"error": domain_error}
+        else:
+            out[c.domain] = {"daily": daily, "date_errors": date_errors, "capped": capped}
+    return out
+
+
+@mcp.tool()
+def gmail_usage_report(days: int = 7, domain: str | None = None) -> dict:
+    """Daily Gmail send/receive counts per domain (Admin SDK customerUsageReports).
+
+    Answers "how much Gmail traffic did this domain send/receive on day X" --
+    a customer-level daily counter, NOT a per-user or per-message breakdown
+    (the Reports API has no such thing; ``login_audit``'s activity stream is
+    the per-event alternative for that, at the cost of no volume total).
+
+    Each day's fetch is independent: a domain missing the DWD scope reports
+    one whole-domain ``error`` (there is no point retrying `days` times for
+    an identical scope failure), but a single date's fetch failing for some
+    other reason (Google's processing for that day not finished yet is a
+    known lag on this API family; a transient error) only skips that one
+    date, recorded in ``date_errors`` -- the rest of the window still comes
+    back. The per-domain result also carries ``capped`` -- true if ANY
+    date's fetch hit the (rare, since a single day's customer report is
+    normally one record) pagination limit -- so a truncated day's counters
+    are never mistaken for the complete picture.
+
+    Requires the ``admin.reports.usage.readonly`` DWD scope, granted PER
+    SERVICE ACCOUNT CLIENT ID in the Admin console (Security > API controls >
+    Domain-wide delegation) -- a DIFFERENT scope from
+    ``admin.reports.audit.readonly`` (the one ``login_audit``,
+    ``drive_external_sharing``, ``drive_doc_activity``,
+    ``shared_drive_membership_changes`` and ``daily_brief`` use), even though
+    both live under the same Admin SDK Reports API. Having one does not
+    imply the other; grant this one separately.
+
+    Read-only: only ``customerUsageReports().get()`` is issued, restricted to
+    the two Gmail counters this tool reports via the API's own ``parameters``
+    filter (:data:`GMAIL_USAGE_PARAMETERS`) rather than pulling every
+    application's counters.
+
+    Args:
+        days: How many days back to report, ending YESTERDAY (not today --
+            the current day's data is not final until it ends) in the
+            Reports API's own UTC-8:00/Pacific-Standard-Time date anchor.
+            Must be ``1..``:data:`MAX_USAGE_REPORT_DAYS` -- ``0``/negative
+            would otherwise silently return a well-formed, error-free empty
+            result indistinguishable from "queried correctly, zero Gmail
+            traffic that window", and an unbounded value drives an unbounded
+            (domain x date) fan-out (one blocking API call per task, even
+            though they run concurrently).
+        domain: Configured ``[domain.*]`` section to report on. Default: all
+            configured domains.
+    """
+    if not (1 <= days <= MAX_USAGE_REPORT_DAYS):
+        return {"error": f"days must be between 1 and {MAX_USAGE_REPORT_DAYS}, got {days}"}
+    try:
+        clients, _ = _clients()
+        picked = _select(clients, domain)
+    except (ConfigError, GwsError) as e:
+        return {"error": str(e)}
+    return {"days": days, "domains": _gmail_usage_report(picked, days)}
 
 
 def _suspended_entry(u: dict) -> dict:

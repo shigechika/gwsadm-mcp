@@ -19,6 +19,7 @@ anything.
 |------|-------------|
 | `health_check` | Server version, config path, and per-domain auth probe — call at session start or after a timeout |
 | `login_audit` | Reports API `login` — accounts **auto-disabled by Google** (`account_disabled_*`: leaked password, hijacked, spamming), suspicious logins, failure top-N |
+| `gmail_usage_report` | Reports API `customerUsageReports` — daily Gmail send/receive counts per domain, one date at a time, ending yesterday (the API's own UTC-8:00/PST date anchor). Requires the separate `admin.reports.usage.readonly` DWD scope (see Auth model below) — a DIFFERENT grant from `admin.reports.audit.readonly` even though both are Reports API |
 | `suspended_accounts` | Directory API — current snapshot of **suspended** accounts (`isSuspended=true`); cross-reference against a downstream IdP (e.g. KeyCloak) to find suspended-but-still-enabled accounts |
 | `get_user` | Directory API `users().get` — **one named account's** current state: `suspended` (with reason and time), `archived`, `last_login`, 2SV enrolled/enforced, org unit, creation time, pending password change. The "why can't this person sign in" lookup: one request, no pagination, for an address you already know — unlike `suspended_accounts`, which lists only accounts that ARE suspended, so it can never confirm that a given address is *not* suspended (and once that list exceeds its page cap, absence stops being evidence either way). Needs no scope beyond the one `suspended_accounts` already uses |
 | `user_oauth_tokens` | Directory API `tokens().list` — third-party OAuth app grants for **one user**; a compromise vector `login_audit` is blind to, since a previously-granted token needs no fresh login. Domain resolved from the username's suffix, with an optional `domain` override for alias/secondary-domain addresses |
@@ -55,6 +56,16 @@ degrading — one place, one pass, avoids the trap:
 `health_check` needs no scope at all to respond: it is the tool to call when
 a grant might be missing — it probes each domain and reports the failing
 auth in a structured per-domain result instead of failing itself.
+
+`gmail_usage_report` needs its own separate scope too, despite living under
+the same Admin SDK Reports API as the base pass above — the "Usage report"
+family (`customerUsageReports`) and the "Audit" activity stream
+(`activities().list`, everything else in the base pass) are gated by two
+different scopes, and having one does not imply the other:
+
+| Scope | Needed by | Missing it |
+|-------|-----------|------------|
+| `https://www.googleapis.com/auth/admin.reports.usage.readonly` | `gmail_usage_report` | that tool degrades to a per-domain error; everything else keeps working |
 
 `gmail_message_trace` and `dmarc_rua_summary` need one more scope, granted as
 a **separate** step — it is intentionally not bundled into the pass above:

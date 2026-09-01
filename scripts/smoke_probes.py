@@ -235,6 +235,17 @@ PROBES: dict[str, Probe] = {
         allow_empty=True,
         must_not_match=NO_DOMAIN_ERROR,
     ),
+    "gmail_usage_report": Probe(
+        args={"days": 3},
+        require_keys=("days", "domains"),
+        must_match=(DOMAINS_NOT_EMPTY,),
+        allow_empty=True,
+        # Deliberately no must_not_match on "error": admin.reports.usage.readonly
+        # is a separate DWD scope from admin.reports.audit.readonly (the one
+        # login_audit above uses) and may simply not be granted yet on a given
+        # tenant -- that surfaces as a per-domain {"error": ...}, which is this
+        # tool WORKING correctly (see its docstring), not a broken probe.
+    ),
     "suspended_accounts": Probe(
         args={"max_pages": 1},
         require_keys=("domains",),
