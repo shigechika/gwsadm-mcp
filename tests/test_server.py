@@ -462,6 +462,21 @@ def test_gmail_usage_report_rejects_non_positive_days(inject):
     assert c.usage_calls == []  # rejected before any per-domain work
 
 
+def test_gmail_usage_report_rejects_days_over_the_cap(inject):
+    # Regression test for a Copilot review finding on PR #81: days had no
+    # upper bound, so it could drive an unbounded (domain x date) fan-out --
+    # one blocking Reports API call per task even though they run
+    # concurrently. Mirrors MAX_TRACE_RECIPIENTS' caller-input-bound pattern.
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.gmail_usage_report(days=server.MAX_USAGE_REPORT_DAYS + 1)
+    assert "error" in out
+    assert c.usage_calls == []
+    # The cap itself is still accepted.
+    out = server.gmail_usage_report(days=server.MAX_USAGE_REPORT_DAYS)
+    assert "error" not in out
+
+
 def test_gmail_usage_report_unknown_domain_is_error(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
     out = server.gmail_usage_report(domain="nope.example")

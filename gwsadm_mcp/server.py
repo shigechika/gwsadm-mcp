@@ -429,6 +429,14 @@ def login_audit(hours: int = 24, domain: str | None = None, include_failures: bo
 # calendar, ...), most of which nothing here uses.
 GMAIL_USAGE_PARAMETERS = "gmail:num_emails_sent,gmail:num_emails_received"
 
+# `days` drives a (domain x date) fan-out -- one blocking Reports API call per
+# task, even though they now run concurrently (see _gmail_usage_report). An
+# unbounded value could still queue an excessive number of tasks through the
+# bounded worker pool and run for a long time. 90 covers a full quarter of
+# daily reporting in one call, comfortably past any real use of this tool
+# (compare MAX_TRACE_RECIPIENTS for the same style of caller-input bound).
+MAX_USAGE_REPORT_DAYS = 90
+
 # The Reports API's own date anchor for usage reports (UTC-8:00, i.e. Pacific
 # Standard Time, year-round -- NOT PDT-adjusted). A plain fixed-offset
 # timezone, not zoneinfo, since the API itself does not observe DST.
@@ -569,14 +577,17 @@ def gmail_usage_report(days: int = 7, domain: str | None = None) -> dict:
         days: How many days back to report, ending YESTERDAY (not today --
             the current day's data is not final until it ends) in the
             Reports API's own UTC-8:00/Pacific-Standard-Time date anchor.
-            Must be positive -- ``0``/negative would otherwise silently
-            return a well-formed, error-free empty result indistinguishable
-            from "queried correctly, zero Gmail traffic that window".
+            Must be ``1..``:data:`MAX_USAGE_REPORT_DAYS` -- ``0``/negative
+            would otherwise silently return a well-formed, error-free empty
+            result indistinguishable from "queried correctly, zero Gmail
+            traffic that window", and an unbounded value drives an unbounded
+            (domain x date) fan-out (one blocking API call per task, even
+            though they run concurrently).
         domain: Configured ``[domain.*]`` section to report on. Default: all
             configured domains.
     """
-    if days <= 0:
-        return {"error": f"days must be a positive integer, got {days}"}
+    if not (1 <= days <= MAX_USAGE_REPORT_DAYS):
+        return {"error": f"days must be between 1 and {MAX_USAGE_REPORT_DAYS}, got {days}"}
     try:
         clients, _ = _clients()
         picked = _select(clients, domain)
