@@ -10,6 +10,9 @@ Phase 1 tools:
 - ``user_oauth_tokens``       — third-party OAuth app grants for one user (Directory API)
 - ``gmail_message_trace``     — did a known Message-ID reach specific mailboxes, and where
   (Gmail API; requires the separate ``gmail.readonly`` DWD scope — see its docstring)
+- ``dmarc_rua_summary``       — DMARC aggregate (RUA) report pass/fail summary per domain
+  (Gmail API against the domain's configured RUA mailbox; shares ``gmail_message_trace``'s
+  ``gmail.readonly`` DWD scope — see its docstring)
 - ``group_delivery_policy``   — a Google Group's own posting/delivery policy (who_can_post,
   allow_external_members) — why external mail silently never arrives (Groups Settings API;
   requires the separate ``apps.groups.settings`` DWD scope — see its docstring)
@@ -832,6 +835,161 @@ def gmail_message_trace(message_id: str, recipients: str, domain: str | None = N
         # order as input" rather than incidental luck.
         "results": {addr: results[addr] for addr in addrs},
     }
+
+
+# Reject-candidate IPs surfaced individually; the rest are folded into the
+# per-domain totals only. Keeps a report from listing thousands of low-volume
+# scanner/spoof source IPs -- the ones worth a human looking at are the
+# high-count ones.
+DMARC_TOP_IPS_DEFAULT = 15
+
+
+def _aggregate_dmarc_rua(records: list[dict], top: int) -> dict:
+    """Aggregate raw DMARC records into a per-policy-domain pass/fail summary.
+
+    A record is a DMARC PASS when EITHER ``dkim`` or ``spf`` (the aligned
+    ``policy_evaluated`` values, not the raw auth result) reads "pass" --
+    counting any non-"pass" dkim as a failure regardless of spf overcounts
+    dramatically, since a lot of legitimate mail passes DMARC via SPF
+    alignment alone with DKIM unaligned or absent. A reject candidate is
+    ``disposition == "quarantine"`` OR both dkim and spf failing; anything
+    else counts as pass. This mirrors the fix applied to an ad-hoc script
+    that miscounted using the naive "dkim != pass" rule on 2026-09-01.
+
+    Returns one entry per ``policy_domain`` seen across the input records:
+    ``{pass, quarantined, undisposed_fail, reject_candidate_ips}`` where the
+    last is the top-``top`` source IPs among reject candidates (by count),
+    each with its own count, dispositions seen, and header_from values seen
+    (multiple header_from values under one source IP usually means it also
+    sends subdomain mail, whose true disposition depends on that
+    subdomain's OWN ``sp=`` policy, not the parent domain's ``p=``).
+    """
+    per_domain: dict[str, dict] = {}
+    reject_agg: dict[tuple[str, str], dict] = {}
+    for r in records:
+        pd = r["policy_domain"] or "(unknown)"
+        bucket = per_domain.setdefault(pd, {"pass": 0, "quarantined": 0, "undisposed_fail": 0})
+        is_reject_candidate = r["disposition"] == "quarantine" or (r["dkim"] != "pass" and r["spf"] != "pass")
+        if r["disposition"] == "quarantine":
+            bucket["quarantined"] += r["count"]
+        elif is_reject_candidate:
+            bucket["undisposed_fail"] += r["count"]
+        else:
+            bucket["pass"] += r["count"]
+        if is_reject_candidate:
+            key = (pd, r["source_ip"])
+            agg = reject_agg.setdefault(key, {"count": 0, "dispositions": set(), "header_from": set()})
+            agg["count"] += r["count"]
+            agg["dispositions"].add(r["disposition"] or "none")
+            if r["header_from"]:
+                agg["header_from"].add(r["header_from"])
+
+    top_by_domain: dict[str, list[dict]] = {pd: [] for pd in per_domain}
+    for (pd, ip), agg in sorted(reject_agg.items(), key=lambda kv: -kv[1]["count"]):
+        bucket = top_by_domain.setdefault(pd, [])
+        if len(bucket) < top:
+            bucket.append(
+                {
+                    "source_ip": ip,
+                    "count": agg["count"],
+                    "dispositions": sorted(agg["dispositions"]),
+                    "header_from": sorted(agg["header_from"]),
+                }
+            )
+    return {pd: {**bucket, "reject_candidate_ips": top_by_domain.get(pd, [])} for pd, bucket in per_domain.items()}
+
+
+def _dmarc_rua_report(clients: list[DomainClient], hours: int, mailbox: str | None, max_pages: int, top: int) -> dict:
+    start = _window(hours)
+
+    def _one(c: DomainClient):
+        return c.fetch_dmarc_rua_records(start=start, mailbox=mailbox, max_pages=max_pages)
+
+    out: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(clients) or 1)) as ex:
+        futs = {ex.submit(_one, c): c for c in clients}
+        for fut in concurrent.futures.as_completed(futs):
+            c = futs[fut]
+            try:
+                records, capped, message_errors, used_mailbox = fut.result()
+            except (GwsAuthError, GwsError) as e:
+                out[c.domain] = {"error": str(e)}
+                continue
+            out[c.domain] = {
+                "mailbox": used_mailbox,
+                "capped": capped,
+                "message_errors": message_errors,
+                "policy_domains": _aggregate_dmarc_rua(records, top),
+            }
+    return out
+
+
+@mcp.tool()
+def dmarc_rua_summary(
+    hours: int = 72,
+    domain: str | None = None,
+    mailbox: str | None = None,
+    max_pages: int = 10,
+    top: int = DMARC_TOP_IPS_DEFAULT,
+) -> dict:
+    """Summarize DMARC aggregate (RUA) reports: pass/fail per domain, top reject-candidate IPs.
+
+    Reads the RUA reports mail providers send to the domain's ``dmarc_rua_mailbox``
+    (config default: ``postmaster@<domain>``, since RUA is conventionally
+    addressed to a Gmail plus-subaddress like ``postmaster+rua@`` that lands
+    in the same inbox) and answers "how much of this domain's mail volume is
+    passing DMARC, and if we moved the policy to ``p=reject``, what would
+    actually get blocked?"
+
+    A record counts as PASS when either its aligned DKIM or SPF check reads
+    "pass" (DMARC's own OR semantics) — NOT when both do. A record counts as
+    a reject candidate when it is already quarantined, or when BOTH checks
+    fail; everything else is a pass. This distinction matters a lot in
+    practice: a large share of legitimate mail (mailing-list forwards, some
+    relays) passes DMARC via SPF alignment alone with DKIM unaligned, so
+    counting on DKIM alone overstates the failure rate severalfold.
+
+    ``reject_candidate_ips`` (the top ``top`` per domain by volume) is where
+    to actually look before flipping a policy to ``p=reject``: a header_from
+    that names a SUBDOMAIN of the audited domain is governed by that
+    subdomain's own ``sp=`` policy, not the parent's ``p=``, so it is not
+    necessarily what a `p=reject` change on the parent would affect.
+
+    Requires the ``gmail.readonly`` DWD scope — the same one
+    ``gmail_message_trace`` needs, granted PER SERVICE ACCOUNT CLIENT ID in
+    the Admin console (Security > API controls > Domain-wide delegation),
+    separately from the ``admin.directory.*`` / ``admin.reports.*`` scopes
+    the rest of this server uses.
+
+    Read-only: only ``messages().list``/``messages().get``/
+    ``attachments().get`` against the one configured mailbox are issued —
+    see ``DomainClient.fetch_dmarc_rua_records``.
+
+    Args:
+        hours: Lookback window. Default 72 (3 days): RUA reports typically
+            arrive roughly daily per sending source, so a single day's
+            window risks missing infrequent senders entirely.
+        domain: Configured ``[domain.*]`` section to report on. Default: all
+            configured domains.
+        mailbox: Override the configured ``dmarc_rua_mailbox`` for every
+            selected domain. Set this only for an ad-hoc check against a
+            different address than the one in config.
+        max_pages: Gmail ``messages().list`` pages (100 messages each) to
+            walk per domain. ``capped=true`` in the result means more pages
+            existed — a capped fetch UNDER-counts real report volume, not
+            just a lower bound on some other total, since every matching
+            message must be walked (there is no server-side aggregate to
+            fall back on).
+        top: How many reject-candidate source IPs to return per domain
+            (highest volume first). The per-domain pass/quarantined/
+            undisposed_fail totals themselves are never truncated.
+    """
+    try:
+        clients, _ = _clients()
+        picked = _select(clients, domain)
+    except (ConfigError, GwsError) as e:
+        return {"error": str(e)}
+    return {"window_hours": hours, "domains": _dmarc_rua_report(picked, hours, mailbox, max_pages, top)}
 
 
 @mcp.tool()

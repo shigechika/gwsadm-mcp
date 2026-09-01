@@ -8,7 +8,7 @@ import gwsadm_mcp.client as client
 from gwsadm_mcp.client import DomainClient, GwsError, event_parameters
 from gwsadm_mcp.config import DomainConfig
 
-CFG = DomainConfig("example.edu", "/tmp/sa.json", "audit-admin@example.edu", "C0abc")
+CFG = DomainConfig("example.edu", "/tmp/sa.json", "audit-admin@example.edu", "C0abc", "postmaster@example.edu")
 
 
 class _Req:
@@ -679,6 +679,323 @@ def test_gmail_service_cache_evicts_oldest_once_over_cap(monkeypatch):
     assert list(c._gmail_cache) == ["b@example.edu", "c@example.edu"]
 
 
+# -- fetch_dmarc_rua_records / DMARC XML parsing -----------------------------
+
+
+def _dmarc_xml(policy_domain, records):
+    """Build a minimal DMARC aggregate-report XML document from simple dicts."""
+    parts = [f"<feedback><policy_published><domain>{policy_domain}</domain></policy_published>"]
+    for r in records:
+        parts.append(
+            f"<record><row><source_ip>{r['source_ip']}</source_ip><count>{r['count']}</count>"
+            f"<policy_evaluated><disposition>{r['disposition']}</disposition>"
+            f"<dkim>{r['dkim']}</dkim><spf>{r['spf']}</spf></policy_evaluated></row>"
+            f"<identifiers><header_from>{r['header_from']}</header_from></identifiers></record>"
+        )
+    parts.append("</feedback>")
+    return "".join(parts).encode()
+
+
+def _gzip_b64(raw_bytes):
+    import base64
+    import gzip
+
+    # urlsafe_b64encode's trailing '=' padding is stripped, matching real
+    # Gmail attachment "data" fields (see fetch_dmarc_rua_records, which
+    # re-pads before decoding) -- this exercises that re-padding path too.
+    return base64.urlsafe_b64encode(gzip.compress(raw_bytes)).decode().rstrip("=")
+
+
+def test_find_attachment_id_top_level():
+    assert client._find_attachment_id({"body": {"attachmentId": "a1"}}) == "a1"
+
+
+def test_find_attachment_id_nested_in_parts():
+    payload = {"body": {}, "parts": [{"body": {}}, {"body": {"attachmentId": "a2"}}]}
+    assert client._find_attachment_id(payload) == "a2"
+
+
+def test_find_attachment_id_none_when_absent():
+    assert client._find_attachment_id({"body": {}, "parts": [{"body": {}}]}) is None
+
+
+def test_decode_report_payload_gzip_roundtrip():
+    import gzip
+
+    xml = b"<feedback>gzip</feedback>"
+    assert client._decode_report_payload(gzip.compress(xml)) == xml
+
+
+def test_decode_report_payload_zip_roundtrip():
+    import io
+    import zipfile
+
+    xml = b"<feedback>zip</feedback>"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("report.xml", xml)
+    assert client._decode_report_payload(buf.getvalue()) == xml
+
+
+def test_decode_report_payload_plain_xml_passthrough():
+    xml = b"<feedback>plain</feedback>"
+    assert client._decode_report_payload(xml) == xml
+
+
+def test_parse_dmarc_records_extracts_all_fields():
+    xml = _dmarc_xml(
+        "example.edu",
+        [
+            {
+                "source_ip": "1.2.3.4",
+                "count": 5,
+                "dkim": "pass",
+                "spf": "fail",
+                "disposition": "none",
+                "header_from": "example.edu",
+            }
+        ],
+    )
+    assert client._parse_dmarc_records(xml) == [
+        {
+            "policy_domain": "example.edu",
+            "source_ip": "1.2.3.4",
+            "count": 5,
+            "dkim": "pass",
+            "spf": "fail",
+            "disposition": "none",
+            "header_from": "example.edu",
+        }
+    ]
+
+
+def test_parse_dmarc_records_skips_record_with_missing_count():
+    xml = (
+        b"<feedback><policy_published><domain>example.edu</domain></policy_published>"
+        b"<record><row><source_ip>1.2.3.4</source_ip></row></record></feedback>"
+    )
+    assert client._parse_dmarc_records(xml) == []
+
+
+class FakeGmailAttachmentsResource:
+    def __init__(self, by_id, exc=None):
+        self._by_id, self.exc = by_id, exc
+        self.calls = []
+
+    def get(self, **kw):
+        self.calls.append(kw)
+        if self.exc:
+            return _Req(None, self.exc)
+        return _Req({"data": self._by_id.get(kw["id"], "")})
+
+
+class FakeGmailMessagesResourceDmarc:
+    """Like FakeGmailMessagesResource, but also exposes attachments()."""
+
+    def __init__(self, list_pages, get_by_id, attachments, list_exc=None, get_exc=None):
+        self.list_pages, self.get_by_id = list_pages, get_by_id
+        self._attachments = attachments
+        self.list_exc, self.get_exc = list_exc, get_exc
+        self.list_calls, self.get_calls = [], []
+
+    def list(self, **kw):
+        self.list_calls.append(kw)
+        if self.list_exc:
+            return _Req(None, self.list_exc)
+        return _Req(self.list_pages[min(len(self.list_calls) - 1, len(self.list_pages) - 1)])
+
+    def get(self, **kw):
+        self.get_calls.append(kw)
+        if self.get_exc:
+            return _Req(None, self.get_exc)
+        return _Req(self.get_by_id[kw["id"]])
+
+    def attachments(self):
+        return self._attachments
+
+
+def _dmarc_client(
+    list_pages, get_by_id=None, attachments_by_id=None, list_exc=None, get_exc=None, attachments_exc=None
+):
+    messages = FakeGmailMessagesResourceDmarc(
+        list_pages,
+        get_by_id or {},
+        FakeGmailAttachmentsResource(attachments_by_id or {}, attachments_exc),
+        list_exc,
+        get_exc,
+    )
+    svc = FakeGmailUsersResource(messages)
+
+    class _Svc:
+        def users(self):
+            return svc
+
+    c = DomainClient(CFG, gmail_service_factory=lambda user_email: _Svc())
+    return c, messages
+
+
+def test_fetch_dmarc_rua_records_happy_path_parses_and_defaults_mailbox():
+    import datetime
+
+    xml = _dmarc_xml(
+        "example.edu",
+        [
+            {
+                "source_ip": "1.2.3.4",
+                "count": 3,
+                "dkim": "pass",
+                "spf": "pass",
+                "disposition": "none",
+                "header_from": "example.edu",
+            }
+        ],
+    )
+    c, messages = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_by_id={"m1": {"payload": {"body": {"attachmentId": "att1"}}}},
+        attachments_by_id={"att1": _gzip_b64(xml)},
+    )
+    records, capped, message_errors, mailbox = c.fetch_dmarc_rua_records(
+        start=datetime.datetime.now(datetime.timezone.utc)
+    )
+    assert records == [
+        {
+            "policy_domain": "example.edu",
+            "source_ip": "1.2.3.4",
+            "count": 3,
+            "dkim": "pass",
+            "spf": "pass",
+            "disposition": "none",
+            "header_from": "example.edu",
+        }
+    ]
+    assert capped is False
+    assert message_errors == 0
+    assert mailbox == "postmaster@example.edu"  # CFG.dmarc_rua_mailbox default
+    assert "to:postmaster@example.edu" in messages.list_calls[0]["q"]
+
+
+def test_fetch_dmarc_rua_records_honors_explicit_mailbox_override():
+    import datetime
+
+    c, messages = _dmarc_client(list_pages=[{"messages": []}])
+    _, _, _, mailbox = c.fetch_dmarc_rua_records(
+        start=datetime.datetime.now(datetime.timezone.utc), mailbox="dmarc-reports@example.edu"
+    )
+    assert mailbox == "dmarc-reports@example.edu"
+    assert "to:dmarc-reports@example.edu" in messages.list_calls[0]["q"]
+
+
+def test_fetch_dmarc_rua_records_message_with_no_attachment_counts_as_error():
+    import datetime
+
+    c, _ = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_by_id={"m1": {"payload": {"body": {}}}},  # no attachmentId anywhere
+    )
+    records, _, message_errors, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    assert records == []
+    assert message_errors == 1
+
+
+def test_fetch_dmarc_rua_records_malformed_attachment_counts_as_error_not_raise():
+    import datetime
+
+    c, _ = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_by_id={"m1": {"payload": {"body": {"attachmentId": "att1"}}}},
+        attachments_by_id={"att1": "not-valid-base64-or-xml!!!"},
+    )
+    records, _, message_errors, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    assert records == []
+    assert message_errors == 1
+
+
+def test_fetch_dmarc_rua_records_capped_when_more_pages_exist_than_max_pages():
+    import datetime
+
+    c, _ = _dmarc_client(list_pages=[{"messages": [], "nextPageToken": "tok2"}])
+    _, capped, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc), max_pages=1)
+    assert capped is True
+
+
+def test_fetch_dmarc_rua_records_not_capped_when_no_more_pages():
+    import datetime
+
+    c, _ = _dmarc_client(list_pages=[{"messages": []}])
+    _, capped, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc), max_pages=5)
+    assert capped is False
+
+
+def test_fetch_dmarc_rua_records_list_http_error_maps_to_gws_error():
+    import datetime
+
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _dmarc_client(list_pages=[{}], list_exc=err)
+    with pytest.raises(GwsError):
+        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+
+
+def test_fetch_dmarc_rua_records_list_auth_error_maps_to_gws_auth_error():
+    import datetime
+
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _dmarc_client(list_pages=[{}], list_exc=RefreshError("unauthorized_client"))
+    with pytest.raises(GwsAuthError):
+        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+
+
+def test_fetch_dmarc_rua_records_per_message_auth_error_fails_the_whole_fetch():
+    """A GoogleAuthError from one message's get() means the scope/mailbox is
+    broken for every message identically -- it must propagate as GwsAuthError,
+    not get silently counted as one of many tolerated per-message errors."""
+    import datetime
+
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    c, _ = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_exc=RefreshError("unauthorized_client"),
+    )
+    with pytest.raises(GwsAuthError):
+        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+
+
+def test_fetch_dmarc_rua_records_one_bad_message_does_not_lose_other_records():
+    import datetime
+
+    good_xml = _dmarc_xml(
+        "example.edu",
+        [
+            {
+                "source_ip": "9.9.9.9",
+                "count": 1,
+                "dkim": "pass",
+                "spf": "pass",
+                "disposition": "none",
+                "header_from": "example.edu",
+            }
+        ],
+    )
+    c, _ = _dmarc_client(
+        list_pages=[{"messages": [{"id": "good"}, {"id": "bad"}]}],
+        get_by_id={
+            "good": {"payload": {"body": {"attachmentId": "att-good"}}},
+            "bad": {"payload": {"body": {}}},  # no attachment
+        },
+        attachments_by_id={"att-good": _gzip_b64(good_xml)},
+    )
+    records, _, message_errors, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    assert len(records) == 1
+    assert records[0]["source_ip"] == "9.9.9.9"
+    assert message_errors == 1
+
+
 def test_http_error_maps_to_gws_error():
     import datetime
 
@@ -719,7 +1036,7 @@ def test_key_load_failure_does_not_leak_path(tmp_path):
     from gwsadm_mcp.client import GwsAuthError
 
     secret_path = str(tmp_path / "very-secret-key.json")
-    cfg = DomainConfig("example.edu", secret_path, "a@example.edu", "C0abc")
+    cfg = DomainConfig("example.edu", secret_path, "a@example.edu", "C0abc", "postmaster@example.edu")
     c = DomainClient(cfg)  # no injected service -> loads the key file
     with pytest.raises(GwsAuthError) as ei:
         c._reports_service()

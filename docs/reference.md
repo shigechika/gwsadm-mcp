@@ -13,6 +13,7 @@
 | `drive_doc_activity` | Reports API `drive` with a server-side `doc_id` filter — **one document's** owner, ACL changes, and lifecycle events. Triage companion to `drive_external_sharing`: the owner (an individual vs. a shared drive's name) disambiguates the shared-drive false-positive class |
 | `shared_drive_membership_changes` | Reports API `drive` (`shared_drive_membership_change`) — who added/removed/re-roled shared-drive members and when, with external classification of the affected member and a client-side drive-name filter |
 | `gmail_message_trace` | Gmail API — did a **known** Message-ID reach **specific** mailboxes, and where (inbox/spam/trash/archived)? For each recipient it impersonates that user via DWD and searches their own mailbox. Requires the separate `gmail.readonly` DWD scope; a domain missing that grant reports a per-recipient error, never a false "not found" |
+| `dmarc_rua_summary` | Gmail API — DMARC aggregate (RUA) report pass/fail summary and top reject-candidate source IPs, per domain. Impersonates the domain's configured `dmarc_rua_mailbox` (default `postmaster@<domain>`) and reads the compressed report attachments. Shares `gmail_message_trace`'s `gmail.readonly` DWD scope, but reads attachment content, not just metadata |
 | `group_delivery_policy` | Groups Settings API — a Google Group's own posting/delivery policy (`who_can_post`, `allow_external_members`, moderation levels). Requires the separate `apps.groups.settings` DWD scope |
 | `list_group_members` | Directory API — a Google Group's basic metadata and member roster, resolved directly rather than inferred from who happened to receive one particular message. Requires the separate `admin.directory.group.readonly` and `admin.directory.group.member.readonly` DWD scopes |
 | `daily_brief` | One-call summary across all configured domains |
@@ -37,7 +38,7 @@ with the base pass:
 
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
-| `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace` | that tool reports a per-recipient error; everything else keeps working |
+| `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace`, `dmarc_rua_summary` | those tools report a per-recipient/per-domain error; everything else keeps working |
 | `https://www.googleapis.com/auth/apps.groups.settings` | `group_delivery_policy` | that tool degrades to an error; everything else keeps working |
 | `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members` (group metadata half) | that half reports its own error; the member-roster half still works independently if its own scope is granted |
 | `https://www.googleapis.com/auth/admin.directory.group.member.readonly` | `list_group_members` (member roster half) | same, independent of the metadata half — the two calls never gate each other |

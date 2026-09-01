@@ -274,6 +274,19 @@ PROBES: dict[str, Probe] = {
         # shape above; a raised exception or a malformed shape still fails
         # the probe through the harness's own checks.
     ),
+    "dmarc_rua_summary": Probe(
+        args={"hours": WINDOW_HOURS, "max_pages": 1, "top": 5},
+        require_keys=("window_hours", "domains"),
+        must_match=(DOMAINS_NOT_EMPTY,),
+        allow_empty=True,
+        # Deliberately no must_not_match on "error", for the same reason as
+        # gmail_message_trace above: gmail.readonly is a separate DWD scope
+        # from the rest of this server's admin.* scopes and may simply not be
+        # granted yet on a given tenant, or dmarc_rua_mailbox may point at an
+        # address this service account cannot impersonate. Either surfaces as
+        # a per-domain {"error": ...} inside "domains", which is this tool
+        # WORKING correctly (see its docstring), not a broken probe.
+    ),
     "group_delivery_policy": Probe(
         args_factory=_fake_group,
         require_keys=("domain", "group_email", "found"),

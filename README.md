@@ -26,6 +26,7 @@ anything.
 | `drive_doc_activity` | Reports API `drive` with a server-side `doc_id` filter — **one document's** owner, ACL changes, and lifecycle events. Triage companion to `drive_external_sharing`: the owner (an individual vs. a shared drive's name) disambiguates the shared-drive false-positive class, where files created inside a shared drive propagate member ACLs and read as bulk external sharing |
 | `shared_drive_membership_changes` | Reports API `drive` (`shared_drive_membership_change`) — who added/removed/re-roled shared-drive members and when, with external classification of the affected member and a client-side drive-name filter |
 | `gmail_message_trace` | Gmail API — did a **known** Message-ID reach **specific** mailboxes, and where (inbox/spam/trash/archived)? For each recipient it impersonates that user via DWD and searches their own mailbox. Requires the separate `gmail.readonly` DWD scope (see Auth model below); a domain missing that grant reports a per-recipient error, never a false "not found" |
+| `dmarc_rua_summary` | Gmail API — DMARC aggregate (RUA) report pass/fail summary and top reject-candidate source IPs, per domain. Impersonates the domain's configured `dmarc_rua_mailbox` (default `postmaster@<domain>`) and reads the compressed report attachments those messages carry. Shares `gmail_message_trace`'s `gmail.readonly` DWD scope, but unlike that tool this one DOES read attachment content (the report XML), not just metadata — see Auth model below |
 | `group_delivery_policy` | Groups Settings API — a Google Group's own posting/delivery policy (`who_can_post`, `allow_external_members`, moderation levels). A group's access control sits **in front of** Gmail delivery: a domain-only posting policy silently drops an external sender's mail before it generates any Gmail delivery event at all, indistinguishable from a delivery failure without reading the policy directly. Requires the separate `apps.groups.settings` DWD scope (see Auth model below) |
 | `list_group_members` | Directory API — a Google Group's basic metadata and member roster, resolved directly rather than inferred from who happened to receive one particular message. Requires the separate `admin.directory.group.readonly` and `admin.directory.group.member.readonly` DWD scopes (see Auth model below) |
 | `daily_brief` | One-call summary across all configured domains |
@@ -55,24 +56,28 @@ degrading — one place, one pass, avoids the trap:
 a grant might be missing — it probes each domain and reports the failing
 auth in a structured per-domain result instead of failing itself.
 
-`gmail_message_trace` needs one more scope, granted as a **separate** step —
-it is intentionally not bundled into the pass above:
+`gmail_message_trace` and `dmarc_rua_summary` need one more scope, granted as
+a **separate** step — it is intentionally not bundled into the pass above:
 
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
-| `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace` | that tool reports a per-recipient error; everything else keeps working |
+| `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace`, `dmarc_rua_summary` | those tools report a per-recipient/per-domain error; everything else keeps working |
 
 This is a materially broader grant than the three above: it allows reading
 *message content* for any user the service account impersonates, not just
-metadata. The tool code itself only ever requests `format="metadata"` — it
-never reads a message body — but the grant itself does not enforce that; the
-narrower `gmail.metadata` scope was considered and rejected because it does
-not support the `q=` search parameter the `rfc822msgid:` lookup needs. Grant
-it on the **same** service-account client ID as the other scopes (Admin
-console → Security → API controls → Domain-wide delegation → find the
-existing client ID → add this scope to its list), and weigh that broader
-exposure against how much you actually need message-trace before turning it
-on for a given domain.
+metadata. `gmail_message_trace` only ever requests `format="metadata"` — it
+never reads a message body — but `dmarc_rua_summary` DOES read content: it
+fetches the compressed DMARC report attachment each RUA message carries
+(`format="full"` plus `attachments().get()`) and parses it. Both stay within
+what the grant allows either way, but only `gmail_message_trace` stays inside
+the narrower "metadata only" habit; the narrower `gmail.metadata` scope was
+considered and rejected for both tools because it does not support the `q=`
+search parameter the `rfc822msgid:`/RUA-mailbox lookups need. Grant it on the
+**same** service-account client ID as the other scopes (Admin console →
+Security → API controls → Domain-wide delegation → find the existing client
+ID → add this scope to its list), and weigh that broader exposure against how
+much you actually need message-trace/DMARC reporting before turning it on for
+a given domain.
 
 `group_delivery_policy` and `list_group_members` each need their own
 separate scope too — three more grants beyond the base pass, none bundled
@@ -134,10 +139,16 @@ internal_domains = example.edu, mail.example.edu
 service_account_file = /path/to/service-account.json
 subject = audit-admin@example.edu
 customer_id = C0xxxxxxx
+dmarc_rua_mailbox = postmaster@example.edu   # optional, default: postmaster@<domain>
 ```
 
 One `[domain.*]` section per audited Workspace domain. `internal_domains` is
 the allowlist used to classify sharing targets as internal vs external.
+`dmarc_rua_mailbox` is the mailbox `dmarc_rua_summary` impersonates to read
+DMARC aggregate reports — usually the same inbox `subject` receives mail
+addressed to a `postmaster+rua@` Gmail plus-subaddress, which is why the
+default assumes `postmaster@` rather than requiring every deployment to
+spell it out.
 
 ## Usage
 
