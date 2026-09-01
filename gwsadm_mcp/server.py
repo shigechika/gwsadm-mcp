@@ -466,9 +466,10 @@ def _gmail_usage_report(clients: list[DomainClient], days: int) -> dict:
         daily: list[dict] = []
         date_errors: list[dict] = []
         domain_error: str | None = None
+        capped = False
         for date in dates:
             try:
-                reports, _capped = c.fetch_customer_usage(date=date, parameters=GMAIL_USAGE_PARAMETERS)
+                reports, date_capped = c.fetch_customer_usage(date=date, parameters=GMAIL_USAGE_PARAMETERS)
             except GwsAuthError as e:
                 # The whole domain lacks this scope -- identical for every
                 # remaining date, so stop here instead of repeating the same
@@ -481,6 +482,7 @@ def _gmail_usage_report(clients: list[DomainClient], days: int) -> dict:
                 # NOT domain-wide: record it and keep trying the other dates.
                 date_errors.append({"date": date, "error": str(e)})
                 continue
+            capped = capped or date_capped
             for r in reports:
                 p = event_parameters(r)
                 daily.append(
@@ -493,7 +495,7 @@ def _gmail_usage_report(clients: list[DomainClient], days: int) -> dict:
         if domain_error is not None:
             out[c.domain] = {"error": domain_error}
         else:
-            out[c.domain] = {"daily": daily, "date_errors": date_errors}
+            out[c.domain] = {"daily": daily, "date_errors": date_errors, "capped": capped}
     return out
 
 
@@ -512,7 +514,10 @@ def gmail_usage_report(days: int = 7, domain: str | None = None) -> dict:
     other reason (Google's processing for that day not finished yet is a
     known lag on this API family; a transient error) only skips that one
     date, recorded in ``date_errors`` -- the rest of the window still comes
-    back.
+    back. The per-domain result also carries ``capped`` -- true if ANY
+    date's fetch hit the (rare, since a single day's customer report is
+    normally one record) pagination limit -- so a truncated day's counters
+    are never mistaken for the complete picture.
 
     Requires the ``admin.reports.usage.readonly`` DWD scope, granted PER
     SERVICE ACCOUNT CLIENT ID in the Admin console (Security > API controls >

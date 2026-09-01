@@ -360,7 +360,29 @@ def test_gmail_usage_report_reports_daily_counts(inject):
     dom = out["domains"]["example.edu"]
     assert dom["daily"] == [{"date": server._recent_dates(1)[0], "num_emails_sent": 10, "num_emails_received": 20}]
     assert dom["date_errors"] == []
+    assert dom["capped"] is False
     assert out["days"] == 1
+
+
+def test_gmail_usage_report_capped_when_any_date_is_capped(inject):
+    # Regression test for a Copilot review finding on PR #81: fetch_customer_usage
+    # returns (reports, capped) per date, but the aggregation loop was discarding
+    # the capped flag entirely -- violating the module's own coverage contract
+    # ("every result section carries capped when its window was not fully
+    # scanned"). A single capped date must mark the whole domain result capped,
+    # even when every other date in the window came back uncapped.
+    dates = server._recent_dates(2)
+    c = FakeDomainClient(
+        "example.edu",
+        {},
+        usage_by_date={
+            dates[0]: ([_usage_report(dates[0], sent=1, received=1)], True),  # capped
+            dates[1]: ([_usage_report(dates[1], sent=2, received=2)], False),  # not capped
+        },
+    )
+    inject([c], {"example.edu"})
+    out = server.gmail_usage_report(days=2)
+    assert out["domains"]["example.edu"]["capped"] is True
 
 
 def test_gmail_usage_report_domain_wide_auth_error_stops_further_dates(inject):
