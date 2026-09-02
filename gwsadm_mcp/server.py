@@ -1084,24 +1084,38 @@ def _aggregate_dmarc_rua(records: list[dict], top: int) -> dict:
     return {pd: {**bucket, "reject_candidate_ips": top_by_domain.get(pd, [])} for pd, bucket in per_domain.items()}
 
 
-def _dmarc_rua_report(clients: list[DomainClient], hours: int, mailbox: str | None, max_pages: int, top: int) -> dict:
+def _dmarc_rua_report(
+    clients: list[DomainClient], hours: int, mailbox: str | None, recipient: str | None, max_pages: int, top: int
+) -> dict:
     start = _window(hours)
+    out: dict = {}
+    runnable: list[DomainClient] = []
+    for c in clients:
+        # A domain whose rua= lands in another domain's mailbox has nothing of
+        # its own to read (DWD cannot impersonate a group/alias); its reports
+        # still appear under that other domain's entry, keyed by the policy
+        # domain each report names. An explicit mailbox override re-enables
+        # the read for an ad-hoc check.
+        if mailbox is None and c.cfg.dmarc_rua_mailbox is None:
+            out[c.domain] = {"skipped": "DMARC reading is disabled for this domain (dmarc_rua_mailbox = none)"}
+            continue
+        runnable.append(c)
 
     def _one(c: DomainClient):
-        return c.fetch_dmarc_rua_records(start=start, mailbox=mailbox, max_pages=max_pages)
+        return c.fetch_dmarc_rua_records(start=start, mailbox=mailbox, recipient=recipient, max_pages=max_pages)
 
-    out: dict = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(clients) or 1)) as ex:
-        futs = {ex.submit(_one, c): c for c in clients}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(runnable) or 1)) as ex:
+        futs = {ex.submit(_one, c): c for c in runnable}
         for fut in concurrent.futures.as_completed(futs):
             c = futs[fut]
             try:
-                records, capped, message_errors, used_mailbox = fut.result()
+                records, capped, message_errors, used_mailbox, used_recipient = fut.result()
             except (GwsAuthError, GwsError) as e:
                 out[c.domain] = {"error": str(e)}
                 continue
             out[c.domain] = {
                 "mailbox": used_mailbox,
+                "recipient": used_recipient,
                 "capped": capped,
                 "message_errors": message_errors,
                 "policy_domains": _aggregate_dmarc_rua(records, top),
@@ -1114,15 +1128,18 @@ def dmarc_rua_summary(
     hours: int = 72,
     domain: str | None = None,
     mailbox: str | None = None,
+    recipient: str | None = None,
     max_pages: int = 10,
     top: int = DMARC_TOP_IPS_DEFAULT,
 ) -> dict:
     """Summarize DMARC aggregate (RUA) reports: pass/fail per domain, top reject-candidate IPs.
 
-    Reads the RUA reports mail providers send to the domain's ``dmarc_rua_mailbox``
-    (config default: ``postmaster@<domain>``, since RUA is conventionally
-    addressed to a Gmail plus-subaddress like ``postmaster+rua@`` that lands
-    in the same inbox) and answers "how much of this domain's mail volume is
+    Impersonates the domain's configured ``dmarc_rua_mailbox`` (a real user --
+    domain-wide delegation cannot act as a group or alias; config default
+    ``postmaster@<domain>``), searches it for mail addressed to
+    ``dmarc_rua_recipient`` (the ``rua=mailto:`` address published in DNS,
+    e.g. the ``postmaster+rua@`` plus-subaddress; default: same as the
+    mailbox), reads the aggregate reports those messages carry, and answers "how much of this domain's mail volume is
     passing DMARC, and if we moved the policy to ``p=reject``, what would
     actually get blocked?"
 
@@ -1159,11 +1176,18 @@ def dmarc_rua_summary(
             window risks missing infrequent senders entirely.
         domain: Configured ``[domain.*]`` section to report on. Default: all
             configured domains.
-        mailbox: Override the configured ``dmarc_rua_mailbox`` for every
-            selected domain. Set this only for an ad-hoc check against a
-            different address than the one in config. Validated as an
-            email-shaped address (rejected otherwise) before use, since it
-            is interpolated into a Gmail search query.
+        mailbox: Override the configured ``dmarc_rua_mailbox`` (the user to
+            impersonate) for every selected domain. Set this only for an
+            ad-hoc check against a different inbox than the one in config;
+            unless ``recipient`` is also given, that inbox's own address is
+            searched. Also re-enables a domain configured with
+            ``dmarc_rua_mailbox = none`` for the duration of the call.
+            Validated as an email-shaped address (rejected otherwise).
+        recipient: Override the address searched for (``to:``) for every
+            selected domain -- the ``rua=mailto:`` value in DNS when it is
+            not the mailbox itself. Validated as an email-shaped address
+            (rejected otherwise) before use, since it is interpolated into
+            a Gmail search query.
         max_pages: Gmail ``messages().list`` pages (100 messages each) to
             walk per domain. ``capped=true`` in the result means more pages
             existed — a capped fetch UNDER-counts real report volume, not
@@ -1177,17 +1201,22 @@ def dmarc_rua_summary(
     try:
         clients, _ = _clients()
         picked = _select(clients, domain)
-        if mailbox is not None:
-            # mailbox is interpolated directly into a Gmail search query
-            # ("to:{mailbox}"); a caller-supplied value is adversarial input
-            # like any other tool argument, so it is validated as email-shaped
-            # (reusing _domain_of purely for its shape check) BEFORE use --
-            # unvalidated whitespace or a search operator smuggled in here
-            # could change the query's meaning and scan unrelated messages.
-            _domain_of(mailbox)
+        # mailbox (impersonation subject) and recipient (interpolated directly
+        # into a Gmail search query, "to:{recipient}"; mailbox doubles as the
+        # recipient when no recipient is given) are adversarial input like any
+        # other tool argument, so both are validated as email-shaped (reusing
+        # _domain_of purely for its shape check) BEFORE use -- unvalidated
+        # whitespace or a search operator smuggled in here could change the
+        # query's meaning and scan unrelated messages.
+        for arg in (mailbox, recipient):
+            if arg is not None:
+                _domain_of(arg)
     except (ConfigError, GwsError) as e:
         return {"error": str(e)}
-    return {"window_hours": hours, "domains": _dmarc_rua_report(picked, hours, mailbox, max_pages, top)}
+    return {
+        "window_hours": hours,
+        "domains": _dmarc_rua_report(picked, hours, mailbox, recipient, max_pages, top),
+    }
 
 
 @mcp.tool()

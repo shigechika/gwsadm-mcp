@@ -67,13 +67,16 @@ internal_domains = example.edu, mail.example.edu
 service_account_file = /path/to/service-account.json
 subject = audit-admin@example.edu
 customer_id = C0xxxxxxx
-dmarc_rua_mailbox = postmaster@example.edu   # 省略可。既定値: postmaster@<domain>
+dmarc_rua_mailbox = postmaster@example.edu   # 省略可。既定値: postmaster@<domain>。"none" で対象外
+dmarc_rua_recipient = postmaster+rua@example.edu   # 省略可。既定値: dmarc_rua_mailbox と同じ
 ```
 
 監査対象の Workspace ドメインごとに1つの `[domain.*]` セクションを置く。
 `internal_domains` は共有先を内部/外部に分類するための許可リスト。
-`dmarc_rua_mailbox`（省略可）は `dmarc_rua_summary` がDMARC集約レポートを
-読むためになりすますメールボックス。
+`dmarc_rua_mailbox`（省略可）は `dmarc_rua_summary` がDMARC集約レポートを読むために
+なりすます実ユーザー。`dmarc_rua_recipient`（省略可）は、それと異なる場合の公開 `rua=`
+宛先（プラスサブアドレスやグループ）で、検索の絞り込みに使う。`dmarc_rua_mailbox = none`
+でそのドメインを対象外にできる。詳しい理由は README を参照。
 
 `GWSADM_CONFIG` そのものが設定サーフェス全体であり、環境変数だけで
 サーバーを設定する方法は存在しない。各 `service_account_file` はさらに

@@ -14,7 +14,7 @@
 | `shared_drive_membership_changes` | Reports API `drive`（`shared_drive_membership_change`）— 共有ドライブのメンバー追加/削除/ロール変更の履歴。対象メンバーの外部判定と、クライアント側ドライブ名フィルタ付き |
 | `gmail_message_trace` | Gmail API — **既知の** Message-ID が**特定の**メールボックスに届いたか、届いたならどこに入っているか（受信トレイ/迷惑メール/ゴミ箱/アーカイブ）を確認する。宛先ごとに DWD でそのユーザーになりすまし、本人のメールボックスを検索する。別付与の `gmail.readonly` DWD スコープが必要。未付与のドメインは宛先ごとのエラーとして報告され、誤って「届いていない」扱いにはならない |
 | `gmail_usage_report` | Reports API `customerUsageReports` — ドメイン別・日次のGmail送受信通数、昨日まで（APIの日付基準はUTC-8:00／PST）。別付与の `admin.reports.usage.readonly` DWD スコープが必要 — `admin.reports.audit.readonly` とは同じReports APIでも別のグラント |
-| `dmarc_rua_summary` | Gmail API — DMARC 集約（RUA）レポートのドメイン別 PASS/FAIL 集計と reject 候補送信元IPの上位一覧。ドメインの設定値 `dmarc_rua_mailbox`（既定 `postmaster@<domain>`）になりすまし、圧縮された添付レポートを読む。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープを使うが、メタデータだけでなく添付内容を読む |
+| `dmarc_rua_summary` | Gmail API — DMARC 集約（RUA）レポートのドメイン別 PASS/FAIL 集計と reject 候補送信元IPの上位一覧。ドメインの設定値 `dmarc_rua_mailbox`（実ユーザー。既定 `postmaster@<domain>`）になりすまし、`dmarc_rua_recipient`（既定は mailbox と同じ）宛のメールを検索して圧縮された添付レポートを読む。`dmarc_rua_mailbox = none` のドメインは `skipped` として返る。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープを使うが、メタデータだけでなく添付内容を読む |
 | `group_delivery_policy` | Groups Settings API — Google グループ自体の投稿/配送ポリシー（`who_can_post`、`allow_external_members`、モデレーションレベル）。別付与の `apps.groups.settings` DWD スコープが必要 |
 | `list_group_members` | Directory API — Google グループの基本情報とメンバー一覧を直接取得する。別付与の `admin.directory.group.readonly` と `admin.directory.group.member.readonly` DWD スコープが必要 |
 | `daily_brief` | 設定済み全ドメインを横断した一括サマリ |

@@ -66,13 +66,17 @@ internal_domains = example.edu, mail.example.edu
 service_account_file = /path/to/service-account.json
 subject = audit-admin@example.edu
 customer_id = C0xxxxxxx
-dmarc_rua_mailbox = postmaster@example.edu   # optional, default: postmaster@<domain>
+dmarc_rua_mailbox = postmaster@example.edu   # optional, default: postmaster@<domain>; "none" opts out
+dmarc_rua_recipient = postmaster+rua@example.edu   # optional, default: same as dmarc_rua_mailbox
 ```
 
 One `[domain.*]` section per audited Workspace domain. `internal_domains` is
 the allowlist used to classify sharing targets as internal vs external.
-`dmarc_rua_mailbox` (optional) is the mailbox `dmarc_rua_summary` impersonates
-to read DMARC aggregate reports.
+`dmarc_rua_mailbox` (optional) is the real user `dmarc_rua_summary` impersonates
+to read DMARC aggregate reports; `dmarc_rua_recipient` (optional) is the published
+`rua=` address it searches for when that differs from the mailbox (a plus-subaddress
+or a group); `dmarc_rua_mailbox = none` opts the domain out. See the README for the
+full rationale.
 
 `GWSADM_CONFIG` itself is the entire configuration surface — there is no way
 to configure the server through plain environment variables alone. Each

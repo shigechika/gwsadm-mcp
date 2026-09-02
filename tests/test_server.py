@@ -1,6 +1,7 @@
 """Tests for the MCP tools (aggregation, external/grant classification, degradation)."""
 
 import inspect
+import types
 
 import pytest
 
@@ -23,8 +24,16 @@ class FakeDomainClient:
         group_members=None,
         dmarc_rua=None,
         usage_by_date=None,
+        dmarc_mailbox_configured=True,
     ):
         self.domain = domain
+        # The server consults cfg.dmarc_rua_mailbox to skip domains that opted
+        # out of DMARC reading (dmarc_rua_mailbox = none); everything else on the
+        # real DomainConfig is irrelevant to these tests.
+        self.cfg = types.SimpleNamespace(
+            dmarc_rua_mailbox=(f"postmaster@{domain}" if dmarc_mailbox_configured else None),
+            dmarc_rua_recipient=(f"postmaster@{domain}" if dmarc_mailbox_configured else None),
+        )
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
         self._auth = auth
         self._suspended = suspended  # (users, capped) | Exception | None
@@ -62,6 +71,7 @@ class FakeDomainClient:
         self.group_meta_calls = []
         self.group_members_calls = []
         self.dmarc_rua_calls = []
+        self.dmarc_rua_recipients = []
         self.usage_calls = []
 
     def fetch_customer_usage(self, *, date, parameters=None, max_pages=3):
@@ -113,13 +123,18 @@ class FakeDomainClient:
             raise got
         return got  # a dict (found) or None (not found) — caller's choice per user
 
-    def fetch_dmarc_rua_records(self, *, start, mailbox=None, max_pages=5, max_workers=8):
+    def fetch_dmarc_rua_records(self, *, start, mailbox=None, recipient=None, max_pages=5, max_workers=8):
         self.dmarc_rua_calls.append((start, mailbox, max_pages))
+        self.dmarc_rua_recipients.append(recipient)
+        used_mailbox = mailbox or f"postmaster@{self.domain}"
+        used_recipient = recipient or used_mailbox
         if self._dmarc_rua is None:
-            return [], False, 0, mailbox or f"postmaster@{self.domain}"
+            return [], False, 0, used_mailbox, used_recipient
         if isinstance(self._dmarc_rua, Exception):
             raise self._dmarc_rua
-        return self._dmarc_rua
+        canned = tuple(self._dmarc_rua)
+        # Canned 4-tuples predate the recipient field; the real client returns 5.
+        return canned if len(canned) == 5 else (*canned, used_recipient)
 
     def get_group_settings(self, group_email):
         self.group_settings_calls.append(group_email)
@@ -1006,6 +1021,7 @@ def test_dmarc_rua_summary_reports_per_domain_mailbox_and_counts(inject):
     out = server.dmarc_rua_summary(hours=72)
     dom = out["domains"]["example.edu"]
     assert dom["mailbox"] == "postmaster@example.edu"
+    assert dom["recipient"] == "postmaster@example.edu"
     assert dom["capped"] is False
     assert dom["message_errors"] == 0
     assert dom["policy_domains"]["example.edu"]["pass"] == 10
@@ -2695,3 +2711,47 @@ def test_shared_drive_membership_missing_drive_name_is_surfaced(inject):
     assert dom["total"] == 3
     assert dom["missing_drive_name"] == 0
     assert any(e["drive"] is None for e in dom["entries"])
+
+
+def test_dmarc_rua_summary_forwards_recipient_override_and_reports_it(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.dmarc_rua_summary(recipient="postmaster+rua@example.edu")
+    assert c.dmarc_rua_recipients == ["postmaster+rua@example.edu"]
+    dom = out["domains"]["example.edu"]
+    assert dom["mailbox"] == "postmaster@example.edu"
+    assert dom["recipient"] == "postmaster+rua@example.edu"
+
+
+def test_dmarc_rua_summary_rejects_malformed_recipient_override(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.dmarc_rua_summary(recipient="not-an-email newer_than:1d")
+    assert "error" in out
+    assert c.dmarc_rua_calls == []
+
+
+def test_dmarc_rua_summary_skips_opted_out_domain_but_reads_the_others(inject):
+    """A domain whose rua= lands in another domain's mailbox (dmarc_rua_mailbox = none)
+    is reported as skipped, not as an error, and must not block the domain that reads."""
+    reader = FakeDomainClient(
+        "example.edu",
+        {},
+        dmarc_rua=([_dmarc_record(policy_domain="students.example.edu")], False, 0, "postmaster@example.edu"),
+    )
+    opted_out = FakeDomainClient("students.example.edu", {}, dmarc_mailbox_configured=False)
+    inject([reader, opted_out], {"example.edu", "students.example.edu"})
+    out = server.dmarc_rua_summary(hours=24)
+    assert "skipped" in out["domains"]["students.example.edu"]
+    assert "error" not in out["domains"]["students.example.edu"]
+    assert opted_out.dmarc_rua_calls == []
+    # the opted-out domain's reports surface under the reading domain, keyed by policy domain
+    assert out["domains"]["example.edu"]["policy_domains"]["students.example.edu"]["pass"] == 1
+
+
+def test_dmarc_rua_summary_mailbox_override_re_enables_opted_out_domain(inject):
+    opted_out = FakeDomainClient("students.example.edu", {}, dmarc_mailbox_configured=False)
+    inject([opted_out], {"students.example.edu"})
+    out = server.dmarc_rua_summary(mailbox="dmarc-reports@students.example.edu")
+    assert len(opted_out.dmarc_rua_calls) == 1
+    assert out["domains"]["students.example.edu"]["mailbox"] == "dmarc-reports@students.example.edu"

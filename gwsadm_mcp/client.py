@@ -876,17 +876,27 @@ class DomainClient:
         *,
         start: datetime.datetime,
         mailbox: str | None = None,
+        recipient: str | None = None,
         max_pages: int = 5,
         max_workers: int = _DMARC_FETCH_WORKERS_DEFAULT,
-    ) -> tuple[list[dict], bool, int, str]:
+    ) -> tuple[list[dict], bool, int, str, str]:
         """Fetch and parse DMARC aggregate (RUA) reports delivered to one mailbox.
 
         Impersonates ``mailbox`` (default ``cfg.dmarc_rua_mailbox``) via the
         same ``gmail.readonly`` DWD scope and per-user credential cache as
         ``find_message_by_id`` -- see the class docstring for why Gmail auth
-        is architecturally different from this client's other services.
+        is architecturally different from this client's other services. DWD
+        can only impersonate a real user, so ``mailbox`` must be one; the
+        address the reports are *sent to* may differ (a plus-subaddress, or a
+        group that fans out to this inbox) and is ``recipient`` -- default
+        ``cfg.dmarc_rua_recipient`` when ``mailbox`` is not overridden, else the
+        overridden ``mailbox`` itself (an ad-hoc check of another inbox searches
+        that inbox's own address unless told otherwise).
 
-        Searches for messages addressed to ``mailbox`` received on or after
+        Raises ``GwsError`` when the domain opted out of DMARC reading
+        (``cfg.dmarc_rua_mailbox`` is None) and no ``mailbox`` override is given.
+
+        Searches for messages addressed to ``recipient`` received on or after
         ``start`` (Gmail's ``after:`` search operator, second-precision unix
         timestamp), then for each matching message walks its MIME parts for
         the first attachment, decompresses it, and parses every ``<record>``
@@ -911,21 +921,27 @@ class DomainClient:
         fetch just the MIME tree without headers too) and
         ``messages().attachments().get`` are issued.
 
-        Returns ``(records, capped, message_errors, mailbox)`` -- the last is
-        the mailbox actually used (the resolved ``cfg.dmarc_rua_mailbox``
-        default when the ``mailbox`` argument was not given), so a caller can
-        report which address the summary covers without reaching into this
-        client's config. ``capped=True`` means the mailbox had more pages of
+        Returns ``(records, capped, message_errors, mailbox, recipient)`` --
+        the last two are the mailbox impersonated and the address searched
+        for (config defaults resolved when the arguments were not given), so a
+        caller can report which addresses the summary covers without reaching
+        into this client's config. ``capped=True`` means the mailbox had more pages of
         matching messages than ``max_pages`` covered -- unlike
         ``fetch_activities``, every matching message must be walked (there is
         no server-side count to report instead), so a capped fetch
         under-counts real report volume, not just a lower bound on some other
         total.
         """
-        mailbox = mailbox or self.cfg.dmarc_rua_mailbox
+        if mailbox is None:
+            if self.cfg.dmarc_rua_mailbox is None:
+                raise GwsError(f"[{self.domain}] DMARC reading is disabled for this domain (dmarc_rua_mailbox = none)")
+            mailbox = self.cfg.dmarc_rua_mailbox
+            recipient = recipient or self.cfg.dmarc_rua_recipient or mailbox
+        else:
+            recipient = recipient or mailbox
         svc, creds = self._gmail_service(mailbox)
         list_http = self._new_http(creds)
-        query = f"to:{mailbox} after:{int(start.timestamp())}"
+        query = f"to:{recipient} after:{int(start.timestamp())}"
 
         def _fetch_one(message_id: str) -> list[dict] | None:
             """Fetch+parse one message's attachment; None on a tolerated per-message failure."""
@@ -997,7 +1013,7 @@ class DomainClient:
             raise GwsAuthError(f"[{self.domain}] auth failed for {mailbox}: {e}") from e
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (gmail, {mailbox}): {type(e).__name__}") from e
-        return records, bool(token), message_errors, mailbox
+        return records, bool(token), message_errors, mailbox, recipient
 
     def get_group_settings(self, group_email: str) -> dict | None:
         """Fetch one Google Group's own posting/delivery policy (Groups Settings API).

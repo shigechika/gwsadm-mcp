@@ -78,3 +78,54 @@ def test_is_external():
     assert is_external("user@gmail.com", internal)
     assert is_external(None, internal)  # anonymous must count as external
     assert is_external("not-an-address", internal)
+
+
+def test_dmarc_rua_defaults_to_postmaster_for_both_mailbox_and_recipient(tmp_path):
+    p = tmp_path / "config.ini"
+    p.write_text(GOOD)
+    domains, _ = load_config(str(p))
+    assert domains[0].dmarc_rua_mailbox == "postmaster@example.edu"
+    assert domains[0].dmarc_rua_recipient == "postmaster@example.edu"
+
+
+def test_dmarc_rua_recipient_defaults_to_explicit_mailbox(tmp_path):
+    p = tmp_path / "config.ini"
+    p.write_text(GOOD.replace("customer_id = C0abc", "customer_id = C0abc\ndmarc_rua_mailbox = dmarc-bot@example.edu"))
+    domains, _ = load_config(str(p))
+    assert domains[0].dmarc_rua_mailbox == "dmarc-bot@example.edu"
+    assert domains[0].dmarc_rua_recipient == "dmarc-bot@example.edu"
+
+
+def test_dmarc_rua_recipient_parsed_separately_from_mailbox(tmp_path):
+    p = tmp_path / "config.ini"
+    p.write_text(
+        GOOD.replace(
+            "customer_id = C0abc",
+            "customer_id = C0abc\ndmarc_rua_mailbox = dmarc-bot@example.edu\n"
+            "dmarc_rua_recipient = postmaster+rua@example.edu",
+        )
+    )
+    domains, _ = load_config(str(p))
+    assert domains[0].dmarc_rua_mailbox == "dmarc-bot@example.edu"
+    assert domains[0].dmarc_rua_recipient == "postmaster+rua@example.edu"
+
+
+def test_dmarc_rua_mailbox_none_opts_out_case_insensitively(tmp_path):
+    p = tmp_path / "config.ini"
+    p.write_text(GOOD.replace("customer_id = C0def", "customer_id = C0def\ndmarc_rua_mailbox = NONE"))
+    domains, _ = load_config(str(p))
+    assert domains[1].dmarc_rua_mailbox is None
+    assert domains[1].dmarc_rua_recipient is None
+    assert domains[0].dmarc_rua_mailbox == "postmaster@example.edu"  # other sections unaffected
+
+
+def test_dmarc_rua_recipient_without_mailbox_is_a_config_error(tmp_path):
+    p = tmp_path / "config.ini"
+    p.write_text(
+        GOOD.replace(
+            "customer_id = C0def",
+            "customer_id = C0def\ndmarc_rua_mailbox = none\ndmarc_rua_recipient = postmaster+rua@example.edu",
+        )
+    )
+    with pytest.raises(ConfigError, match="dmarc_rua_recipient"):
+        load_config(str(p))

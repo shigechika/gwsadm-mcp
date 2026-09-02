@@ -24,7 +24,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `drive_doc_activity` | Reports API `drive` をサーバー側 `doc_id` フィルタで — **特定1文書**の所有者・ACL 変更・ライフサイクル履歴。`drive_external_sharing` の検知トリアージ用： 所有者（個人か共有ドライブ名か）で「共有ドライブ内のファイル作成が既存メンバーへの ACL 伝播として一括外部共有に見える」誤検知クラスを切り分ける |
 | `shared_drive_membership_changes` | Reports API `drive`（`shared_drive_membership_change`）— 共有ドライブのメンバー追加/削除/ロール変更の履歴。対象メンバーの外部判定と、クライアント側ドライブ名フィルタ付き |
 | `gmail_message_trace` | Gmail API — **既知の** Message-ID が**特定の**メールボックスに届いたか、届いたならどこに入っているか（受信トレイ/迷惑メール/ゴミ箱/アーカイブ）を確認する。宛先ごとに DWD でそのユーザーになりすまし、本人のメールボックスを検索する。別付与の `gmail.readonly` DWD スコープが必要（下記「認証方式」参照）。未付与のドメインは宛先ごとのエラーとして報告され、誤って「届いていない」扱いにはならない |
-| `dmarc_rua_summary` | Gmail API — DMARC 集約（RUA）レポートのドメイン別 PASS/FAIL 集計と、reject 候補となる送信元IPの上位一覧。ドメインの設定値 `dmarc_rua_mailbox`（既定 `postmaster@<domain>`）になりすまし、レポートメールの添付を読む。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープを使うが、こちらは（メタデータだけでなく）添付内容＝レポートXMLを実際に読む点が異なる — 下記「認証方式」参照 |
+| `dmarc_rua_summary` | Gmail API — DMARC 集約（RUA）レポートのドメイン別 PASS/FAIL 集計と、reject 候補となる送信元IPの上位一覧。ドメインの設定値 `dmarc_rua_mailbox`（実ユーザー。既定 `postmaster@<domain>`）になりすまし、`dmarc_rua_recipient`（公開している `rua=` 宛先、例 `postmaster+rua@`。既定は mailbox と同じ）宛のメールを検索してレポートの添付を読む。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープを使うが、こちらは（メタデータだけでなく）添付内容＝レポートXMLを実際に読む点が異なる — 下記「認証方式」参照 |
 | `group_delivery_policy` | Groups Settings API — Google グループ自体の投稿/配送ポリシー（`who_can_post`、`allow_external_members`、モデレーションレベル）。グループのアクセス制御は Gmail 配送の**手前**にある： 学内限定の投稿ポリシーは外部送信者のメールを、Gmail の配送イベントが1件も生成されないまま静かに落とす — ポリシーを直接読まない限り配送失敗と見分けがつかない。別付与の `apps.groups.settings` DWD スコープが必要（下記「認証方式」参照） |
 | `list_group_members` | Directory API — Google グループの基本情報とメンバー一覧を直接取得する。特定のメッセージがたまたま誰に届いたかから推測するのではない。別付与の `admin.directory.group.readonly` と `admin.directory.group.member.readonly` DWD スコープが必要（下記「認証方式」参照） |
 | `daily_brief` | 設定済み全ドメインを横断した一括サマリ |
@@ -140,15 +140,22 @@ internal_domains = example.edu, mail.example.edu
 service_account_file = /path/to/service-account.json
 subject = audit-admin@example.edu
 customer_id = C0xxxxxxx
-dmarc_rua_mailbox = postmaster@example.edu   # 省略可。既定値: postmaster@<domain>
+dmarc_rua_mailbox = postmaster@example.edu   # 省略可。既定値: postmaster@<domain>。"none" で対象外
+dmarc_rua_recipient = postmaster+rua@example.edu   # 省略可。既定値: dmarc_rua_mailbox と同じ
 ```
 
 監査対象の Workspace ドメインごとに1つの `[domain.*]` セクションを置く。
 `internal_domains` は共有先を内部/外部に分類するための許可リスト。
 `dmarc_rua_mailbox` は `dmarc_rua_summary` がDMARC集約レポートを読むためになりすます
-メールボックス — 通常は `subject` と同じ受信箱で、`postmaster+rua@` というGmailの
-プラスサブアドレス宛のメールを受け取っている想定。デプロイのたびに書く手間を省くため、
-既定値は `postmaster@` としている。
+**実ユーザー**（ドメイン全体の委任はグループやエイリアスにはなりすませない）。
+`dmarc_rua_recipient` はレポートの宛先（ドメインの `_dmarc` レコードに公開している
+`rua=mailto:` の値）で、Gmail 検索の絞り込み（`to:<recipient>`）にだけ使う。既定値は
+mailbox と同じ。公開している宛先が `postmaster+rua@` のような Gmail のプラスサブアドレス
+（この絞り込みにより `postmaster+ruf@` 宛の `ruf=` 失敗レポートも集計から外れる）や、
+なりすまし先の受信箱へ配送されるグループのときに設定する。`dmarc_rua_mailbox = none` で
+そのドメインを DMARC 読み取りの対象外にできる — 例えば `rua=` が別ドメインのメールボックス
+宛で、そちらの `[domain.*]` セクションが既に読んでいる場合。レポートは各レポートが名乗る
+ポリシードメインごとに集計されるので、そのセクションの結果に含まれる。
 
 ## 使い方
 
