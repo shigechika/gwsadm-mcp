@@ -973,7 +973,7 @@ def test_fetch_dmarc_rua_records_happy_path_parses_and_defaults_mailbox():
         get_by_id={"m1": {"payload": {"body": {"attachmentId": "att1"}}}},
         attachments_by_id={"att1": _gzip_b64(xml)},
     )
-    records, capped, message_errors, mailbox = c.fetch_dmarc_rua_records(
+    records, capped, message_errors, mailbox, recipient = c.fetch_dmarc_rua_records(
         start=datetime.datetime.now(datetime.timezone.utc)
     )
     assert records == [
@@ -990,6 +990,7 @@ def test_fetch_dmarc_rua_records_happy_path_parses_and_defaults_mailbox():
     assert capped is False
     assert message_errors == 0
     assert mailbox == "postmaster@example.edu"  # CFG.dmarc_rua_mailbox default
+    assert recipient == "postmaster@example.edu"  # recipient unset -> same as mailbox
     assert "to:postmaster@example.edu" in messages.list_calls[0]["q"]
 
 
@@ -997,10 +998,11 @@ def test_fetch_dmarc_rua_records_honors_explicit_mailbox_override():
     import datetime
 
     c, messages = _dmarc_client(list_pages=[{"messages": []}])
-    _, _, _, mailbox = c.fetch_dmarc_rua_records(
+    _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(
         start=datetime.datetime.now(datetime.timezone.utc), mailbox="dmarc-reports@example.edu"
     )
     assert mailbox == "dmarc-reports@example.edu"
+    assert recipient == "dmarc-reports@example.edu"  # an overridden inbox is searched on its own address
     assert "to:dmarc-reports@example.edu" in messages.list_calls[0]["q"]
 
 
@@ -1011,7 +1013,7 @@ def test_fetch_dmarc_rua_records_message_with_no_attachment_counts_as_error():
         list_pages=[{"messages": [{"id": "m1"}]}],
         get_by_id={"m1": {"payload": {"body": {}}}},  # no attachmentId anywhere
     )
-    records, _, message_errors, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
     assert records == []
     assert message_errors == 1
 
@@ -1024,7 +1026,7 @@ def test_fetch_dmarc_rua_records_malformed_attachment_counts_as_error_not_raise(
         get_by_id={"m1": {"payload": {"body": {"attachmentId": "att1"}}}},
         attachments_by_id={"att1": "not-valid-base64-or-xml!!!"},
     )
-    records, _, message_errors, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
     assert records == []
     assert message_errors == 1
 
@@ -1033,7 +1035,7 @@ def test_fetch_dmarc_rua_records_capped_when_more_pages_exist_than_max_pages():
     import datetime
 
     c, _ = _dmarc_client(list_pages=[{"messages": [], "nextPageToken": "tok2"}])
-    _, capped, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc), max_pages=1)
+    _, capped, _, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc), max_pages=1)
     assert capped is True
 
 
@@ -1041,7 +1043,7 @@ def test_fetch_dmarc_rua_records_not_capped_when_no_more_pages():
     import datetime
 
     c, _ = _dmarc_client(list_pages=[{"messages": []}])
-    _, capped, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc), max_pages=5)
+    _, capped, _, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc), max_pages=5)
     assert capped is False
 
 
@@ -1108,7 +1110,7 @@ def test_fetch_dmarc_rua_records_one_bad_message_does_not_lose_other_records():
         },
         attachments_by_id={"att-good": _gzip_b64(good_xml)},
     )
-    records, _, message_errors, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
     assert len(records) == 1
     assert records[0]["source_ip"] == "9.9.9.9"
     assert message_errors == 1
@@ -1322,3 +1324,70 @@ def test_fetch_customer_usage_params_match_discovery_schema():
     # a typo like ``page_token`` is only caught while the key is still present.
     real = build("admin", "reports_v1", static_discovery=True, developerKey="unused")
     real.customerUsageReports().get(**calls[0])  # raises TypeError on an unknown/invalid kwarg
+
+
+def _dmarc_client_recording_impersonation(cfg, list_pages):
+    """Like _dmarc_client, but records which user_email the Gmail service was built for."""
+    messages = FakeGmailMessagesResourceDmarc(list_pages, {}, FakeGmailAttachmentsResource({}, None), None, None)
+    svc = FakeGmailUsersResource(messages)
+    impersonated = []
+
+    class _Svc:
+        def users(self):
+            return svc
+
+    def factory(user_email):
+        impersonated.append(user_email)
+        return _Svc()
+
+    return DomainClient(cfg, gmail_service_factory=factory), messages, impersonated
+
+
+def test_fetch_dmarc_rua_records_impersonates_mailbox_but_searches_recipient():
+    """The user impersonated (a real inbox DWD can act as) and the address the reports are
+    addressed to (a plus-subaddress or a group) are different things; searching on the
+    published rua= address also keeps ruf= failure reports (postmaster+ruf@) out of the parse."""
+    import datetime
+
+    cfg = DomainConfig(
+        "example.edu",
+        "/tmp/sa.json",
+        "audit-admin@example.edu",
+        "C0abc",
+        "dmarc-bot@example.edu",
+        "postmaster+rua@example.edu",
+    )
+    c, messages, impersonated = _dmarc_client_recording_impersonation(cfg, [{"messages": []}])
+    _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    assert impersonated == ["dmarc-bot@example.edu"]
+    assert mailbox == "dmarc-bot@example.edu"
+    assert recipient == "postmaster+rua@example.edu"
+    assert messages.list_calls[0]["q"].startswith("to:postmaster+rua@example.edu ")
+    assert "dmarc-bot@" not in messages.list_calls[0]["q"]
+
+
+def test_fetch_dmarc_rua_records_explicit_recipient_override_wins():
+    import datetime
+
+    c, messages = _dmarc_client(list_pages=[{"messages": []}])
+    _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(
+        start=datetime.datetime.now(datetime.timezone.utc), recipient="postmaster+rua@example.edu"
+    )
+    assert mailbox == "postmaster@example.edu"
+    assert recipient == "postmaster+rua@example.edu"
+    assert "to:postmaster+rua@example.edu" in messages.list_calls[0]["q"]
+
+
+def test_fetch_dmarc_rua_records_opted_out_domain_raises_without_override():
+    import datetime
+
+    cfg = DomainConfig("example.edu", "/tmp/sa.json", "audit-admin@example.edu", "C0abc", None)
+    c, _, impersonated = _dmarc_client_recording_impersonation(cfg, [{"messages": []}])
+    with pytest.raises(GwsError, match="disabled"):
+        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    assert impersonated == []  # never touched Gmail
+    # ...but an explicit mailbox override re-enables the read for an ad-hoc check.
+    _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(
+        start=datetime.datetime.now(datetime.timezone.utc), mailbox="dmarc-reports@example.edu"
+    )
+    assert (mailbox, recipient) == ("dmarc-reports@example.edu", "dmarc-reports@example.edu")

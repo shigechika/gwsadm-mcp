@@ -27,7 +27,7 @@ anything.
 | `drive_doc_activity` | Reports API `drive` with a server-side `doc_id` filter — **one document's** owner, ACL changes, and lifecycle events. Triage companion to `drive_external_sharing`: the owner (an individual vs. a shared drive's name) disambiguates the shared-drive false-positive class, where files created inside a shared drive propagate member ACLs and read as bulk external sharing |
 | `shared_drive_membership_changes` | Reports API `drive` (`shared_drive_membership_change`) — who added/removed/re-roled shared-drive members and when, with external classification of the affected member and a client-side drive-name filter |
 | `gmail_message_trace` | Gmail API — did a **known** Message-ID reach **specific** mailboxes, and where (inbox/spam/trash/archived)? For each recipient it impersonates that user via DWD and searches their own mailbox. Requires the separate `gmail.readonly` DWD scope (see Auth model below); a domain missing that grant reports a per-recipient error, never a false "not found" |
-| `dmarc_rua_summary` | Gmail API — DMARC aggregate (RUA) report pass/fail summary and top reject-candidate source IPs, per domain. Impersonates the domain's configured `dmarc_rua_mailbox` (default `postmaster@<domain>`) and reads the compressed report attachments those messages carry. Shares `gmail_message_trace`'s `gmail.readonly` DWD scope, but unlike that tool this one DOES read attachment content (the report XML), not just metadata — see Auth model below |
+| `dmarc_rua_summary` | Gmail API — DMARC aggregate (RUA) report pass/fail summary and top reject-candidate source IPs, per domain. Impersonates the domain's configured `dmarc_rua_mailbox` (a real user; default `postmaster@<domain>`), searches it for mail addressed to `dmarc_rua_recipient` (the published `rua=` address, e.g. `postmaster+rua@`; default: the mailbox) and reads the compressed report attachments those messages carry. Shares `gmail_message_trace`'s `gmail.readonly` DWD scope, but unlike that tool this one DOES read attachment content (the report XML), not just metadata — see Auth model below |
 | `group_delivery_policy` | Groups Settings API — a Google Group's own posting/delivery policy (`who_can_post`, `allow_external_members`, moderation levels). A group's access control sits **in front of** Gmail delivery: a domain-only posting policy silently drops an external sender's mail before it generates any Gmail delivery event at all, indistinguishable from a delivery failure without reading the policy directly. Requires the separate `apps.groups.settings` DWD scope (see Auth model below) |
 | `list_group_members` | Directory API — a Google Group's basic metadata and member roster, resolved directly rather than inferred from who happened to receive one particular message. Requires the separate `admin.directory.group.readonly` and `admin.directory.group.member.readonly` DWD scopes (see Auth model below) |
 | `daily_brief` | One-call summary across all configured domains |
@@ -150,16 +150,24 @@ internal_domains = example.edu, mail.example.edu
 service_account_file = /path/to/service-account.json
 subject = audit-admin@example.edu
 customer_id = C0xxxxxxx
-dmarc_rua_mailbox = postmaster@example.edu   # optional, default: postmaster@<domain>
+dmarc_rua_mailbox = postmaster@example.edu   # optional, default: postmaster@<domain>; "none" opts out
+dmarc_rua_recipient = postmaster+rua@example.edu   # optional, default: same as dmarc_rua_mailbox
 ```
 
 One `[domain.*]` section per audited Workspace domain. `internal_domains` is
 the allowlist used to classify sharing targets as internal vs external.
-`dmarc_rua_mailbox` is the mailbox `dmarc_rua_summary` impersonates to read
-DMARC aggregate reports — usually the same inbox `subject` receives mail
-addressed to a `postmaster+rua@` Gmail plus-subaddress, which is why the
-default assumes `postmaster@` rather than requiring every deployment to
-spell it out.
+`dmarc_rua_mailbox` is the real user `dmarc_rua_summary` impersonates to read
+DMARC aggregate reports — domain-wide delegation can only act as an actual user,
+never as a group or alias. `dmarc_rua_recipient` is the address the reports are
+sent to (the `rua=mailto:` value published in the domain's `_dmarc` record) and
+is used only to narrow the Gmail search (`to:<recipient>`); it defaults to the
+mailbox. Set it when the published address is a Gmail plus-subaddress such as
+`postmaster+rua@` (searching on it also keeps `ruf=` failure reports sent to
+`postmaster+ruf@` out of the aggregate parse) or a group that fans out to the
+impersonated inbox. `dmarc_rua_mailbox = none` opts a domain out of DMARC reading
+— e.g. when its `rua=` points at another domain's mailbox that a different
+`[domain.*]` section already reads; reports are grouped by the policy domain each
+report names, so they still appear under that other section.
 
 ## Usage
 
