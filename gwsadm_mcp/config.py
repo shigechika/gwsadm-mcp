@@ -71,7 +71,16 @@ def load_config(path: str | None = None) -> tuple[list[DomainConfig], set[str]]:
     file, missing keys, or zero ``[domain.*]`` sections.
     """
     path = path or config_path()
-    cp = configparser.ConfigParser()
+    # Strip trailing ``# ...`` / ``; ...`` comments from values. Every example in
+    # this docstring, the README and docs/setup annotates its keys that way, so
+    # without this a copied line keeps the comment IN the value -- and the
+    # failures are silent rather than loud: ``dmarc_rua_mailbox = none  # ...``
+    # stops matching the opt-out sentinel and is treated as a literal mailbox,
+    # and a commented ``dmarc_rua_recipient`` smuggles extra terms into the Gmail
+    # search, returning an empty summary with no error. configparser only treats
+    # a prefix as a comment when whitespace precedes it, so a value that legitimately
+    # contains ``#``/``;`` mid-token (none do today) is left alone.
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
     if not cp.read(path):
         raise ConfigError(f"config not found: {path} (set GWSADM_CONFIG)")
     domains: list[DomainConfig] = []

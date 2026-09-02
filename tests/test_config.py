@@ -129,3 +129,58 @@ def test_dmarc_rua_recipient_without_mailbox_is_a_config_error(tmp_path):
     )
     with pytest.raises(ConfigError, match="dmarc_rua_recipient"):
         load_config(str(p))
+
+
+def test_inline_comments_are_stripped_from_values(tmp_path):
+    """Every documented example annotates its keys with a trailing comment.
+
+    Copying one verbatim must not put the comment INSIDE the value: the failures
+    are silent, not loud -- a commented ``dmarc_rua_mailbox = none`` stops matching
+    the opt-out sentinel and becomes a literal mailbox, and a commented recipient
+    smuggles extra terms into the Gmail search behind ``to:``.
+    """
+    p = tmp_path / "config.ini"
+    p.write_text(
+        "[domain.example.edu]\n"
+        "service_account_file = /tmp/sa.json   # the key downloaded from GCP\n"
+        "subject = audit-admin@example.edu     ; an admin who can be impersonated\n"
+        "customer_id = C0abc\n"
+        'dmarc_rua_mailbox = none   # optional, default: postmaster@<domain>; "none" opts out\n'
+    )
+    domains, _ = load_config(str(p))
+    d = domains[0]
+    assert d.service_account_file == "/tmp/sa.json"
+    assert d.subject == "audit-admin@example.edu"
+    assert d.dmarc_rua_mailbox is None  # the sentinel still opts the domain out
+    assert d.dmarc_rua_recipient is None
+
+
+def test_inline_comment_stripping_keeps_recipient_usable_in_a_search(tmp_path):
+    p = tmp_path / "config.ini"
+    p.write_text(
+        "[domain.example.edu]\n"
+        "service_account_file = /tmp/sa.json\n"
+        "subject = audit-admin@example.edu\n"
+        "customer_id = C0abc\n"
+        "dmarc_rua_mailbox = dmarc-bot@example.edu       # the real user to impersonate\n"
+        "dmarc_rua_recipient = postmaster+rua@example.edu ; the published rua= address\n"
+    )
+    domains, _ = load_config(str(p))
+    d = domains[0]
+    assert d.dmarc_rua_mailbox == "dmarc-bot@example.edu"
+    assert d.dmarc_rua_recipient == "postmaster+rua@example.edu"
+    # nothing that would change the meaning of ``to:{recipient} after:...``
+    assert not any(ch.isspace() for ch in d.dmarc_rua_recipient)
+
+
+def test_a_value_containing_a_hash_mid_token_is_not_truncated(tmp_path):
+    """configparser only treats #/; as a comment when whitespace precedes it."""
+    p = tmp_path / "config.ini"
+    p.write_text(
+        "[domain.example.edu]\n"
+        "service_account_file = /tmp/sa#1.json\n"
+        "subject = audit-admin@example.edu\n"
+        "customer_id = C0abc\n"
+    )
+    domains, _ = load_config(str(p))
+    assert domains[0].service_account_file == "/tmp/sa#1.json"
