@@ -137,6 +137,8 @@ def test_fetch_customer_usage_paginates_and_passes_params():
     assert u.calls[0]["date"] == "2026-08-30"
     assert u.calls[0]["customerId"] == "C0abc"
     assert u.calls[0]["parameters"] == "gmail:num_emails_sent"
+    # customerUsageReports.get has no maxResults parameter; sending it is a client-side TypeError
+    assert "maxResults" not in u.calls[0]
     assert u.calls[1]["pageToken"] == "tok"
 
 
@@ -1279,3 +1281,44 @@ def test_fetch_activities_passes_filters_only_when_set():
     assert a.calls[0]["filters"] == "doc_id==abc123defg"
     c.fetch_activities("drive", start=start)
     assert "filters" not in a.calls[1]
+
+
+def test_fetch_customer_usage_params_match_discovery_schema():
+    """Guard against sending parameters the real API does not accept.
+
+    The mocks above accept any kwargs, so a bogus parameter (e.g. ``maxResults``,
+    which ``customerUsageReports.get`` does not define -- shipped in 0.15.0 and
+    failed on first live call) passes every mock test. The bundled static
+    discovery document validates kwargs client-side without network or
+    credentials, so build the real service and make sure every key we send is
+    accepted.
+
+    ``parameters`` carries its own pattern in that schema, so this replays the
+    production constant rather than a literal: a typo in
+    ``GMAIL_USAGE_PARAMETERS`` (e.g. ``email:`` for ``gmail:``) is rejected by
+    the same check, and hardcoding a known-good value here would let one ship
+    green and fail on the first live call -- the very failure this guards.
+    """
+    from googleapiclient.discovery import build
+
+    from gwsadm_mcp.server import GMAIL_USAGE_PARAMETERS
+
+    calls = []
+
+    class _Recorder:
+        def customerUsageReports(self):
+            return self
+
+        def get(self, **kw):
+            calls.append(kw)
+            return _Req({"usageReports": []})
+
+    c = DomainClient(CFG, reports_usage_service=_Recorder())
+    c.fetch_customer_usage(date="2026-08-30", parameters=GMAIL_USAGE_PARAMETERS)
+
+    # Replay EXACTLY what was sent -- including ``pageToken`` (None on the first
+    # page, which the validator accepts). Dropping a key here would stop that
+    # parameter's name from being checked at all, which is the whole point:
+    # a typo like ``page_token`` is only caught while the key is still present.
+    real = build("admin", "reports_v1", static_discovery=True, developerKey="unused")
+    real.customerUsageReports().get(**calls[0])  # raises TypeError on an unknown/invalid kwarg

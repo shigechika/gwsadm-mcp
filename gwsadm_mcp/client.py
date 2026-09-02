@@ -621,7 +621,10 @@ class DomainClient:
         :data:`SCOPE_REPORTS_USAGE`'s docstring for why this is a distinct
         grant from :data:`SCOPE_REPORTS` despite both being Reports API.
         """
-        params: dict = {"customerId": self.cfg.customer_id, "date": date, "maxResults": PAGE_SIZE}
+        # NOTE: no ``maxResults`` here -- ``customerUsageReports.get`` does not accept it
+        # (its discovery schema lists only customerId/date/pageToken/parameters), and the
+        # client raises ``TypeError: Got an unexpected keyword argument`` before any HTTP.
+        params: dict = {"customerId": self.cfg.customer_id, "date": date}
         if parameters:
             params["parameters"] = parameters
         reports: list[dict] = []
