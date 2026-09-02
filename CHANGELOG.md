@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.16.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.15.0...v0.16.0) (2026-09-02)
+
+
+### Features
+
+* **dmarc_rua_summary:** separate the impersonated mailbox from the searched recipient ([#84](https://github.com/shigechika/gwsadm-mcp/issues/84)) ([8f0c128](https://github.com/shigechika/gwsadm-mcp/commit/8f0c128b422c63d511e53cf956110469d6998f65))
+
+
+### Bug Fixes
+
+* **gmail_usage_report:** drop maxResults from customerUsageReports.get ([#83](https://github.com/shigechika/gwsadm-mcp/issues/83)) ([5e9c6f5](https://github.com/shigechika/gwsadm-mcp/commit/5e9c6f54a13c5f7ec546eea6a177622eb61b45b9))
+
 ## [0.15.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.14.1...v0.15.0) (2026-09-01)
 
 
