@@ -69,6 +69,9 @@ def _dmarc_reports(argv: list[str]) -> int:
     if until <= since:
         print("dmarc-reports: --until must be after --since", file=sys.stderr)
         return 2
+    if args.max_pages < 1:
+        print("dmarc-reports: --max-pages must be at least 1", file=sys.stderr)
+        return 2
     try:
         domains, _ = load_config()
     except ConfigError as e:
@@ -77,6 +80,12 @@ def _dmarc_reports(argv: list[str]) -> int:
     picked = [d for d in domains if d.domain == args.domain.strip().lower()]
     if not picked:
         print(f"dmarc-reports: unknown domain {args.domain!r}", file=sys.stderr)
+        return 2
+    if picked[0].dmarc_rua_mailbox is None:
+        print(
+            f"dmarc-reports: DMARC reading is disabled for {picked[0].domain} (dmarc_rua_mailbox = none)",
+            file=sys.stderr,
+        )
         return 2
     try:
         got = DomainClient(picked[0]).fetch_dmarc_reports(start=since, end=until, max_pages=args.max_pages)

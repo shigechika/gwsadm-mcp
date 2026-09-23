@@ -228,33 +228,62 @@ def _parse_dmarc_records(xml_bytes: bytes) -> list[dict]:
     return records
 
 
-def _find_attachment_ids(payload: dict) -> list[str]:
-    """Depth-first list of every attachment id in a Gmail message payload.
+# Largest decompressed report document accepted (per attachment / ZIP entry). The
+# RUA address is published in DNS, so anyone can mail it a small archive that
+# expands to gigabytes; real aggregate reports are a few MB at most.
+_DMARC_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 
-    ``_find_attachment_id`` takes the first one, which is right for the
-    summary tool; an archive that must not silently drop a report reads all
-    of them and lets the parser say which ones were reports.
+
+def _find_report_parts(payload: dict) -> list[tuple[str, str]]:
+    """Depth-first list of every part that may hold a report.
+
+    ``("id", attachmentId)`` for parts stored as attachments, and
+    ``("data", base64url)`` for a named or compressed/XML part whose content is
+    inline in ``body.data`` (Gmail inlines small parts). ``_find_attachment_id``
+    takes the first attachment, which is right for the summary tool; an archive
+    that must not silently drop a report reads all of them.
     """
-    found: list[str] = []
-    attachment_id = payload.get("body", {}).get("attachmentId")
-    if attachment_id:
-        found.append(attachment_id)
+    found: list[tuple[str, str]] = []
+    body = payload.get("body", {}) or {}
+    mime = (payload.get("mimeType") or "").lower()
+    if body.get("attachmentId"):
+        found.append(("id", body["attachmentId"]))
+    elif body.get("data") and (payload.get("filename") or any(k in mime for k in ("gzip", "zip", "xml"))):
+        found.append(("data", body["data"]))
     for part in payload.get("parts", []) or []:
-        found.extend(_find_attachment_ids(part))
+        found.extend(_find_report_parts(part))
     return found
 
 
-def _decode_report_payloads(raw: bytes) -> list[bytes]:
-    """Like ``_decode_report_payload`` but returns every ZIP entry, not the first."""
+def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) -> list[bytes | None]:
+    """Like ``_decode_report_payload`` but returns every ZIP entry, bounded in size.
+
+    An entry (or gzip stream) that would expand past ``limit`` is returned as
+    None instead of being materialised, so the caller counts it as a
+    non-report attachment rather than running out of memory.
+    """
     try:
-        return [gzip.decompress(raw)]
-    except (OSError, EOFError, zlib.error):
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        out = d.decompress(raw, limit + 1)
+        if d.unconsumed_tail or len(out) > limit:
+            return [None]
+        if d.eof:
+            return [out]
+    except zlib.error:
         pass
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            return [zf.read(name) for name in zf.namelist()] or [raw]
+            docs: list[bytes | None] = []
+            for info in zf.infolist():
+                if info.file_size > limit:
+                    docs.append(None)
+                    continue
+                with zf.open(info) as fh:
+                    data = fh.read(limit + 1)
+                docs.append(data if len(data) <= limit else None)
+            return docs or [raw]
     except zipfile.BadZipFile:
-        return [raw]
+        return [raw[: limit + 1]] if len(raw) <= limit else [None]
 
 
 def _strip_namespaces(root: ET.Element) -> ET.Element:
@@ -1148,8 +1177,10 @@ class DomainClient:
         ``message_errors`` counts messages that could not be fetched or held
         no attachment; ``non_report_attachments`` counts attachments that
         decoded to something other than an aggregate report (including
-        malformed XML). An auth failure (e.g. the gmail.readonly scope was
-        revoked) raises ``GwsAuthError`` instead of returning an empty result.
+        malformed XML, or a document that would expand past
+        ``_DMARC_MAX_DOCUMENT_BYTES``). Spam and trash are searched too. An
+        auth failure (e.g. the gmail.readonly scope was revoked) raises
+        ``GwsAuthError`` instead of returning an empty result.
         """
         if self.cfg.dmarc_rua_mailbox is None:
             raise GwsError(f"[{self.domain}] DMARC reading is disabled for this domain (dmarc_rua_mailbox = none)")
@@ -1162,25 +1193,28 @@ class DomainClient:
         def _fetch_one(message_id: str) -> tuple[list[dict], int] | None:
             http = self._new_http(creds)
             full = self._execute(lambda: svc.users().messages().get(userId="me", id=message_id, format="full"), http)
-            ids = _find_attachment_ids(full.get("payload", {}))
-            if not ids:
+            parts = _find_report_parts(full.get("payload", {}))
+            if not parts:
                 return None
             reports, non_report = [], 0
-            for attachment_id in ids:
-                att = self._execute(
-                    lambda aid=attachment_id: (
-                        svc.users().messages().attachments().get(userId="me", messageId=message_id, id=aid)
-                    ),
-                    http,
-                )
-                data = att.get("data") or ""
+            for kind, ref in parts:
+                if kind == "id":
+                    att = self._execute(
+                        lambda aid=ref: (
+                            svc.users().messages().attachments().get(userId="me", messageId=message_id, id=aid)
+                        ),
+                        http,
+                    )
+                    data = att.get("data") or ""
+                else:
+                    data = ref
                 if not data:
                     non_report += 1
                     continue
                 padded = data + "=" * (-len(data) % 4)
                 for doc in _decode_report_payloads(base64.urlsafe_b64decode(padded)):
                     try:
-                        report = _parse_dmarc_report(doc)
+                        report = _parse_dmarc_report(doc) if doc is not None else None
                     except ET.ParseError:
                         report = None
                     if report is None:
@@ -1198,7 +1232,14 @@ class DomainClient:
                     lambda tok=token: (
                         svc.users()
                         .messages()
-                        .list(userId="me", q=query, maxResults=_DMARC_MESSAGE_LIST_PAGE_SIZE, pageToken=tok)
+                        .list(
+                            userId="me",
+                            q=query,
+                            maxResults=_DMARC_MESSAGE_LIST_PAGE_SIZE,
+                            pageToken=tok,
+                            # a report Gmail filed as spam (or someone trashed) still arrived
+                            includeSpamTrash=True,
+                        )
                     ),
                     list_http,
                 )

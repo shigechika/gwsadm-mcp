@@ -1455,9 +1455,47 @@ def test_decode_report_payloads_returns_every_zip_entry():
     assert client._decode_report_payloads(buf.getvalue()) == [b"<a/>", b"<b/>"]
 
 
-def test_find_attachment_ids_lists_all():
-    payload = {"parts": [{"body": {"attachmentId": "a1"}}, {"parts": [{"body": {"attachmentId": "a2"}}]}]}
-    assert client._find_attachment_ids(payload) == ["a1", "a2"]
+def test_find_report_parts_lists_attachments_and_inline_parts():
+    payload = {
+        "parts": [
+            {"body": {"attachmentId": "a1"}},
+            {"parts": [{"body": {"attachmentId": "a2"}}]},
+            {"mimeType": "application/gzip", "filename": "r.xml.gz", "body": {"data": "ZGF0YQ"}},
+            {"mimeType": "text/plain", "body": {"data": "aGVsbG8"}},  # the message text, not a report
+        ]
+    }
+    assert client._find_report_parts(payload) == [("id", "a1"), ("id", "a2"), ("data", "ZGF0YQ")]
+
+
+def test_decode_report_payloads_refuses_documents_past_the_limit():
+    import gzip
+    import io
+    import zipfile
+
+    big = b"<feedback>" + b" " * 2000 + b"</feedback>"
+    assert client._decode_report_payloads(gzip.compress(big), limit=1000) == [None]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("big.xml", big)
+        zf.writestr("small.xml", b"<a/>")
+    assert client._decode_report_payloads(buf.getvalue(), limit=1000) == [None, b"<a/>"]
+
+
+def test_fetch_dmarc_reports_reads_inline_report_parts():
+    start, end = _window()
+    import base64
+
+    inline = base64.urlsafe_b64encode(__import__("gzip").compress(_REPORT_XML)).decode().rstrip("=")
+    c, _ = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_by_id={
+            "m1": {
+                "payload": {"parts": [{"mimeType": "application/gzip", "filename": "r.gz", "body": {"data": inline}}]}
+            }
+        },
+    )
+    got = c.fetch_dmarc_reports(start=start, end=end)
+    assert [r["report_id"] for r in got["reports"]] == ["123"] and got["message_errors"] == 0
 
 
 def _window():
@@ -1475,6 +1513,7 @@ def test_fetch_dmarc_reports_bounds_both_ends_and_reads_every_attachment():
         attachments_by_id={"a1": _gzip_b64(_REPORT_XML), "a2": _gzip_b64(b"<html/>")},
     )
     got = c.fetch_dmarc_reports(start=start, end=end)
+    assert messages.list_calls[0].get("includeSpamTrash") is True
     q = messages.list_calls[0]["q"]
     assert f"after:{int(start.timestamp())}" in q and f"before:{int(end.timestamp())}" in q
     assert [r["report_id"] for r in got["reports"]] == ["123"]
