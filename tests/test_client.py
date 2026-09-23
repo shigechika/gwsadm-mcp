@@ -1391,3 +1391,242 @@ def test_fetch_dmarc_rua_records_opted_out_domain_raises_without_override():
         start=datetime.datetime.now(datetime.timezone.utc), mailbox="dmarc-reports@example.edu"
     )
     assert (mailbox, recipient) == ("dmarc-reports@example.edu", "dmarc-reports@example.edu")
+
+
+# -- fetch_dmarc_reports / _parse_dmarc_report (archive CLI) ------------------
+
+_REPORT_XML = b"""<?xml version="1.0"?>
+<feedback xmlns="urn:ietf:params:xml:ns:dmarc-2.0">
+  <report_metadata><org_name>google.com</org_name><report_id>123</report_id>
+    <date_range><begin>1758585600</begin><end>1758671999</end></date_range></report_metadata>
+  <policy_published><domain>example.edu</domain><p>quarantine</p><sp>none</sp><pct>100</pct>
+    <adkim>r</adkim><aspf>r</aspf></policy_published>
+  <record><row><source_ip>192.0.2.1</source_ip><count>4</count>
+    <policy_evaluated><disposition>quarantine</disposition><dkim>fail</dkim><spf>fail</spf>
+      <reason><type>forwarded</type><comment>via list</comment></reason></policy_evaluated></row>
+    <identifiers><header_from>sub.example.edu</header_from><envelope_from>list.example.org</envelope_from></identifiers>
+    <auth_results><dkim><domain>example.edu</domain><result>fail</result></dkim>
+      <spf><domain>list.example.org</domain><result>pass</result></spf></auth_results></record>
+  <record><row><source_ip>192.0.2.2</source_ip><count>x</count>
+    <policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>pass</spf></policy_evaluated></row>
+    <identifiers><header_from>example.edu</header_from></identifiers></record>
+</feedback>"""
+
+
+def test_parse_dmarc_report_keeps_metadata_reasons_and_auth_results():
+    r = client._parse_dmarc_report(_REPORT_XML)
+    assert r["org_name"] == "google.com" and r["report_id"] == "123"
+    assert (r["begin"], r["end"]) == (1758585600, 1758671999)
+    assert r["policy"] == {
+        "domain": "example.edu",
+        "p": "quarantine",
+        "sp": "none",
+        "pct": "100",
+        "adkim": "r",
+        "aspf": "r",
+    }
+    assert r["dropped_records"] == 1  # the record with count "x"
+    (rec,) = r["records"]
+    assert rec["reason"] == [{"type": "forwarded", "comment": "via list"}]
+    assert rec["header_from"] == "sub.example.edu" and rec["envelope_from"] == "list.example.org"
+    assert rec["auth_results"] == {
+        "dkim": [{"domain": "example.edu", "result": "fail"}],
+        "spf": [{"domain": "list.example.org", "result": "pass"}],
+    }
+
+
+def test_parse_dmarc_report_returns_none_for_non_report_xml():
+    assert client._parse_dmarc_report(b"<html><body>not a report</body></html>") is None
+
+
+def test_parse_dmarc_records_is_unchanged_by_the_archive_parser():
+    # the summary tool's parser still returns its original, flat shape (and ignores namespaces it never handled)
+    assert client._parse_dmarc_records(_dmarc_xml("example.edu", [])) == []
+
+
+def test_decode_report_payloads_returns_every_zip_entry():
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.xml", b"<a/>")
+        zf.writestr("b.xml", b"<b/>")
+    assert client._decode_report_payloads(buf.getvalue()) == [b"<a/>", b"<b/>"]
+
+
+def test_find_report_parts_lists_attachments_and_inline_parts():
+    payload = {
+        "parts": [
+            {"body": {"attachmentId": "a1"}},
+            {"parts": [{"body": {"attachmentId": "a2"}}]},
+            {"mimeType": "application/gzip", "filename": "r.xml.gz", "body": {"data": "ZGF0YQ"}},
+            {"mimeType": "text/plain", "body": {"data": "aGVsbG8"}},  # the message text, not a report
+        ]
+    }
+    assert client._find_report_parts(payload) == [("id", "a1"), ("id", "a2"), ("data", "ZGF0YQ")]
+
+
+def test_decode_report_payloads_refuses_documents_past_the_limit():
+    import gzip
+    import io
+    import zipfile
+
+    big = b"<feedback>" + b" " * 2000 + b"</feedback>"
+    assert client._decode_report_payloads(gzip.compress(big), limit=1000) == [None]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("big.xml", big)
+        zf.writestr("small.xml", b"<a/>")
+    assert client._decode_report_payloads(buf.getvalue(), limit=1000) == [None, b"<a/>"]
+
+
+def test_fetch_dmarc_reports_reads_inline_report_parts():
+    start, end = _window()
+    import base64
+
+    inline = base64.urlsafe_b64encode(__import__("gzip").compress(_REPORT_XML)).decode().rstrip("=")
+    c, _ = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_by_id={
+            "m1": {
+                "payload": {"parts": [{"mimeType": "application/gzip", "filename": "r.gz", "body": {"data": inline}}]}
+            }
+        },
+    )
+    got = c.fetch_dmarc_reports(start=start, end=end)
+    assert [r["report_id"] for r in got["reports"]] == ["123"] and got["message_errors"] == 0
+
+
+def _window():
+    import datetime
+
+    s = datetime.datetime(2026, 9, 20, tzinfo=datetime.timezone.utc)
+    return s, s + datetime.timedelta(days=3)
+
+
+def test_fetch_dmarc_reports_bounds_both_ends_and_reads_every_attachment():
+    start, end = _window()
+    c, messages = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_by_id={"m1": {"payload": {"parts": [{"body": {"attachmentId": "a1"}}, {"body": {"attachmentId": "a2"}}]}}},
+        attachments_by_id={"a1": _gzip_b64(_REPORT_XML), "a2": _gzip_b64(b"<html/>")},
+    )
+    got = c.fetch_dmarc_reports(start=start, end=end)
+    assert messages.list_calls[0].get("includeSpamTrash") is True
+    q = messages.list_calls[0]["q"]
+    assert f"after:{int(start.timestamp())}" in q and f"before:{int(end.timestamp())}" in q
+    assert [r["report_id"] for r in got["reports"]] == ["123"]
+    assert got["non_report_attachments"] == 1
+    assert got["dropped_records"] == 1
+    assert got["messages"] == 1 and got["message_errors"] == 0 and got["capped"] is False
+
+
+def test_fetch_dmarc_reports_message_without_attachment_is_an_error():
+    start, end = _window()
+    c, _ = _dmarc_client(list_pages=[{"messages": [{"id": "m1"}]}], get_by_id={"m1": {"payload": {"body": {}}}})
+    assert c.fetch_dmarc_reports(start=start, end=end)["message_errors"] == 1
+
+
+def test_fetch_dmarc_reports_capped():
+    start, end = _window()
+    c, _ = _dmarc_client(list_pages=[{"messages": [], "nextPageToken": "t"}, {"messages": []}])
+    assert c.fetch_dmarc_reports(start=start, end=end, max_pages=1)["capped"] is True
+
+
+def test_fetch_dmarc_reports_disabled_domain_raises():
+    import dataclasses
+
+    start, end = _window()
+    cfg = dataclasses.replace(CFG, dmarc_rua_mailbox=None)
+    with pytest.raises(GwsError):
+        DomainClient(cfg, gmail_service_factory=lambda u: None).fetch_dmarc_reports(start=start, end=end)
+
+
+def test_decode_report_payloads_caps_the_whole_zip_not_each_entry():
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i in range(4):
+            zf.writestr(f"{i}.xml", b"x" * 400)
+    # each entry fits the limit alone, but only two fit together
+    assert client._decode_report_payloads(buf.getvalue(), limit=1000) == [b"x" * 400, b"x" * 400, None, None]
+
+
+def test_decode_report_payloads_caps_zip_entry_count(monkeypatch):
+    import io
+    import zipfile
+
+    monkeypatch.setattr(client, "_DMARC_MAX_ZIP_ENTRIES", 2)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i in range(4):
+            zf.writestr(f"{i}.xml", b"<a/>")
+    assert client._zip_directory_ok(buf.getvalue()) is False
+    # refused from the end-of-central-directory record, before zipfile parses the directory
+    assert client._decode_report_payloads(buf.getvalue()) == [None]
+
+
+def test_zip_directory_size_is_checked_even_when_the_count_is_forged(monkeypatch):
+    import io
+    import zipfile
+
+    monkeypatch.setattr(client, "_DMARC_MAX_ZIP_DIRECTORY_BYTES", 100)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i in range(5):
+            zf.writestr(f"entry-{i}.xml", b"<a/>")
+    raw = bytearray(buf.getvalue())
+    at = raw.rfind(b"PK\x05\x06")
+    raw[at + 8 : at + 12] = b"\x00\x00\x00\x00"  # entries on disk / total entries forged to 0
+    assert client._zip_directory_ok(bytes(raw)) is False
+
+
+def test_decode_report_payloads_treats_an_encrypted_zip_entry_as_non_report():
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.xml", b"<a/>")
+        zf.writestr("secret.xml", b"<b/>")
+    raw = bytearray(buf.getvalue())
+    # flag the second entry as encrypted (general purpose bit 0) in its local header and central directory
+    name_at = [i for i in range(len(raw)) if raw.startswith(b"secret.xml", i)]
+    assert len(name_at) == 2  # local header, then central directory
+    for pos, sig, off in ((name_at[0], b"PK\x03\x04", 6), (name_at[1], b"PK\x01\x02", 8)):
+        at = raw.rfind(sig, 0, pos)
+        raw[at + off] |= 1
+    assert client._decode_report_payloads(bytes(raw)) == [b"<a/>", None]
+
+
+def test_zip64_locator_is_only_recognised_at_its_offset():
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.xml", b"<a/>")
+        zf.comment = b""
+    raw = buf.getvalue()
+    assert client._zip_directory_ok(raw) is True
+    # the same bytes inside the last entry's comment must not be mistaken for a locator
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w") as zf:
+        info = zipfile.ZipInfo("a.xml")
+        info.comment = b"xxPK\x06\x07yy"
+        zf.writestr(info, b"<a/>")
+    assert client._zip_directory_ok(buf2.getvalue()) is True
+
+
+def test_fetch_dmarc_reports_unknown_xml_encoding_is_a_non_report():
+    start, end = _window()
+    c, _ = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_by_id={"m1": {"payload": {"body": {"attachmentId": "a1"}}}},
+        attachments_by_id={"a1": _gzip_b64(b'<?xml version="1.0" encoding="bogus"?><feedback/>')},
+    )
+    got = c.fetch_dmarc_reports(start=start, end=end)
+    assert got["reports"] == [] and got["non_report_attachments"] == 1 and got["message_errors"] == 0
