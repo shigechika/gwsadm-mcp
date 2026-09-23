@@ -233,6 +233,7 @@ def _parse_dmarc_records(xml_bytes: bytes) -> list[dict]:
 # expands to gigabytes; real aggregate reports are a few MB at most.
 _DMARC_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 _DMARC_MAX_ZIP_ENTRIES = 20
+_DMARC_MAX_ZIP_DIRECTORY_BYTES = 64 * 1024
 
 
 def _find_report_parts(payload: dict) -> list[tuple[str, str]]:
@@ -256,17 +257,24 @@ def _find_report_parts(payload: dict) -> list[tuple[str, str]]:
     return found
 
 
-def _zip_entry_count(raw: bytes) -> int | None:
-    """Total entries from a ZIP's end-of-central-directory record, or None when there is none.
+def _zip_directory_ok(raw: bytes) -> bool:
+    """True when a ZIP's central directory is small enough to hand to ``zipfile``.
 
-    Read from the last 64 KiB without building ZipInfo objects, so an archive
-    with a huge central directory can be refused before ``zipfile`` parses it.
+    ``zipfile`` allocates one ZipInfo per central-directory record and reads the
+    directory by its SIZE field, not its entry count, so both are checked from
+    the end-of-central-directory record (last 64 KiB) before it is parsed. Zip64
+    archives are refused: a DMARC report never needs one. Data that is not a ZIP
+    at all returns True and is left to ``zipfile`` to reject.
     """
     tail = raw[-(65535 + 22) :]
     at = tail.rfind(b"PK\x05\x06")
     if at < 0 or at + 22 > len(tail):
-        return None
-    return int.from_bytes(tail[at + 10 : at + 12], "little")
+        return True
+    if b"PK\x06\x07" in tail[max(0, at - 20) : at]:  # Zip64 end-of-central-directory locator
+        return False
+    entries = int.from_bytes(tail[at + 10 : at + 12], "little")
+    cd_size = int.from_bytes(tail[at + 12 : at + 16], "little")
+    return entries <= _DMARC_MAX_ZIP_ENTRIES and cd_size <= _DMARC_MAX_ZIP_DIRECTORY_BYTES
 
 
 def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) -> list[bytes | None]:
@@ -286,9 +294,8 @@ def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) 
             return [out]
     except zlib.error:
         pass
-    entries = _zip_entry_count(raw)
-    if entries is not None and entries > _DMARC_MAX_ZIP_ENTRIES:
-        return [None]  # refuse before ZipFile() parses the whole central directory
+    if not _zip_directory_ok(raw):
+        return [None]  # refuse before ZipFile() parses the central directory
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             docs: list[bytes | None] = []

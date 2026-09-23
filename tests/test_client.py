@@ -1564,6 +1564,21 @@ def test_decode_report_payloads_caps_zip_entry_count(monkeypatch):
     with zipfile.ZipFile(buf, "w") as zf:
         for i in range(4):
             zf.writestr(f"{i}.xml", b"<a/>")
-    assert client._zip_entry_count(buf.getvalue()) == 4
-    # refused from the end-of-central-directory count, before zipfile parses the directory
+    assert client._zip_directory_ok(buf.getvalue()) is False
+    # refused from the end-of-central-directory record, before zipfile parses the directory
     assert client._decode_report_payloads(buf.getvalue()) == [None]
+
+
+def test_zip_directory_size_is_checked_even_when_the_count_is_forged(monkeypatch):
+    import io
+    import zipfile
+
+    monkeypatch.setattr(client, "_DMARC_MAX_ZIP_DIRECTORY_BYTES", 100)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i in range(5):
+            zf.writestr(f"entry-{i}.xml", b"<a/>")
+    raw = bytearray(buf.getvalue())
+    at = raw.rfind(b"PK\x05\x06")
+    raw[at + 8 : at + 12] = b"\x00\x00\x00\x00"  # entries on disk / total entries forged to 0
+    assert client._zip_directory_ok(bytes(raw)) is False
