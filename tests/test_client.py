@@ -1541,3 +1541,27 @@ def test_fetch_dmarc_reports_disabled_domain_raises():
     cfg = dataclasses.replace(CFG, dmarc_rua_mailbox=None)
     with pytest.raises(GwsError):
         DomainClient(cfg, gmail_service_factory=lambda u: None).fetch_dmarc_reports(start=start, end=end)
+
+
+def test_decode_report_payloads_caps_the_whole_zip_not_each_entry():
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i in range(4):
+            zf.writestr(f"{i}.xml", b"x" * 400)
+    # each entry fits the limit alone, but only two fit together
+    assert client._decode_report_payloads(buf.getvalue(), limit=1000) == [b"x" * 400, b"x" * 400, None, None]
+
+
+def test_decode_report_payloads_caps_zip_entry_count(monkeypatch):
+    import io
+    import zipfile
+
+    monkeypatch.setattr(client, "_DMARC_MAX_ZIP_ENTRIES", 2)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i in range(4):
+            zf.writestr(f"{i}.xml", b"<a/>")
+    assert client._decode_report_payloads(buf.getvalue()) == [b"<a/>", b"<a/>", None, None]

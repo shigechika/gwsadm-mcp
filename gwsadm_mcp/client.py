@@ -232,6 +232,7 @@ def _parse_dmarc_records(xml_bytes: bytes) -> list[dict]:
 # RUA address is published in DNS, so anyone can mail it a small archive that
 # expands to gigabytes; real aggregate reports are a few MB at most.
 _DMARC_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+_DMARC_MAX_ZIP_ENTRIES = 20
 
 
 def _find_report_parts(payload: dict) -> list[tuple[str, str]]:
@@ -258,9 +259,10 @@ def _find_report_parts(payload: dict) -> list[tuple[str, str]]:
 def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) -> list[bytes | None]:
     """Like ``_decode_report_payload`` but returns every ZIP entry, bounded in size.
 
-    An entry (or gzip stream) that would expand past ``limit`` is returned as
-    None instead of being materialised, so the caller counts it as a
-    non-report attachment rather than running out of memory.
+    ``limit`` bounds the whole attachment: a gzip stream, or the sum of a ZIP's
+    entries (at most ``_DMARC_MAX_ZIP_ENTRIES`` are read). Anything past it is
+    returned as None instead of being materialised, so the caller counts it as
+    a non-report attachment rather than running out of memory.
     """
     try:
         d = zlib.decompressobj(16 + zlib.MAX_WBITS)
@@ -274,13 +276,19 @@ def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) 
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             docs: list[bytes | None] = []
-            for info in zf.infolist():
-                if info.file_size > limit:
+            budget = limit  # for the whole archive, not per entry
+            for info in zf.infolist()[:_DMARC_MAX_ZIP_ENTRIES]:
+                if info.file_size > budget:
                     docs.append(None)
                     continue
                 with zf.open(info) as fh:
-                    data = fh.read(limit + 1)
-                docs.append(data if len(data) <= limit else None)
+                    data = fh.read(budget + 1)
+                if len(data) > budget:
+                    docs.append(None)
+                    continue
+                budget -= len(data)
+                docs.append(data)
+            docs.extend([None] * max(0, len(zf.infolist()) - _DMARC_MAX_ZIP_ENTRIES))
             return docs or [raw]
     except zipfile.BadZipFile:
         return [raw[: limit + 1]] if len(raw) <= limit else [None]
