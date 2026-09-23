@@ -228,6 +228,117 @@ def _parse_dmarc_records(xml_bytes: bytes) -> list[dict]:
     return records
 
 
+def _find_attachment_ids(payload: dict) -> list[str]:
+    """Depth-first list of every attachment id in a Gmail message payload.
+
+    ``_find_attachment_id`` takes the first one, which is right for the
+    summary tool; an archive that must not silently drop a report reads all
+    of them and lets the parser say which ones were reports.
+    """
+    found: list[str] = []
+    attachment_id = payload.get("body", {}).get("attachmentId")
+    if attachment_id:
+        found.append(attachment_id)
+    for part in payload.get("parts", []) or []:
+        found.extend(_find_attachment_ids(part))
+    return found
+
+
+def _decode_report_payloads(raw: bytes) -> list[bytes]:
+    """Like ``_decode_report_payload`` but returns every ZIP entry, not the first."""
+    try:
+        return [gzip.decompress(raw)]
+    except (OSError, EOFError, zlib.error):
+        pass
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            return [zf.read(name) for name in zf.namelist()] or [raw]
+    except zipfile.BadZipFile:
+        return [raw]
+
+
+def _strip_namespaces(root: ET.Element) -> ET.Element:
+    """Drop XML namespaces in place (DMARC 2.0 reports declare one; 1.0 reports do not)."""
+    for el in root.iter():
+        if isinstance(el.tag, str) and "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+    return root
+
+
+def _int_or_none(text: str | None) -> int | None:
+    try:
+        return int(text) if text is not None else None
+    except ValueError:
+        return None
+
+
+def _parse_dmarc_report(xml_bytes: bytes) -> dict | None:
+    """Parse one DMARC aggregate report into its metadata and per-source records.
+
+    Returns None when the document is not an aggregate report (root element
+    other than ``feedback``), so a caller can count non-report attachments
+    instead of mistaking them for an empty report. Raises ``ET.ParseError``
+    for malformed XML, like ``_parse_dmarc_records``.
+
+    Unlike ``_parse_dmarc_records`` (kept as is for ``dmarc_rua_summary``),
+    this keeps what an archive needs to bucket, deduplicate and classify:
+    ``org_name``, ``report_id``, the ``begin``/``end`` of the reported period
+    (epoch seconds), the published policy, and per record the override
+    ``reason`` list and the raw DKIM/SPF ``auth_results``. Records whose
+    ``count`` is missing or not an integer are skipped and counted in
+    ``dropped_records`` rather than disappearing.
+    """
+    root = _strip_namespaces(ET.fromstring(xml_bytes))
+    if root.tag != "feedback":
+        return None
+    policy = root.find("policy_published")
+
+    def _p(tag: str) -> str:
+        return (policy.findtext(tag) if policy is not None else None) or ""
+
+    records: list[dict] = []
+    dropped = 0
+    for rec in root.findall(".//record"):
+        count = _int_or_none(rec.findtext("row/count"))
+        if count is None:
+            dropped += 1
+            continue
+        records.append(
+            {
+                "source_ip": rec.findtext("row/source_ip") or "",
+                "count": count,
+                "dkim": rec.findtext("row/policy_evaluated/dkim") or "",
+                "spf": rec.findtext("row/policy_evaluated/spf") or "",
+                "disposition": rec.findtext("row/policy_evaluated/disposition") or "",
+                "reason": [
+                    {"type": r.findtext("type") or "", "comment": r.findtext("comment") or ""}
+                    for r in rec.findall("row/policy_evaluated/reason")
+                ],
+                "header_from": rec.findtext("identifiers/header_from") or "",
+                "envelope_from": rec.findtext("identifiers/envelope_from") or "",
+                "auth_results": {
+                    "dkim": [
+                        {"domain": a.findtext("domain") or "", "result": a.findtext("result") or ""}
+                        for a in rec.findall("auth_results/dkim")
+                    ],
+                    "spf": [
+                        {"domain": a.findtext("domain") or "", "result": a.findtext("result") or ""}
+                        for a in rec.findall("auth_results/spf")
+                    ],
+                },
+            }
+        )
+    return {
+        "org_name": root.findtext("report_metadata/org_name") or "",
+        "report_id": root.findtext("report_metadata/report_id") or "",
+        "begin": _int_or_none(root.findtext("report_metadata/date_range/begin")),
+        "end": _int_or_none(root.findtext("report_metadata/date_range/end")),
+        "policy": {k: _p(k) for k in ("domain", "p", "sp", "pct", "adkim", "aspf")},
+        "records": records,
+        "dropped_records": dropped,
+    }
+
+
 def _is_retryable(e: HttpError) -> bool:
     """True for a rate-limit / transient server error worth a backoff-retry.
 
@@ -1014,6 +1125,120 @@ class DomainClient:
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (gmail, {mailbox}): {type(e).__name__}") from e
         return records, bool(token), message_errors, mailbox, recipient
+
+    def fetch_dmarc_reports(
+        self,
+        *,
+        start: datetime.datetime,
+        end: datetime.datetime,
+        max_pages: int = 50,
+        max_workers: int = _DMARC_FETCH_WORKERS_DEFAULT,
+    ) -> dict:
+        """Fetch every DMARC aggregate report that ARRIVED in ``[start, end)``, report by report.
+
+        The archive counterpart of ``fetch_dmarc_rua_records``: same mailbox,
+        recipient, DWD scope and read-only calls, but bounded on both ends
+        (Gmail ``after:``/``before:``, second precision), reading every
+        attachment and every ZIP entry, and returning reports whole
+        (``_parse_dmarc_report``) so the caller can bucket them by reported
+        period and deduplicate. Nothing is aggregated here.
+
+        Returns ``{reports, messages, capped, message_errors,
+        non_report_attachments, dropped_records, mailbox, recipient}``.
+        ``message_errors`` counts messages that could not be fetched or held
+        no attachment; ``non_report_attachments`` counts attachments that
+        decoded to something other than an aggregate report (including
+        malformed XML). An auth failure (e.g. the gmail.readonly scope was
+        revoked) raises ``GwsAuthError`` instead of returning an empty result.
+        """
+        if self.cfg.dmarc_rua_mailbox is None:
+            raise GwsError(f"[{self.domain}] DMARC reading is disabled for this domain (dmarc_rua_mailbox = none)")
+        mailbox = self.cfg.dmarc_rua_mailbox
+        recipient = self.cfg.dmarc_rua_recipient or mailbox
+        svc, creds = self._gmail_service(mailbox)
+        list_http = self._new_http(creds)
+        query = f"to:{recipient} after:{int(start.timestamp())} before:{int(end.timestamp())}"
+
+        def _fetch_one(message_id: str) -> tuple[list[dict], int] | None:
+            http = self._new_http(creds)
+            full = self._execute(lambda: svc.users().messages().get(userId="me", id=message_id, format="full"), http)
+            ids = _find_attachment_ids(full.get("payload", {}))
+            if not ids:
+                return None
+            reports, non_report = [], 0
+            for attachment_id in ids:
+                att = self._execute(
+                    lambda aid=attachment_id: (
+                        svc.users().messages().attachments().get(userId="me", messageId=message_id, id=aid)
+                    ),
+                    http,
+                )
+                data = att.get("data") or ""
+                if not data:
+                    non_report += 1
+                    continue
+                padded = data + "=" * (-len(data) % 4)
+                for doc in _decode_report_payloads(base64.urlsafe_b64decode(padded)):
+                    try:
+                        report = _parse_dmarc_report(doc)
+                    except ET.ParseError:
+                        report = None
+                    if report is None:
+                        non_report += 1
+                    else:
+                        reports.append(report)
+            return reports, non_report
+
+        out: dict = {"reports": [], "messages": 0, "message_errors": 0, "non_report_attachments": 0}
+        token = None
+        pages = 0
+        try:
+            while True:
+                resp = self._execute(
+                    lambda tok=token: (
+                        svc.users()
+                        .messages()
+                        .list(userId="me", q=query, maxResults=_DMARC_MESSAGE_LIST_PAGE_SIZE, pageToken=tok)
+                    ),
+                    list_http,
+                )
+                message_ids = [m["id"] for m in resp.get("messages", [])]
+                out["messages"] += len(message_ids)
+                if message_ids:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(message_ids))) as ex:
+                        futs = [ex.submit(_fetch_one, mid) for mid in message_ids]
+                        for fut in concurrent.futures.as_completed(futs):
+                            # Same tolerance as fetch_dmarc_rua_records: one bad message is
+                            # counted; a GoogleAuthError propagates and fails the fetch.
+                            try:
+                                result = fut.result()
+                            except (HttpError, httplib2.HttpLib2Error, OSError, binascii.Error):
+                                out["message_errors"] += 1
+                                continue
+                            if result is None:
+                                out["message_errors"] += 1
+                                continue
+                            reports, non_report = result
+                            out["reports"].extend(reports)
+                            out["non_report_attachments"] += non_report
+                token = resp.get("nextPageToken")
+                pages += 1
+                if not token or pages >= max_pages:
+                    break
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            raise GwsError(f"[{self.domain}] gmail API error (messages.list, {mailbox}): HTTP {status}") from e
+        except GoogleAuthError as e:
+            raise GwsAuthError(f"[{self.domain}] auth failed for {mailbox}: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (gmail, {mailbox}): {type(e).__name__}") from e
+        out.update(
+            capped=bool(token),
+            dropped_records=sum(r["dropped_records"] for r in out["reports"]),
+            mailbox=mailbox,
+            recipient=recipient,
+        )
+        return out
 
     def get_group_settings(self, group_email: str) -> dict | None:
         """Fetch one Google Group's own posting/delivery policy (Groups Settings API).

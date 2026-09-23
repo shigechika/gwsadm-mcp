@@ -228,6 +228,20 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
 
 `--check` exit codes: `0` success, non-zero on config or auth failure.
 
+### Archiving DMARC reports (batch)
+
+`dmarc_rua_summary` aggregates a rolling window for a patrol. To keep a day-by-day history, a scheduled job can dump the reports themselves:
+
+```bash
+gwsadm-mcp dmarc-reports --domain example.edu --since 2026-09-20 --until 2026-09-23 > reports.json
+```
+
+- Reads the same RUA mailbox as `dmarc_rua_summary` (same `gmail.readonly` scope) for messages that **arrived** in `[--since, --until)` (UTC days, Gmail `after:` / `before:`), every attachment and every ZIP entry.
+- Prints one JSON document to stdout: each report whole — `org_name`, `report_id`, `begin` / `end` (epoch seconds of the reported period), the published `policy` (`p`, `sp`, `pct`, `adkim`, `aspf`) and its records with `reason` and `auth_results`. Nothing is aggregated or deduplicated: some reporters split one report across several messages under the same `report_id`, so deduplicate on content, not on the id.
+- `fetch_complete` is true only when nothing was capped and no message, attachment or record was skipped (`message_errors`, `non_report_attachments`, `dropped_records`).
+- Exit `2` for a bad argument or configuration, `1` for an API or auth failure (e.g. the scope was revoked); nothing is written to stdout in either case.
+- The output contains sender IPs and header domains. Keep it out of anything published.
+
 ## Notes
 
 - Every result section reports `capped: true` when a window exceeded the page
