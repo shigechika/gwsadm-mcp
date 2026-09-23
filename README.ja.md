@@ -224,7 +224,7 @@ gwsadm-mcp             # MCP サーバを起動（STDIO、既定）
 gwsadm-mcp dmarc-reports --domain example.edu --since 2026-09-20 --until 2026-09-23 > reports.json
 ```
 
-- `dmarc_rua_summary` と同じ RUA メールボックス（同じ `gmail.readonly` スコープ）から、`[--since, --until)`（UTC の日、Gmail の `after:` / `before:`）に**届いた**メッセージを読む。添付はすべて、ZIP は全エントリーを読む
+- `dmarc_rua_summary` と同じ RUA メールボックス（同じ `gmail.readonly` スコープ）から、`[--since, --until)`（UTC の日、Gmail の `after:` / `before:`）に**届いた**メッセージを読む。添付はすべて、ZIP は全エントリーを読む（1 添付あたり 20 エントリー・展開後 50 MB まで。それを超える分や、暗号化・破損したエントリーは `non_report_attachments` に数える）
 - 標準出力に JSON を 1 つ出す。報告ごとに `org_name`・`report_id`・`begin` / `end`（報告期間の epoch 秒）・公開ポリシー `policy`（`p`・`sp`・`pct`・`adkim`・`aspf`）と、`reason`・`auth_results` 付きのレコードを持つ。集計も重複排除もしない。1 つの報告を同じ `report_id` のまま複数のメールに分けて送る報告元があるので、重複は ID ではなく中身で判定する
 - `fetch_complete` は、打ち切りが無く、読めないメッセージ・添付・レコードが 1 つも無いとき（`message_errors`・`non_report_attachments`・`dropped_records`）だけ true
 - 引数・設定の誤りは終了コード 2、API・認証の失敗（スコープの取り消しなど）は 1。どちらも標準出力には何も書かない

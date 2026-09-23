@@ -270,7 +270,7 @@ def _zip_directory_ok(raw: bytes) -> bool:
     at = tail.rfind(b"PK\x05\x06")
     if at < 0 or at + 22 > len(tail):
         return True
-    if b"PK\x06\x07" in tail[max(0, at - 20) : at]:  # Zip64 end-of-central-directory locator
+    if at >= 20 and tail[at - 20 : at - 16] == b"PK\x06\x07":  # Zip64 locator sits exactly 20 bytes before
         return False
     entries = int.from_bytes(tail[at + 10 : at + 12], "little")
     cd_size = int.from_bytes(tail[at + 12 : at + 16], "little")
@@ -304,8 +304,13 @@ def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) 
                 if info.file_size > budget:
                     docs.append(None)
                     continue
-                with zf.open(info) as fh:
-                    data = fh.read(budget + 1)
+                try:
+                    with zf.open(info) as fh:
+                        data = fh.read(budget + 1)
+                except (RuntimeError, NotImplementedError, zlib.error, EOFError, zipfile.BadZipFile, ValueError):
+                    # encrypted, unsupported compression, corrupt or truncated entry: not a report
+                    docs.append(None)
+                    continue
                 if len(data) > budget:
                     docs.append(None)
                     continue
@@ -1245,7 +1250,7 @@ class DomainClient:
                 for doc in _decode_report_payloads(base64.urlsafe_b64decode(padded)):
                     try:
                         report = _parse_dmarc_report(doc) if doc is not None else None
-                    except ET.ParseError:
+                    except (ET.ParseError, LookupError, ValueError):  # malformed XML or an unknown encoding
                         report = None
                     if report is None:
                         non_report += 1

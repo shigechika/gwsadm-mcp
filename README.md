@@ -236,7 +236,7 @@ gwsadm-mcp             # Start MCP server (STDIO, default)
 gwsadm-mcp dmarc-reports --domain example.edu --since 2026-09-20 --until 2026-09-23 > reports.json
 ```
 
-- Reads the same RUA mailbox as `dmarc_rua_summary` (same `gmail.readonly` scope) for messages that **arrived** in `[--since, --until)` (UTC days, Gmail `after:` / `before:`), every attachment and every ZIP entry.
+- Reads the same RUA mailbox as `dmarc_rua_summary` (same `gmail.readonly` scope) for messages that **arrived** in `[--since, --until)` (UTC days, Gmail `after:` / `before:`), every attachment and every ZIP entry (up to 20 entries and 50 MB decompressed per attachment; anything past that, or an encrypted / corrupt entry, is counted in `non_report_attachments`).
 - Prints one JSON document to stdout: each report whole — `org_name`, `report_id`, `begin` / `end` (epoch seconds of the reported period), the published `policy` (`p`, `sp`, `pct`, `adkim`, `aspf`) and its records with `reason` and `auth_results`. Nothing is aggregated or deduplicated: some reporters split one report across several messages under the same `report_id`, so deduplicate on content, not on the id.
 - `fetch_complete` is true only when nothing was capped and no message, attachment or record was skipped (`message_errors`, `non_report_attachments`, `dropped_records`).
 - Exit `2` for a bad argument or configuration, `1` for an API or auth failure (e.g. the scope was revoked); nothing is written to stdout in either case.

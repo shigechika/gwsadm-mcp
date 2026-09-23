@@ -1582,3 +1582,51 @@ def test_zip_directory_size_is_checked_even_when_the_count_is_forged(monkeypatch
     at = raw.rfind(b"PK\x05\x06")
     raw[at + 8 : at + 12] = b"\x00\x00\x00\x00"  # entries on disk / total entries forged to 0
     assert client._zip_directory_ok(bytes(raw)) is False
+
+
+def test_decode_report_payloads_treats_an_encrypted_zip_entry_as_non_report():
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.xml", b"<a/>")
+        zf.writestr("secret.xml", b"<b/>")
+    raw = bytearray(buf.getvalue())
+    # flag the second entry as encrypted (general purpose bit 0) in its local header and central directory
+    name_at = [i for i in range(len(raw)) if raw.startswith(b"secret.xml", i)]
+    assert len(name_at) == 2  # local header, then central directory
+    for pos, sig, off in ((name_at[0], b"PK\x03\x04", 6), (name_at[1], b"PK\x01\x02", 8)):
+        at = raw.rfind(sig, 0, pos)
+        raw[at + off] |= 1
+    assert client._decode_report_payloads(bytes(raw)) == [b"<a/>", None]
+
+
+def test_zip64_locator_is_only_recognised_at_its_offset():
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.xml", b"<a/>")
+        zf.comment = b""
+    raw = buf.getvalue()
+    assert client._zip_directory_ok(raw) is True
+    # the same bytes inside the last entry's comment must not be mistaken for a locator
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w") as zf:
+        info = zipfile.ZipInfo("a.xml")
+        info.comment = b"xxPK\x06\x07yy"
+        zf.writestr(info, b"<a/>")
+    assert client._zip_directory_ok(buf2.getvalue()) is True
+
+
+def test_fetch_dmarc_reports_unknown_xml_encoding_is_a_non_report():
+    start, end = _window()
+    c, _ = _dmarc_client(
+        list_pages=[{"messages": [{"id": "m1"}]}],
+        get_by_id={"m1": {"payload": {"body": {"attachmentId": "a1"}}}},
+        attachments_by_id={"a1": _gzip_b64(b'<?xml version="1.0" encoding="bogus"?><feedback/>')},
+    )
+    got = c.fetch_dmarc_reports(start=start, end=end)
+    assert got["reports"] == [] and got["non_report_attachments"] == 1 and got["message_errors"] == 0
