@@ -105,3 +105,35 @@ def test_dmarc_reports_cli_auth_failure_exit_1(monkeypatch, capsys):
     assert ex.value.code == 1
     out = capsys.readouterr()
     assert out.out == "" and "gmail.readonly" in out.err
+
+
+@pytest.mark.parametrize("field", ["message_errors", "non_report_attachments", "dropped_records"])
+def test_dmarc_reports_cli_any_skip_makes_it_incomplete(monkeypatch, capsysbinary, field):
+    import json
+
+    import gwsadm_mcp.client as client
+    import gwsadm_mcp.config as config
+    from gwsadm_mcp import __main__ as cli
+    from gwsadm_mcp.config import DomainConfig
+
+    cfg = DomainConfig("example.edu", "/tmp/sa.json", "a@example.edu", "C0abc", "postmaster@example.edu")
+    monkeypatch.setattr(config, "load_config", lambda: ([cfg], set()))
+    got = {
+        "reports": [],
+        "messages": 1,
+        "capped": False,
+        "message_errors": 0,
+        "non_report_attachments": 0,
+        "dropped_records": 0,
+        "mailbox": "m",
+        "recipient": "r",
+    }
+    got[field] = 1
+    monkeypatch.setattr(client.DomainClient, "fetch_dmarc_reports", lambda self, **kw: dict(got))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["gwsadm-mcp", "dmarc-reports", "--domain", "example.edu", "--since", "2026-09-20", "--until", "2026-09-23"],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert json.loads(capsysbinary.readouterr().out.decode("utf-8"))["fetch_complete"] is False

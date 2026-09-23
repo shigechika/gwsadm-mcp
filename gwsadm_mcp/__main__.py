@@ -91,7 +91,12 @@ def _dmarc_reports(argv: list[str]) -> int:
         "gwsadm_mcp_version": __version__,
         "domain": picked[0].domain,
         "window": {"since": since.isoformat(), "until": until.isoformat(), "basis": "arrival"},
-        "fetch_complete": not got["capped"] and got["message_errors"] == 0 and got["non_report_attachments"] == 0,
+        "fetch_complete": (
+            not got["capped"]
+            and got["message_errors"] == 0
+            and got["non_report_attachments"] == 0
+            and got["dropped_records"] == 0
+        ),
         **got,
     }
     # Stream UTF-8 regardless of the console code page (Windows redirects use the ANSI one).
