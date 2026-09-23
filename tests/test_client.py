@@ -1564,4 +1564,6 @@ def test_decode_report_payloads_caps_zip_entry_count(monkeypatch):
     with zipfile.ZipFile(buf, "w") as zf:
         for i in range(4):
             zf.writestr(f"{i}.xml", b"<a/>")
-    assert client._decode_report_payloads(buf.getvalue()) == [b"<a/>", b"<a/>", None, None]
+    assert client._zip_entry_count(buf.getvalue()) == 4
+    # refused from the end-of-central-directory count, before zipfile parses the directory
+    assert client._decode_report_payloads(buf.getvalue()) == [None]

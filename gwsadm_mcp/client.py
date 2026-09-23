@@ -256,6 +256,19 @@ def _find_report_parts(payload: dict) -> list[tuple[str, str]]:
     return found
 
 
+def _zip_entry_count(raw: bytes) -> int | None:
+    """Total entries from a ZIP's end-of-central-directory record, or None when there is none.
+
+    Read from the last 64 KiB without building ZipInfo objects, so an archive
+    with a huge central directory can be refused before ``zipfile`` parses it.
+    """
+    tail = raw[-(65535 + 22) :]
+    at = tail.rfind(b"PK\x05\x06")
+    if at < 0 or at + 22 > len(tail):
+        return None
+    return int.from_bytes(tail[at + 10 : at + 12], "little")
+
+
 def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) -> list[bytes | None]:
     """Like ``_decode_report_payload`` but returns every ZIP entry, bounded in size.
 
@@ -273,6 +286,9 @@ def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) 
             return [out]
     except zlib.error:
         pass
+    entries = _zip_entry_count(raw)
+    if entries is not None and entries > _DMARC_MAX_ZIP_ENTRIES:
+        return [None]  # refuse before ZipFile() parses the whole central directory
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             docs: list[bytes | None] = []
@@ -288,7 +304,6 @@ def _decode_report_payloads(raw: bytes, limit: int = _DMARC_MAX_DOCUMENT_BYTES) 
                     continue
                 budget -= len(data)
                 docs.append(data)
-            docs.extend([None] * max(0, len(zf.infolist()) - _DMARC_MAX_ZIP_ENTRIES))
             return docs or [raw]
     except zipfile.BadZipFile:
         return [raw[: limit + 1]] if len(raw) <= limit else [None]
