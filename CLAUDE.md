@@ -30,7 +30,7 @@ scope), `list_group_members` (a Google Group's metadata + member roster —
 Directory API, requires the separate `admin.directory.group.readonly` and
 `admin.directory.group.member.readonly` DWD scopes), and a `daily_brief`
 combining the Reports-based tools, to AI assistants via STDIO transport,
-built on the official `mcp` Python SDK's `FastMCP`. Read-only: the only
+built on the official `mcp` Python SDK's `MCPServer`. Read-only: the only
 Admin SDK / Groups Settings / Gmail API methods called anywhere in this
 package are `activities().list` (Reports API), `customerUsageReports().get()`
 (Reports API, for `gmail_usage_report` -- same discovery document as
@@ -64,7 +64,7 @@ to guard against stdio newline regressions).
 
 ## Architecture
 
-- `gwsadm_mcp/server.py` — FastMCP server with `health_check`,
+- `gwsadm_mcp/server.py` — MCPServer server with `health_check`,
   `login_audit`, `gmail_usage_report`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
   `drive_external_sharing`, `drive_doc_activity`,
   `shared_drive_membership_changes`, `gmail_message_trace`,

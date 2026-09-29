@@ -45,13 +45,13 @@ import secrets
 import threading
 import time
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 
 from gwsadm_mcp import __version__
 from gwsadm_mcp.client import DomainClient, GwsAuthError, GwsError, event_parameters
 from gwsadm_mcp.config import ConfigError, config_path, is_external, load_config
 
-mcp = FastMCP("gwsadm-mcp")
+mcp = MCPServer("gwsadm-mcp", version=__version__)
 
 # Concurrent Reports-API fetches. Each daily_brief issues ~16 independent
 # (domain x eventName) activity fetches; running them serially blows past a
