@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.17.0...v0.18.0) (2026-09-29)
+
+
+### Features
+
+* require mcp 2.x (MCPServer) and drop 1.x support ([#90](https://github.com/shigechika/gwsadm-mcp/issues/90)) ([3aa70fd](https://github.com/shigechika/gwsadm-mcp/commit/3aa70fd2e38d89edc0ed0202809c4783062b2ac5))
+
 ## [0.17.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.16.0...v0.17.0) (2026-09-23)
 
 
