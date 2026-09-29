@@ -39,6 +39,8 @@ import asyncio
 import collections
 import concurrent.futures
 import datetime
+import functools
+import inspect
 import os
 import re
 import secrets
@@ -46,12 +48,59 @@ import threading
 import time
 
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 
 from gwsadm_mcp import __version__
 from gwsadm_mcp.client import DomainClient, GwsAuthError, GwsError, event_parameters
 from gwsadm_mcp.config import ConfigError, config_path, is_external, load_config
 
-mcp = MCPServer("gwsadm-mcp", version=__version__)
+
+def _expose_errors(fn):
+    """Wrap a tool so any exception reaches the model as a ToolError with its message.
+
+    mcp 1.x returned the exception text for every failing tool. mcp 2.x hides it
+    (the model sees only "Error executing tool <name>") unless a ToolError is raised.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except (ToolError, MCPError):
+                raise
+            except Exception as exc:
+                raise ToolError(str(exc) or type(exc).__name__) from exc
+
+    else:
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (ToolError, MCPError):
+                raise
+            except Exception as exc:
+                raise ToolError(str(exc) or type(exc).__name__) from exc
+
+    return wrapper
+
+
+class _Server(MCPServer):
+    """MCPServer whose tools report their exception messages (see _expose_errors)."""
+
+    def tool(self, *args, **kwargs):
+        register = super().tool(*args, **kwargs)
+
+        def decorator(fn):
+            register(_expose_errors(fn))
+            return fn
+
+        return decorator
+
+
+mcp = _Server("gwsadm-mcp", version=__version__)
 
 # Concurrent Reports-API fetches. Each daily_brief issues ~16 independent
 # (domain x eventName) activity fetches; running them serially blows past a
