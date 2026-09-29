@@ -3,7 +3,7 @@
 `gwsadm-mcp` is an MCP (Model Context Protocol) server exposing Google
 Workspace security-audit data (login locks, suspicious logins, Drive
 external-sharing exposure) to AI assistants over **stdio transport**. Built
-on the official `mcp` Python SDK's `FastMCP` (`gwsadm_mcp/server.py`), with
+on the official `mcp` Python SDK's `MCPServer` (`gwsadm_mcp/server.py`), with
 `DomainClient` (`gwsadm_mcp/client.py`) wrapping the Admin SDK Reports API
 via a service account + domain-wide delegation (DWD) credential. Read-only:
 the only Admin SDK Reports API method called anywhere in this package is
@@ -42,10 +42,10 @@ the live `mcp.run()` server. Flag any new code path that adds a `print()`
 or a logger without an explicit stderr handler that could execute while
 `mcp.run()` is active.
 
-## 2. FastMCP already wraps tool returns — don't ask for manual envelope code
+## 2. MCPServer already wraps tool returns — don't ask for manual envelope code
 
 `server.py`'s `@mcp.tool()`-decorated functions return plain `dict` values;
-FastMCP handles the MCP content-envelope wrapping itself. Do **not** suggest
+MCPServer handles the MCP content-envelope wrapping itself. Do **not** suggest
 a tool handler manually construct `{"content": [...], "isError": ...}`.
 
 ## 3. Coverage contract: `capped` must be set whenever a scan is cut short
