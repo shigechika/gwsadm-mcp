@@ -151,6 +151,26 @@ async def _fake_account(call: Caller) -> dict[str, Any]:
     return {"username": f"smoke-test-{secrets.token_hex(16)}@{suffix}"}
 
 
+async def _some_ip(call: Caller) -> dict[str, Any]:
+    """Discover a source address at run time for the per-IP tool.
+
+    Taken from whatever ``user_activity`` reports for the account
+    ``_some_account`` found: an address that acted in the tenant recently, so
+    the probe exercises the ``actorIpAddress`` filter against events that
+    exist. A tenant whose discovered account shows no activity in the window
+    is a skip, not a failure — there is no address to ask about.
+    """
+    account = await _some_account(call)
+    activity = await call(
+        "user_activity",
+        {**account, "hours": 24 * 7, "max_pages": MAX_PAGES, "max_events": 1},
+    )
+    ip = _first_field(activity, "ip", r"[0-9A-Fa-f.:]+")
+    if not ip:
+        raise SkipProbe("no activity in the window to take a source address from")
+    return {"ip": ip}
+
+
 async def _fake_message_and_recipient(call: Caller) -> dict[str, Any]:
     """A syntactically valid but guaranteed-nonexistent Message-ID, paired
     with a real account discovered at run time (reusing ``_some_account``).
@@ -269,6 +289,24 @@ PROBES: dict[str, Probe] = {
         rows_key="tokens",
         # This tool reports a failure as {"username": ..., "error": ...}, which
         # still satisfies two of the required keys.
+        must_not_match=NO_DOMAIN_ERROR,
+        allow_empty=True,
+    ),
+    "user_activity": Probe(
+        args={"hours": WINDOW_HOURS * 7, "max_pages": MAX_PAGES, "max_events": 5},
+        args_factory=_some_account,
+        require_keys=("domain", "username", "window", "applications", "flags", "ips", "timeline", "capped"),
+        rows_key="timeline",
+        # A quiet account is a real answer; what must hold is the envelope and
+        # that no application's fetch failed outright.
+        must_not_match=NO_DOMAIN_ERROR,
+        allow_empty=True,
+    ),
+    "ip_activity": Probe(
+        args={"hours": WINDOW_HOURS * 7, "max_pages": MAX_PAGES, "top": 5},
+        args_factory=_some_ip,
+        require_keys=("ip", "window", "domains"),
+        must_match=(DOMAINS_NOT_EMPTY,),
         must_not_match=NO_DOMAIN_ERROR,
         allow_empty=True,
     ),

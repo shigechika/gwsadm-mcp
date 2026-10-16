@@ -46,7 +46,7 @@ ADDRESS_SHAPES = {
 #: but a doc id and a drive name have no shape to recognise, and the rule is
 #: about the parameter rather than about the value happening to look like one.
 #: Every one of these comes from an args_factory or is left unset.
-IDENTIFIER_ARGS = {"username", "domain", "doc_id", "drive_name"}
+IDENTIFIER_ARGS = {"username", "domain", "doc_id", "drive_name", "ip"}
 
 #: Parameters that bound how much work a tool does. A scheduled probe must pass
 #: each one it is offered rather than inheriting a default sized for a human

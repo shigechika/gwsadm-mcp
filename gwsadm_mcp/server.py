@@ -41,6 +41,7 @@ import concurrent.futures
 import datetime
 import functools
 import inspect
+import ipaddress
 import os
 import re
 import secrets
@@ -876,6 +877,402 @@ def user_oauth_tokens(username: str, domain: str | None = None) -> dict:
         "username": username,
         "count": len(tokens),
         "tokens": [_token_entry(t) for t in tokens],
+    }
+
+
+# user_activity / ip_activity: the Reports API applications walked by default
+# for one account's, or one source address's, timeline. ``gmail`` is absent on
+# purpose: message-level Gmail activity is not served by the Reports API on
+# every tenant (verified live: ``applicationName=gmail`` answers HTTP 400 on a
+# tenant whose every other application works), and a caller whose tenant has
+# it passes it explicitly. The list is an argument, not a fixed set, because
+# the right applications depend on what the tenant uses.
+ACTIVITY_APPLICATIONS = ("login", "token", "user_accounts", "drive", "groups", "calendar", "chat", "meet", "saml")
+# An application name is a path segment of the request URL, so it is validated
+# against a charset before use (same treatment as ``_DOC_ID_RE``: tool inputs
+# are LLM-driven and must be treated as adversarial).
+_APPLICATION_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+MAX_ACTIVITY_APPLICATIONS = 20
+
+# Events that change an account's security posture, or mark it as under
+# attack. ``flags`` surfaces these on top regardless of volume because they
+# are what a compromise leaves behind once the session itself is gone: a
+# second factor the attacker enrolled survives a password reset (observed
+# live, 2026-10-16: ``2sv_enroll`` from the attacker's address fifteen
+# minutes after the first SAML login, with no Drive activity at all), a
+# recovery address captures the next reset, an outbound forwarding rule keeps
+# leaking, an OAuth grant needs no further login. Names are the Reports API's
+# own, from the ``login``, ``user_accounts`` and ``token`` applications.
+POSTURE_EVENTS = frozenset(
+    {
+        "2sv_enroll",
+        "2sv_disable",
+        "2sv_change_phone",
+        "password_edit",
+        "recovery_email_edit",
+        "recovery_phone_edit",
+        "recovery_secret_qa_edit",
+        "email_forwarding_out_of_domain",
+        "risky_sensitive_action_allowed",
+        "risky_sensitive_action_blocked",
+        "authorize",
+        *ACCOUNT_DISABLED_EVENTS,
+        *SUSPICIOUS_LOGIN_EVENTS,
+    }
+)
+# Event parameters worth carrying on a timeline row. Everything else the API
+# attaches (dozens of bookkeeping fields on a Drive event) is dropped so a
+# day's timeline stays readable; the application-level counts are unaffected.
+_ACTIVITY_PARAMS = (
+    "login_type",
+    "is_suspicious",
+    "is_second_factor",
+    "login_challenge_method",
+    "sensitive_action_name",
+    "app_name",
+    "client_id",
+    "client_type",
+    "scope",
+    "email_forwarding_destination_address",
+    "doc_id",
+    "doc_title",
+    "doc_type",
+    "owner",
+    "visibility",
+    "old_visibility",
+    "target_user",
+    "target_domain",
+    "new_value",
+)
+# Drive events that belong on the timeline: ACL changes and the document
+# lifecycle. The access noise (view/edit/download/print/preview) is counted
+# per event name instead -- a hot afternoon of reading produces hundreds of
+# rows that would drown the one share or delete that matters.
+DRIVE_TIMELINE_EVENTS = frozenset(DRIVE_ACL_EVENTS) | frozenset(DOC_LIFECYCLE_EVENTS)
+
+
+def _parse_applications(raw: str | None) -> list[str]:
+    """Split a comma-separated application list, validating each name.
+
+    ``None``/empty means the default set. Raises ``GwsError`` on a name that
+    could not be a Reports API application (it would otherwise reach the
+    request URL as a path segment) or on more than MAX_ACTIVITY_APPLICATIONS.
+    """
+    if raw is None or not raw.strip():
+        return list(ACTIVITY_APPLICATIONS)
+    apps: list[str] = []
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if not _APPLICATION_RE.match(name):
+            raise GwsError(f"'{name}' is not a Reports API application name")
+        if name not in apps:
+            apps.append(name)
+    if not apps:
+        return list(ACTIVITY_APPLICATIONS)
+    if len(apps) > MAX_ACTIVITY_APPLICATIONS:
+        raise GwsError(f"at most {MAX_ACTIVITY_APPLICATIONS} applications per call, got {len(apps)}")
+    return apps
+
+
+def _parse_ip(raw: str) -> str:
+    """Normalise an IP literal, or raise ``GwsError``.
+
+    The value becomes the ``actorIpAddress`` query parameter, so anything that
+    is not an address is refused here rather than handed to the API as a
+    filter that silently matches nothing.
+    """
+    try:
+        return str(ipaddress.ip_address(raw.strip()))
+    except ValueError as e:
+        raise GwsError(f"'{raw}' is not an IP address") from e
+
+
+def _fetch_per_application(
+    c: DomainClient,
+    applications: list[str],
+    *,
+    start: datetime.datetime,
+    max_pages: int,
+    user_key: str = "all",
+    actor_ip: str | None = None,
+) -> dict:
+    """Run one unfiltered-by-event probe per application concurrently.
+
+    Same worker-pool policy as ``_parallel_fetch``, whose task tuple cannot
+    carry the per-account / per-IP narrowing. Returns ``{application: (items,
+    capped) | Exception}`` so the caller applies its own degradation: a
+    ``GwsAuthError`` means the domain is unusable, a plain ``GwsError`` only
+    that one application (e.g. a tenant without ``gmail`` activity).
+    """
+    results: dict = {}
+    if not applications:
+        return results
+
+    def _one(app: str):
+        return c.fetch_activities(app, start=start, max_pages=max_pages, user_key=user_key, actor_ip=actor_ip)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(applications))) as ex:
+        futs = {ex.submit(_one, app): app for app in applications}
+        for fut in concurrent.futures.as_completed(futs):
+            app = futs[fut]
+            try:
+                results[app] = fut.result()
+            except (GwsAuthError, GwsError) as e:
+                results[app] = e
+    return results
+
+
+def _activity_row(application: str, item: dict, event: dict, p: dict) -> dict:
+    row = {**_entry(item, event), "application": application}
+    params = {k: p[k] for k in _ACTIVITY_PARAMS if k in p}
+    if params:
+        row["params"] = params
+    return row
+
+
+def _is_posture_event(name: str | None, p: dict) -> bool:
+    if name in POSTURE_EVENTS:
+        return True
+    # A successful login Google itself judged suspicious is a flag even
+    # though the event name is the everyday one.
+    return name == "login_success" and str(_scalar(p.get("is_suspicious"))).lower() == "true"
+
+
+def _collect_activity(fetched: dict, applications: list[str]) -> dict:
+    """Merge per-application fetch results into one newest-first picture.
+
+    Returns the per-application accounting, the merged ``timeline`` (Drive
+    access noise excluded, see DRIVE_TIMELINE_EVENTS), the posture ``flags``,
+    and the distinct source ``ips`` / acting ``accounts`` with first/last
+    seen. Raises the ``GwsAuthError`` of any application: that is a domain
+    failure, not a per-application one.
+    """
+    apps: dict = {}
+    timeline: list[dict] = []
+    flags: list[dict] = []
+    seen_flags: set = set()
+    ips: dict = {}
+    accounts: dict = {}
+    capped = False
+    for app in applications:
+        r = fetched.get(app, ([], False))
+        if isinstance(r, GwsAuthError):
+            raise r
+        if isinstance(r, GwsError):
+            apps[app] = {"error": str(r)}
+            continue
+        items, app_capped = r
+        capped = capped or app_capped
+        counts: collections.Counter = collections.Counter()
+        for item in items:
+            for event in item.get("events", []) or []:
+                name = event.get("name")
+                counts[name] += 1
+                p = event_parameters(event)
+                row = _activity_row(app, item, event, p)
+                if app != "drive" or name in DRIVE_TIMELINE_EVENTS:
+                    timeline.append(row)
+                if _is_posture_event(name, p):
+                    # The same posture event can be delivered under two
+                    # applications (2sv_enroll appears in both login and
+                    # user_accounts); one flag per occurrence.
+                    key = (row["time"], name, row["ip"], row["user"])
+                    if key not in seen_flags:
+                        seen_flags.add(key)
+                        flags.append(row)
+                for bucket, k in ((ips, row["ip"]), (accounts, row["user"])):
+                    if not k:
+                        continue
+                    agg = bucket.setdefault(
+                        k, {"count": 0, "first": row["time"], "last": row["time"], "applications": set()}
+                    )
+                    agg["count"] += 1
+                    agg["applications"].add(app)
+                    t = row["time"] or ""
+                    if t and (agg["first"] is None or t < agg["first"]):
+                        agg["first"] = t
+                    if t and (agg["last"] is None or t > agg["last"]):
+                        agg["last"] = t
+        apps[app] = {"count": sum(counts.values()), "capped": app_capped, "events": dict(counts.most_common())}
+    timeline.sort(key=lambda r: r["time"] or "", reverse=True)
+    flags.sort(key=lambda r: r["time"] or "", reverse=True)
+
+    def _finish(bucket: dict, label: str) -> list[dict]:
+        rows = [{label: k, **v, "applications": sorted(v["applications"])} for k, v in bucket.items()]
+        rows.sort(key=lambda r: (r["last"] or "", r["count"]), reverse=True)
+        return rows
+
+    return {
+        "applications": apps,
+        "timeline": timeline,
+        "flags": flags,
+        "ips": _finish(ips, "ip"),
+        "accounts": _finish(accounts, "user"),
+        "capped": capped,
+    }
+
+
+@mcp.tool()
+def user_activity(
+    username: str,
+    hours: int = 24,
+    applications: str | None = None,
+    max_pages: int = 5,
+    max_events: int = 200,
+    domain: str | None = None,
+) -> dict:
+    """Everything ONE account did across Workspace in a window, newest first.
+
+    The first question after an upstream identity provider reports an account
+    as compromised: did the attacker get into Google, and what did they do
+    there? ``login_audit`` cannot answer it — it is a domain-wide view of the
+    events Google itself raised, so it shows neither one named account's
+    logins nor the logins Google did not flag. This tool asks the Reports API
+    for that one account (``userKey=<username>``, server-side) across several
+    applications at once and merges the answers.
+
+    Read ``flags`` first. It holds the events that change the account's
+    security posture or mark it as under attack, regardless of how much
+    ordinary activity surrounds them: a second factor enrolled or disabled
+    (``2sv_enroll`` survives a password reset — it is the attacker's way back
+    in), recovery email/phone changes, a password change, outbound mail
+    forwarding to another domain, Google's own ``risky_sensitive_action_*``
+    and ``suspicious_login`` / ``account_disabled_*`` verdicts, a login Google
+    marked ``is_suspicious``, and every OAuth ``authorize`` (client and
+    scopes — note that a service account impersonating the user through
+    domain-wide delegation, this server's own Gmail tools included, appears
+    here too, as an ``authorize`` whose ``client_id`` is the service
+    account's numeric id). ``ips`` lists the distinct source addresses with first/last seen
+    and which applications each touched — the input to ``ip_activity`` for
+    the "did the same source reach other accounts" question. ``timeline`` is
+    the merged event list (Drive read/edit/download noise is counted under
+    ``applications.drive.events`` but kept off the timeline), cut at
+    ``max_events`` with ``timeline_truncated`` saying so.
+
+    Coverage is explicit: ``window.start`` is the time actually asked for,
+    each application reports its own ``capped`` (more pages existed) or
+    ``error`` (that application failed — the others still answer), and
+    ``capped`` at the top is their union. Reports data for the current day
+    can lag by hours, so an empty window right after an incident is "not
+    visible yet", not "nothing happened". A missing DWD scope or a rejected
+    credential is a whole-call ``{"error": ...}``.
+
+    Read-only (Reports API ``activities().list`` only, the same
+    ``admin.reports.audit.readonly`` DWD scope as ``login_audit``).
+
+    Args:
+        username: Exact user email, passed through as the Reports API
+            ``userKey`` (primary or alias address both work on Google's side).
+        hours: Window length ending now.
+        applications: Comma-separated Reports API application names to walk.
+            Default: login, token, user_accounts, drive, groups, calendar,
+            chat, meet, saml. ``gmail`` is deliberately not in the default —
+            not every tenant has it — pass it explicitly where it exists.
+        max_pages: Page budget per application (1000 events per page).
+        max_events: Timeline rows returned (newest first); flags, ips and
+            counts are computed over everything fetched regardless.
+        domain: Configured ``[domain.*]`` section to route the lookup
+            through. Default: resolved from the username's suffix.
+    """
+    username = username.strip()
+    try:
+        suffix = _domain_of(username)
+        apps = _parse_applications(applications)
+        clients, _ = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"username": username, "error": str(e)}
+    c = picked[0]
+    start = _window(hours)
+    fetched = _fetch_per_application(c, apps, start=start, max_pages=max_pages, user_key=username)
+    try:
+        got = _collect_activity(fetched, apps)
+    except GwsAuthError as e:
+        return {"domain": c.domain, "username": username, "error": str(e)}
+    timeline = got["timeline"]
+    return {
+        "domain": c.domain,
+        "username": username,
+        "window": {"hours": hours, "start": start.isoformat(timespec="seconds")},
+        "applications": got["applications"],
+        "flags": got["flags"],
+        "ips": got["ips"],
+        "timeline": timeline[:max_events],
+        "timeline_truncated": len(timeline) > max_events,
+        "capped": got["capped"],
+    }
+
+
+@mcp.tool()
+def ip_activity(
+    ip: str,
+    hours: int = 24,
+    applications: str | None = None,
+    max_pages: int = 5,
+    top: int = 50,
+    domain: str | None = None,
+) -> dict:
+    """Every account ONE source address acted as, across applications and domains.
+
+    The follow-through after ``user_activity`` names an attacker's address:
+    did the same source get into other accounts? The Reports API filters on
+    ``actorIpAddress`` server-side, so this is one probe per
+    (domain × application) over the matching events only, not a scan of the
+    whole tenant's log. Per domain it returns the acting ``accounts`` (count,
+    first/last seen, which applications) ordered by most recent, the posture
+    ``flags`` the address triggered (same definition as ``user_activity``),
+    and per-application accounting. Failed logins from the address appear
+    under ``applications.login.events`` as ``login_failure`` — a spray from
+    this address shows there before it ever succeeds.
+
+    Coverage reads as in ``user_activity``: ``window.start``, per-application
+    ``capped`` / ``error``, and a per-domain ``error`` when that domain's
+    credential is rejected (the other domains still answer). A quiet answer
+    for a current-day window can be data lag rather than absence.
+
+    Read-only (Reports API ``activities().list`` only, the
+    ``admin.reports.audit.readonly`` DWD scope).
+
+    Args:
+        ip: The source address, IPv4 or IPv6 literal. Validated before use.
+        hours: Window length ending now.
+        applications: Comma-separated application names; default as in
+            ``user_activity``.
+        max_pages: Page budget per (domain × application).
+        top: Accounts returned per domain, most recently seen first;
+            ``accounts_total`` says how many there were.
+        domain: Restrict to one configured ``[domain.*]`` section. Default:
+            every configured domain, since an address is not tied to one.
+    """
+    try:
+        ip = _parse_ip(ip)
+        apps = _parse_applications(applications)
+        clients, _ = _clients()
+        picked = _select(clients, domain)
+    except (ConfigError, GwsError) as e:
+        return {"ip": ip, "error": str(e)}
+    start = _window(hours)
+    out: dict = {}
+    for c in picked:
+        fetched = _fetch_per_application(c, apps, start=start, max_pages=max_pages, actor_ip=ip)
+        try:
+            got = _collect_activity(fetched, apps)
+        except GwsAuthError as e:
+            out[c.domain] = {"error": str(e)}
+            continue
+        out[c.domain] = {
+            "applications": got["applications"],
+            "accounts_total": len(got["accounts"]),
+            "accounts": got["accounts"][:top],
+            "flags": got["flags"],
+            "capped": got["capped"],
+        }
+    return {
+        "ip": ip,
+        "window": {"hours": hours, "start": start.isoformat(timespec="seconds")},
+        "domains": out,
     }
 
 

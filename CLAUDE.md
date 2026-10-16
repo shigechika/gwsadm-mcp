@@ -14,6 +14,14 @@ API's own UTC-8:00/PST anchor -- requires the separate
 via `users().get`, on the same `admin.directory.user.readonly` scope
 `suspended_accounts` uses; a 404 answers `found: false`, never an error),
 `user_oauth_tokens` (one user's third-party OAuth app grants),
+`user_activity` (one account's activity merged across Reports API
+applications via `userKey=<username>`, newest first, with the posture-changing
+events — 2SV enrol/disable, recovery changes, password change, outbound
+forwarding, `risky_sensitive_action_*`, OAuth `authorize` — surfaced as
+`flags` and the distinct source addresses as `ips`), `ip_activity` (every
+account one source address acted as, per domain, via `actorIpAddress`; both
+on the same `admin.reports.audit.readonly` scope and the same
+`activities().list` call as `login_audit`),
 `drive_external_sharing` (ACL grants to external targets, new link/public
 exposure), `drive_doc_activity` (one document's owner + ACL/lifecycle
 history via a server-side `doc_id` filter), `shared_drive_membership_changes`
@@ -66,6 +74,7 @@ to guard against stdio newline regressions).
 
 - `gwsadm_mcp/server.py` — MCPServer server with `health_check`,
   `login_audit`, `gmail_usage_report`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
+  `user_activity`, `ip_activity`,
   `drive_external_sharing`, `drive_doc_activity`,
   `shared_drive_membership_changes`, `gmail_message_trace`,
   `dmarc_rua_summary`, `group_delivery_policy`, `list_group_members`, `daily_brief`,
@@ -84,7 +93,9 @@ to guard against stdio newline regressions).
   Every audit tool fans its `(domain × eventName)` Reports-API fetches out
   through `_parallel_fetch` — or, for the single-probe doc/membership tools
   whose task shape carries a `filters` expression, the sibling
-  `_fetch_drive_per_domain` — onto a bounded `ThreadPoolExecutor`
+  `_fetch_drive_per_domain`, or, for `user_activity` / `ip_activity`, the
+  per-application sibling `_fetch_per_application` whose tasks carry the
+  `userKey` / `actorIpAddress` narrowing — onto a bounded `ThreadPoolExecutor`
   (`GWSADM_MAX_WORKERS`, default 8, clamped 1..32) — running them serially
   would blow past a gateway's request timeout on a large tenant — then
   aggregates the collected results serially.
