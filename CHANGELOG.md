@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.19.0...v0.20.0) (2026-10-17)
+
+
+### Features
+
+* compromise_sweep -- the Google-side follow-through after one account is compromised ([#96](https://github.com/shigechika/gwsadm-mcp/issues/96)) ([5b95885](https://github.com/shigechika/gwsadm-mcp/commit/5b95885ca46562a6177a7a350784c0c73a90d2dd))
+
 ## [0.19.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.18.0...v0.19.0) (2026-10-17)
 
 
