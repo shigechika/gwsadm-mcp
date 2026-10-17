@@ -78,7 +78,7 @@ dmarc_rua_recipient = postmaster+rua@example.edu   # 省略可。既定値: dmar
 宛先（プラスサブアドレスやグループ）で、検索の絞り込みに使う。`dmarc_rua_mailbox = none`
 でそのドメインを対象外にできる。詳しい理由は README を参照。
 
-`GWSADM_CONFIG` そのものが設定サーフェス全体であり、環境変数だけで
+`GWSADM_CONFIG` そのものが必須の設定サーフェス全体であり、環境変数だけで
 サーバーを設定する方法は存在しない。各 `service_account_file` はさらに
 独立したもう1つのファイルパス依存で、自分の GCP プロジェクト固有の
 Google Cloud サービスアカウント JSON 鍵を指す。どちらのファイルも
@@ -88,6 +88,41 @@ Google Cloud サービスアカウント JSON 鍵を指す。どちらのファ�
 `subject` / `customer_id` のいずれかが欠けている場合は全ツール呼び出しが
 失敗する — スコープ不足とは違い、設定欠落に対する縮退動作は無い。
 
+
+`daily_brief` のアカウントの保護の変更の節（2 段階認証の登録・解除、パスキーの追加・削除、
+高度な保護機能の解除、パスワードや再設定用のメール・電話の変更、ドメイン外への転送の有効化）を
+鋭くする任意の設定が 2 つある。ほかの機能には要らない。
+
+`GWSADM_SITES_INI` は自組織のアドレス範囲を書いた INI ファイルで、keycloak-mcp の
+`KEYCLOAK_SITES_INI`・entraadm-mcp の `ENTRAADM_SITES_INI` と同じ形式なので、1 つのファイルを
+3 つで共用できる:
+
+```ini
+[HQ]
+name = Head office
+ipv4 = 192.0.2.0/24, 198.51.100.0/25
+ipv6 = 2001:db8:1::/48
+```
+
+各変更に、どの拠点から来たか、または `external: true` が付く。未設定のときは `external` が
+`false` ではなく `null` になり、「全部内部」とは読ませない。`external` だけでは印にしない
+（持ち主の多くは自宅から設定を変える）。
+
+`GWSADM_IP2ASN` は iptoasn.com の「combined」表（`ip2asn-combined.tsv`、そのままか `.gz`、PDDL。
+`u32` 版ではない）を指し、`GWSADM_HOME_COUNTRIES` は変更が来るはずの国を ISO 3166-1 alpha-2 で
+カンマ区切りで並べる（例 `JP`、`JP,US`）。
+サーバはファイルを読むだけで、更新は利用者側で行う（週 1 回で足りる）。範囲表の外から来た
+変更に `country`・`asn`・`as_name` が付き、次の `flag_reasons` で `flagged` になる:
+
+- `foreign` — 登録国が `GWSADM_HOME_COUNTRIES` の外
+- `unknown_origin` — アドレスが無いか、表で国が引けない（引けない出どころを国内扱いにしない）
+- `after_suspicious_login` — 同じユーザーが変更の前に不審なログインをしていた。窓より 72 時間前まで
+  さかのぼって見る（2 つのファイルが無くても働く。行の利用者がプロファイル ID だけのときと、不審なログインの
+  取得がすべて失敗したときは `null`）。失敗した取得は `event_errors` に名前が出る。そのログインの取得が途中までか失敗したときは `suspicious_login_coverage` にそう出て、
+  その節は `capped` になる
+
+印の付いた行が先で、それぞれ新しい順に並ぶ。`health_check` は両方を `sites`・`geo` に出す。表の 1 行目を
+読んで確かめるので、読めないファイルは `error`、30 日より古い表と `GWSADM_HOME_COUNTRIES` の未設定は `warning` になる。
 ## 何かに組み込む前に確認する
 
 ```bash

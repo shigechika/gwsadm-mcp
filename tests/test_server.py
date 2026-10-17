@@ -38,6 +38,7 @@ class FakeDomainClient:
             dmarc_rua_recipient=(f"postmaster@{domain}" if dmarc_mailbox_configured else None),
         )
         self._canned = canned  # {(application_name, event_name): (items, capped) | Exception}
+        self.starts = []  # (application_name, event_name, start) per fetch_activities call
         self._auth = auth
         self._suspended = suspended  # (users, capped) | Exception | None
         # user: dict (found) | Exception | None (not found) -- None is the
@@ -108,6 +109,7 @@ class FakeDomainClient:
         actor_ip=None,
     ):
         self.calls.append((application_name, event_name, max_pages, filters))
+        self.starts.append((application_name, event_name, start))
         # The per-account / per-IP narrowing is recorded separately so the
         # existing call-shape assertions above stay untouched.
         self.scoped_calls.append((application_name, event_name, user_key, actor_ip, max_pages))
@@ -3448,3 +3450,303 @@ def test_compromise_sweep_lists_a_mark_as_spam_filter(inject):
     out = server.compromise_sweep("victim@example.edu")
     assert [f["id"] for f in out["gmail"]["filters"]] == ["f9"] and out["gmail"]["filters"][0]["spams"] is True
     assert any(h["kind"] == "filter" and "spams" in h["detail"] for h in out["highlights"])
+
+
+# --- daily_brief: account-protection changes ---------------------------------
+
+
+def _sites_ini(tmp_path, monkeypatch):
+    p = tmp_path / "sites.ini"
+    p.write_text("[HQ]\nname = Head office\nipv4 = 192.0.2.0/24\nipv6 = 2001:db8:1::/48\n", encoding="utf-8")
+    monkeypatch.setenv(server.sites.ENV_VAR, str(p))
+
+
+def _geo(tmp_path, monkeypatch, home="JP"):
+    """A tiny iptoasn table: one home-country range, one foreign, one unrouted."""
+    p = tmp_path / "ip2asn.tsv"
+    p.write_text(
+        "198.51.100.0\t198.51.100.255\t64500\tJP\tHOME-ISP\n"
+        "203.0.113.0\t203.0.113.127\t64501\tGB\tFAR-VPN\n"
+        "203.0.113.128\t203.0.113.255\t0\tNone\tNot routed\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(server.geo.PATH_VAR, str(p))
+    monkeypatch.setenv(server.geo.HOME_VAR, home)
+
+
+def _no_tables(monkeypatch):
+    for var in (server.sites.ENV_VAR, server.geo.PATH_VAR, server.geo.HOME_VAR):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _change(user, event, time, ip, params=None, app="user_accounts"):
+    return {(app, event): ([_item(user, event, params, time=time, ip=ip)], False)}
+
+
+def test_account_changes_flag_foreign_unknown_and_post_suspicious_not_merely_external(inject, tmp_path, monkeypatch):
+    _sites_ini(tmp_path, monkeypatch)
+    _geo(tmp_path, monkeypatch)
+    canned = {
+        ("login", "suspicious_login"): (
+            [_item("victim@example.edu", "suspicious_login", time="2026-07-01T02:00:00.000Z", ip="198.51.100.9")],
+            False,
+        ),
+        # from a home-country ISP after a suspicious login of the same user
+        **_change("victim@example.edu", "2sv_enroll", "2026-07-01T02:15:00.000Z", "198.51.100.9"),
+        # from home, outside the sites table, nothing else: external but not flagged
+        **_change("owner@example.edu", "recovery_email_edit", "2026-07-01T05:00:00.000Z", "198.51.100.20"),
+        # foreign country
+        **_change("far@example.edu", "passkey_enrolled", "2026-07-01T03:00:00.000Z", "203.0.113.4", app="login"),
+        # unrouted: the dataset cannot place it
+        **_change("odd@example.edu", "password_edit", "2026-07-01T04:00:00.000Z", "203.0.113.200"),
+        # inside the sites table: never looked up, never flagged
+        **_change("staff@example.edu", "2sv_disable", "2026-07-01T06:00:00.000Z", "192.0.2.10"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    ac = out["account_changes"]["example.edu"]
+    assert ac["total"] == 5 and ac["flagged"] == 3
+    assert ac["by_reason"] == {"after_suspicious_login": 1, "foreign": 1, "unknown_origin": 1}
+    rows = {e["user"]: e for e in ac["entries"]}
+    assert rows["victim@example.edu"]["flag_reasons"] == ["after_suspicious_login"]
+    assert rows["victim@example.edu"]["country"] == "JP" and rows["victim@example.edu"]["external"] is True
+    assert rows["far@example.edu"]["flag_reasons"] == ["foreign"] and rows["far@example.edu"]["as_name"] == "FAR-VPN"
+    assert rows["odd@example.edu"]["flag_reasons"] == ["unknown_origin"] and rows["odd@example.edu"]["country"] is None
+    assert rows["owner@example.edu"]["flagged"] is False and rows["owner@example.edu"]["external"] is True
+    assert rows["staff@example.edu"]["site"] == "HQ" and rows["staff@example.edu"]["country"] is None
+    assert [e["flagged"] for e in ac["entries"]] == [True, True, True, False, False]
+    assert ac["geo"]["configured"] is True and ac["geo"]["home_countries"] == ["JP"] and ac["geo"]["error"] is None
+    s = out["summary"]["example.edu"]
+    assert s["account_changes"] == 5 and s["account_changes_flagged"] == 3
+
+
+def test_account_changes_without_tables_never_claim_home_or_internal(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = {
+        **_change("u@example.edu", "2sv_disable", "2026-07-01T01:00:00.000Z", "203.0.113.7"),
+        # a change before the suspicious login does not count as "after"
+        **_change("w@example.edu", "password_edit", "2026-07-01T01:00:00.000Z", "203.0.113.8"),
+        ("login", "suspicious_login"): (
+            [_item("w@example.edu", "suspicious_login", time="2026-07-01T04:00:00.000Z")],
+            False,
+        ),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    ac = server.daily_brief(hours=24)["account_changes"]["example.edu"]
+    assert ac["total"] == 2 and ac["flagged"] == 0
+    assert all(e["external"] is None and e["country"] is None for e in ac["entries"])
+    assert ac["sites"]["configured"] is False and ac["geo"]["configured"] is False
+
+
+def test_account_changes_missing_address_is_unknown_origin(inject, tmp_path, monkeypatch):
+    _sites_ini(tmp_path, monkeypatch)
+    _geo(tmp_path, monkeypatch)
+    canned = {("user_accounts", "recovery_phone_edit"): ([_item("n@example.edu", "recovery_phone_edit")], False)}
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    row = server.daily_brief(hours=24)["account_changes"]["example.edu"]["entries"][0]
+    assert row["ip"] is None and row["external"] is True and row["flag_reasons"] == ["unknown_origin"]
+
+
+def test_account_changes_without_home_countries_report_country_but_call_nothing_foreign(inject, tmp_path, monkeypatch):
+    _sites_ini(tmp_path, monkeypatch)
+    _geo(tmp_path, monkeypatch, home="")
+    canned = _change("far@example.edu", "2sv_enroll", "2026-07-01T03:00:00.000Z", "203.0.113.4")
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    row = server.daily_brief(hours=24)["account_changes"]["example.edu"]["entries"][0]
+    assert row["country"] == "GB" and row["flagged"] is False
+
+
+def test_account_changes_read_each_event_from_its_one_application(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    fake = FakeDomainClient(
+        "example.edu",
+        {
+            ("login", "2sv_enroll"): ([_item("u@example.edu", "2sv_enroll")], False),
+            ("user_accounts", "recovery_phone_edit"): server.GwsError("boom"),
+        },
+    )
+    inject([fake], {"example.edu"})
+    ac = server.daily_brief(hours=24)["account_changes"]["example.edu"]
+    assert ac["total"] == 0
+    assert ac["event_errors"] == {"recovery_phone_edit": "boom"}
+    assert ac["capped"] is True  # an unscanned event type is partial coverage, not "nothing found"
+    asked = {(app, ev) for app, ev, *_ in fake.calls}
+    assert ("user_accounts", "2sv_enroll") in asked and ("login", "2sv_enroll") not in asked
+    # passkeys exist under login only; 2sv_change_phone is not a Reports API event (HTTP 400)
+    assert ("login", "passkey_enrolled") in asked and ("login", "passkey_removed") in asked
+    assert not any(ev == "2sv_change_phone" for _, ev in asked)
+
+
+def test_account_changes_forwarding_carries_its_destination(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = _change(
+        "v@example.edu",
+        "email_forwarding_out_of_domain",
+        "2026-07-01T01:05:00.000Z",
+        "198.51.100.30",
+        {"email_forwarding_destination_address": "drop@example.net"},
+    )
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    row = server.daily_brief(hours=24)["account_changes"]["example.edu"]["entries"][0]
+    assert row["destination"] == "drop@example.net"
+
+
+def test_account_changes_auth_error_degrades_only_that_section(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    fake = FakeDomainClient("example.edu", {("user_accounts", "2sv_enroll"): server.GwsAuthError("denied")})
+    inject([fake], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    assert out["account_changes"]["example.edu"] == {"error": "denied"}
+    s = out["summary"]["example.edu"]
+    assert s["account_changes"] is None and "error" not in s
+    assert s["capped"] is True  # a failed scan is incomplete coverage, not "nothing changed"
+
+
+def test_account_changes_capped_when_suspicious_login_scan_is_partial(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = {
+        ("login", "suspicious_login"): ([_item("x@example.edu", "suspicious_login")], True),
+        **_change("y@example.edu", "2sv_enroll", "2026-07-01T09:00:00.000Z", "203.0.113.5"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    ac = out["account_changes"]["example.edu"]
+    assert ac["suspicious_login_coverage"] == "partial"
+    assert ac["capped"] is True and out["summary"]["example.edu"]["capped"] is True
+    assert ac["entries"][0]["after_suspicious_login"] is False  # may be wrong: hence capped
+
+
+def test_account_changes_correlation_unavailable_when_every_suspicious_probe_failed(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = {
+        **{("login", n): server.GwsError("down") for n in server.SUSPICIOUS_LOGIN_EVENTS},
+        **_change("z@example.edu", "password_edit", "2026-07-01T09:00:00.000Z", "203.0.113.9"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    ac = out["account_changes"]["example.edu"]
+    assert ac["suspicious_login_coverage"] == "unavailable" and ac["capped"] is True
+    row = ac["entries"][0]
+    assert row["after_suspicious_login"] is None and row["flagged"] is False
+
+
+def test_account_changes_complete_coverage_leaves_capped_false(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = _change("q@example.edu", "2sv_enroll", "2026-07-01T09:00:00.000Z", "203.0.113.5")
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    ac = server.daily_brief(hours=24)["account_changes"]["example.edu"]
+    assert ac["suspicious_login_coverage"] == "complete" and ac["capped"] is False
+
+
+def test_account_changes_flag_unknown_origin_when_the_dataset_is_unusable(inject, tmp_path, monkeypatch):
+    _sites_ini(tmp_path, monkeypatch)
+    monkeypatch.setenv(server.geo.PATH_VAR, str(tmp_path / "missing.tsv"))
+    monkeypatch.setenv(server.geo.HOME_VAR, "JP")
+    canned = {
+        **_change("a@example.edu", "2sv_enroll", "2026-07-01T01:00:00.000Z", "198.51.100.9"),
+        **_change("b@example.edu", "password_edit", "2026-07-01T02:00:00.000Z", "192.0.2.10"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    ac = server.daily_brief(hours=24)["account_changes"]["example.edu"]
+    rows = {e["user"]: e for e in ac["entries"]}
+    assert rows["a@example.edu"]["flag_reasons"] == ["unknown_origin"]
+    assert rows["b@example.edu"]["flagged"] is False  # inside the sites table: never looked up
+    assert ac["geo"]["error"] is not None
+
+
+def test_account_changes_capped_change_probe_reaches_section_and_summary(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = {("user_accounts", "2sv_enroll"): ([_item("p@example.edu", "2sv_enroll", ip="203.0.113.5")], True)}
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    ac = out["account_changes"]["example.edu"]
+    assert ac["total"] == 1 and ac["suspicious_login_coverage"] == "complete"
+    assert ac["capped"] is True and out["summary"]["example.edu"]["capped"] is True
+
+
+def test_account_changes_profile_id_user_cannot_be_correlated(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    item = _item(None, "2sv_enroll", time="2026-07-01T05:00:00.000Z", ip="203.0.113.5", profile_id="1234567890")
+    canned = {
+        ("user_accounts", "2sv_enroll"): ([item], False),
+        ("login", "suspicious_login"): (
+            [_item("someone@example.edu", "suspicious_login", time="2026-07-01T01:00:00.000Z")],
+            False,
+        ),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    row = server.daily_brief(hours=24)["account_changes"]["example.edu"]["entries"][0]
+    assert row["user"] == "1234567890" and row["after_suspicious_login"] is None
+
+
+def test_account_changes_correlate_a_suspicious_login_from_before_the_window(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    fake = FakeDomainClient(
+        "example.edu",
+        {
+            ("login", "suspicious_login"): (
+                [_item("v@example.edu", "suspicious_login", time="2026-06-29T20:00:00.000Z")],
+                False,
+            ),
+            **_change("v@example.edu", "2sv_enroll", "2026-07-01T09:00:00.000Z", "203.0.113.5"),
+        },
+    )
+    inject([fake], {"example.edu"})
+    row = server.daily_brief(hours=24)["account_changes"]["example.edu"]["entries"][0]
+    assert row["flag_reasons"] == ["after_suspicious_login"]
+    # the correlation probe starts CORRELATION_LOOKBACK_HOURS before the change probes
+    starts = {(app, ev): st for app, ev, st in fake.starts}
+    gap = starts[("user_accounts", "2sv_enroll")] - starts[("login", "suspicious_login")]
+    assert gap.total_seconds() >= server.CORRELATION_LOOKBACK_HOURS * 3600 - 1
+
+
+def test_account_changes_list_newest_first_within_each_group(inject, tmp_path, monkeypatch):
+    _sites_ini(tmp_path, monkeypatch)
+    _geo(tmp_path, monkeypatch)
+    canned = {
+        ("user_accounts", "password_edit"): (
+            [
+                _item("a@example.edu", "password_edit", time="2026-07-01T01:00:00.000Z", ip="198.51.100.1"),
+                _item("b@example.edu", "password_edit", time="2026-07-01T03:00:00.000Z", ip="198.51.100.2"),
+            ],
+            False,
+        ),
+        ("user_accounts", "2sv_enroll"): (
+            [
+                _item("c@example.edu", "2sv_enroll", time="2026-07-01T00:30:00.000Z", ip="203.0.113.1"),
+                _item("d@example.edu", "2sv_enroll", time="2026-07-01T02:30:00.000Z", ip="203.0.113.2"),
+            ],
+            False,
+        ),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    users = [e["user"] for e in server.daily_brief(hours=24)["account_changes"]["example.edu"]["entries"]]
+    assert users == ["d@example.edu", "c@example.edu", "b@example.edu", "a@example.edu"]
+
+
+def test_account_changes_auth_error_on_a_correlation_probe_fails_the_section(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = {
+        ("login", "suspicious_login"): server.GwsAuthError("denied"),
+        **_change("v@example.edu", "2sv_enroll", "2026-07-01T09:00:00.000Z", "203.0.113.5"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    # auth is domain-wide: no rows are kept with a correlation that silently reads "no"
+    assert out["account_changes"]["example.edu"] == {"error": "denied"}
+    # the login audit reads the same probe, so the summary reports the domain as failed, not as complete
+    assert "error" in out["summary"]["example.edu"]
+
+
+def test_account_changes_partial_when_one_suspicious_probe_failed(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = {
+        ("login", "suspicious_login"): server.GwsError("[example.edu] reports API error (login): HTTP 503"),
+        **_change("v@example.edu", "2sv_enroll", "2026-07-01T09:00:00.000Z", "203.0.113.5"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    ac = out["account_changes"]["example.edu"]
+    assert ac["suspicious_login_coverage"] == "partial" and ac["capped"] is True
+    assert ac["event_errors"] == {"suspicious_login": "[example.edu] reports API error (login): HTTP 503"}
+    assert ac["entries"][0]["after_suspicious_login"] is False  # may be wrong: hence capped

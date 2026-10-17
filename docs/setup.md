@@ -78,7 +78,7 @@ to read DMARC aggregate reports; `dmarc_rua_recipient` (optional) is the publish
 or a group); `dmarc_rua_mailbox = none` opts the domain out. See the README for the
 full rationale.
 
-`GWSADM_CONFIG` itself is the entire configuration surface — there is no way
+`GWSADM_CONFIG` itself is the entire required configuration surface — there is no way
 to configure the server through plain environment variables alone. Each
 `service_account_file` is a second, independent file-path dependency: a
 Google Cloud service-account JSON key unique to your own GCP project. Neither
@@ -87,6 +87,49 @@ manifest; both must exist on the machine running the server before any tool
 call succeeds. If the INI file is missing, or a domain section is missing
 `service_account_file` / `subject` / `customer_id`, every tool call fails —
 there is no degraded fallback for a missing config, unlike a missing scope.
+
+Two optional extras sharpen `daily_brief`'s account-protection section
+(2-Step Verification enrolled or disabled, a passkey added or removed, Advanced
+Protection turned off, password or recovery address/phone edited, mail
+forwarding out of the domain turned on). Neither is needed for anything else.
+
+`GWSADM_SITES_INI` is an INI file of your own address ranges, the same format
+as keycloak-mcp's `KEYCLOAK_SITES_INI` and entraadm-mcp's `ENTRAADM_SITES_INI`,
+so one file can serve all three:
+
+```ini
+[HQ]
+name = Head office
+ipv4 = 192.0.2.0/24, 198.51.100.0/25
+ipv6 = 2001:db8:1::/48
+```
+
+Each change then says which site it came from, or `external: true`. Unset,
+`external` is `null` rather than `false`, so a missing table never reads as
+"everything is internal". `external` on its own is not a flag: most owners
+change these settings from home.
+
+`GWSADM_IP2ASN` points at the iptoasn.com "combined" table (`ip2asn-combined.tsv`,
+plain or `.gz`, PDDL; not the `u32` variant) and `GWSADM_HOME_COUNTRIES` lists the
+ISO 3166-1 alpha-2 codes changes are expected to come from, separated by commas,
+e.g. `JP` or `JP,US`. The server only reads the file; refresh it
+yourself (weekly is plenty). Each change from outside the sites table then
+carries `country` / `asn` / `as_name`, and a row is `flagged` with
+`flag_reasons`:
+
+- `foreign` — registered country outside `GWSADM_HOME_COUNTRIES`;
+- `unknown_origin` — no address, or one the dataset cannot place (an origin
+  that cannot be placed is not treated as home);
+- `after_suspicious_login` — the same user had a suspicious login before the
+  change, looking 72 hours further back than the window (works without either
+  file; `null` when the row names only a profile id or every suspicious-login
+  probe failed). Probes that failed outright are named in `event_errors`. When that login scan itself was partial
+  or failed, `suspicious_login_coverage` says so and the section is `capped`.
+
+Flagged rows come first, newest first. `health_check` reports both under
+`sites` and `geo`; it reads the dataset's first line, so an unreadable file is an
+`error` there, and a dataset older than 30 days or a missing
+`GWSADM_HOME_COUNTRIES` is a `warning`.
 
 ## Verify before wiring it into anything
 
