@@ -96,11 +96,25 @@ async def _some_account(call: Caller) -> dict[str, Any]:
         address = _first_field(failures, "user", r"[^'\"]+@[^'\"]+")
     if not address:
         raise SkipProbe("no suspended account or failing login to take an address from")
-    return {"username": address}
+    args: dict[str, Any] = {"username": address}
+    # The login-failure fallback is whatever somebody typed at a login prompt,
+    # so its suffix may be no configured domain at all -- the per-user tools
+    # would then answer ``unknown domain``, a red about the probe's input
+    # rather than the tool. Route such an address through a configured domain
+    # explicitly (every per-user tool takes the same ``domain`` override); an
+    # address in a configured domain resolves on its own and gets none.
+    suffix = address.rsplit("@", 1)[-1].lower()
+    configured = await _configured_domains(call)
+    if configured and suffix not in configured:
+        args["domain"] = configured[0]
+    return args
 
 
-async def _configured_domain(call: Caller) -> str | None:
-    """A domain the server is actually configured for, taken from health_check.
+_DOMAIN_SHAPE = r"[A-Za-z0-9.-]+\.(?:xn--[A-Za-z0-9-]+|[A-Za-z]{2,})"
+
+
+async def _configured_domains(call: Caller) -> list[str]:
+    """Every domain the server is configured for, taken from health_check.
 
     Needed because ``_some_account`` can fall back to an address scraped from the
     login_audit failure top, whose suffix is whatever somebody typed at a login
@@ -109,11 +123,18 @@ async def _configured_domain(call: Caller) -> str | None:
     tool. health_check reports the configured domains, so use those instead.
     """
     health = await call("health_check", {})
+    text = health if isinstance(health, str) else str(health)
     # The final label allows the punycode form as well as a plain alphabetic TLD:
     # an internationalised domain reaches the API as "xn--..." (digits and hyphens),
     # which an [A-Za-z]{2,} tail rejects -- and a rejection here is a silent skip of
     # the whole probe, i.e. a tenant whose per-account lookup is never exercised.
-    return _first_field(health, "domain", r"[A-Za-z0-9.-]+\.(?:xn--[A-Za-z0-9-]+|[A-Za-z]{2,})")
+    return [m.lower() for m in re.findall(rf"""['"]domain['"]:\s*['"]({_DOMAIN_SHAPE})['"]""", text)]
+
+
+async def _configured_domain(call: Caller) -> str | None:
+    """The first configured domain, or None (see ``_configured_domains``)."""
+    found = await _configured_domains(call)
+    return found[0] if found else None
 
 
 async def _fake_account(call: Caller) -> dict[str, Any]:
@@ -149,6 +170,33 @@ async def _fake_account(call: Caller) -> dict[str, Any]:
     if not suffix:
         raise SkipProbe("health_check reported no configured domain to build an address on")
     return {"username": f"smoke-test-{secrets.token_hex(16)}@{suffix}"}
+
+
+async def _some_ip(call: Caller) -> dict[str, Any]:
+    """Discover a source address at run time for the per-IP tool.
+
+    An address that acted in the tenant recently, so the probe exercises the
+    ``actorIpAddress`` filter against events that exist. Two sources, cheapest
+    first: the ``ip`` on a Google verdict or a failing login that
+    ``login_audit`` already reports, then whatever ``user_activity`` shows for
+    a recently failing account (NOT ``_some_account``'s first choice, a
+    suspended account, which by definition has no recent activity and would
+    make this a skip on every tenant that has one). A tenant with neither is
+    a skip, not a failure — there is no address to ask about.
+    """
+    audit = await call("login_audit", {"hours": 24 * 30, "include_failures": True, "top": 5})
+    ip = _first_field(audit, "ip", r"[0-9A-Fa-f.:]+")
+    if not ip:
+        address = _first_field(audit, "user", r"[^'\"]+@[^'\"]+")
+        if address:
+            args: dict[str, Any] = {"username": address, "hours": 24 * 7, "max_pages": MAX_PAGES, "max_events": 1}
+            configured = await _configured_domains(call)
+            if configured and address.rsplit("@", 1)[-1].lower() not in configured:
+                args["domain"] = configured[0]
+            ip = _first_field(await call("user_activity", args), "ip", r"[0-9A-Fa-f.:]+")
+    if not ip:
+        raise SkipProbe("no verdict, failing login or recent activity to take a source address from")
+    return {"ip": ip}
 
 
 async def _fake_message_and_recipient(call: Caller) -> dict[str, Any]:
@@ -270,6 +318,33 @@ PROBES: dict[str, Probe] = {
         # This tool reports a failure as {"username": ..., "error": ...}, which
         # still satisfies two of the required keys.
         must_not_match=NO_DOMAIN_ERROR,
+        allow_empty=True,
+    ),
+    "user_activity": Probe(
+        args={"hours": WINDOW_HOURS * 7, "max_pages": MAX_PAGES, "max_events": 5},
+        args_factory=_some_account,
+        require_keys=("domain", "username", "window", "applications", "flags", "ips", "timeline", "capped"),
+        rows_key="timeline",
+        # A quiet account is a real answer, but a quiet answer in which EVERY
+        # application failed is not: at least one application must have
+        # produced its accounting (a "count"). Deliberately no must_not_match
+        # on a nested "error" beyond that: one application the tenant does not
+        # have (gmail on some tenants) is reported as that application's own
+        # error next to the others' results -- the tool WORKING as documented.
+        # A whole-call failure is a top-level error, which the harness already
+        # rejects.
+        must_match=(r'"count": \d',),
+        allow_empty=True,
+    ),
+    "ip_activity": Probe(
+        args={"hours": WINDOW_HOURS * 7, "max_pages": MAX_PAGES, "top": 5},
+        args_factory=_some_ip,
+        require_keys=("ip", "window", "domains"),
+        must_match=(DOMAINS_NOT_EMPTY, r'"count": \d'),
+        # Only a whole-domain failure (the domain's value IS {"error": ...})
+        # fails the probe. A per-application error sits one level deeper,
+        # under a key with no dot in it, and is the documented degradation.
+        must_not_match=(r'"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+": \{"error":',),
         allow_empty=True,
     ),
     "gmail_message_trace": Probe(

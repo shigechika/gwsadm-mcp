@@ -721,6 +721,8 @@ class DomainClient:
         event_name: str | None = None,
         filters: str | None = None,
         max_pages: int = 5,
+        user_key: str = "all",
+        actor_ip: str | None = None,
     ) -> tuple[list[dict], bool]:
         """Fetch audit activities (newest first). Returns ``(items, capped)``.
 
@@ -729,9 +731,15 @@ class DomainClient:
         ``filters`` is passed through as the Reports API ``filters`` expression
         (e.g. ``"doc_id==<id>"``); callers own validating any interpolated value
         because the expression is an operator language, not a plain string.
+        ``user_key`` narrows the query to one account (the API's ``userKey``
+        path segment: an email or profile id; ``"all"`` is every account) and
+        ``actor_ip`` to events performed from one source address (the
+        ``actorIpAddress`` parameter) — both server-side, so the page budget
+        is spent on the matching events only. Callers own validating those
+        values too: ``user_key`` becomes part of the request URL.
         """
         params = {
-            "userKey": "all",
+            "userKey": user_key,
             "applicationName": application_name,
             "customerId": self.cfg.customer_id,
             "startTime": _rfc3339(start),
@@ -743,6 +751,8 @@ class DomainClient:
             params["eventName"] = event_name
         if filters:
             params["filters"] = filters
+        if actor_ip:
+            params["actorIpAddress"] = actor_ip
         items: list[dict] = []
         token = None
         pages = 0

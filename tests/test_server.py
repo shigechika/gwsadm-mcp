@@ -64,6 +64,7 @@ class FakeDomainClient:
         # to that call, letting a test cover "one date fails, others don't")
         self._usage_by_date = usage_by_date
         self.calls = []
+        self.scoped_calls = []
         self.user_calls = []
         self.token_calls = []
         self.gmail_calls = []
@@ -83,8 +84,22 @@ class FakeDomainClient:
             raise got
         return got
 
-    def fetch_activities(self, application_name, *, start, end=None, event_name=None, filters=None, max_pages=5):
+    def fetch_activities(
+        self,
+        application_name,
+        *,
+        start,
+        end=None,
+        event_name=None,
+        filters=None,
+        max_pages=5,
+        user_key="all",
+        actor_ip=None,
+    ):
         self.calls.append((application_name, event_name, max_pages, filters))
+        # The per-account / per-IP narrowing is recorded separately so the
+        # existing call-shape assertions above stay untouched.
+        self.scoped_calls.append((application_name, event_name, user_key, actor_ip, max_pages))
         # Filtered (doc-scoped) fetches are canned under (application, filters).
         got = self._canned.get((application_name, filters if filters else event_name), ([], False))
         if isinstance(got, Exception):
@@ -2755,3 +2770,341 @@ def test_dmarc_rua_summary_mailbox_override_re_enables_opted_out_domain(inject):
     out = server.dmarc_rua_summary(mailbox="dmarc-reports@students.example.edu")
     assert len(opted_out.dmarc_rua_calls) == 1
     assert out["domains"]["students.example.edu"]["mailbox"] == "dmarc-reports@students.example.edu"
+
+
+# --- user_activity / ip_activity -------------------------------------------
+
+
+def _activity_fixture():
+    """One account's day as the Reports API delivers it, spread over applications.
+
+    Mirrors a live compromise shape: SAML login from one address, an OAuth
+    authorize, a login Google marked suspicious from a second address, 2SV
+    enrolment from a third (delivered under BOTH login and user_accounts),
+    then Drive reads that are noise and one share that is not.
+    """
+    u = "victim@example.edu"
+    return {
+        ("login", None): (
+            [
+                _item(u, "login_success", {"login_type": "saml"}, time="2026-07-01T01:00:00.000Z", ip="192.0.2.10"),
+                _item(
+                    u,
+                    "login_success",
+                    {"login_type": "saml", "is_suspicious": "true"},
+                    time="2026-07-01T01:10:00.000Z",
+                    ip="192.0.2.20",
+                ),
+                _item(u, "2sv_enroll", time="2026-07-01T01:20:00.000Z", ip="192.0.2.30"),
+                _item(
+                    u,
+                    "risky_sensitive_action_blocked",
+                    {"sensitive_action_name": "ACCOUNT_RECOVERY_CHANGE"},
+                    time="2026-07-01T05:00:00.000Z",
+                    ip="192.0.2.40",
+                ),
+            ],
+            False,
+        ),
+        ("user_accounts", None): (
+            [_item(u, "2sv_enroll", time="2026-07-01T01:20:00.000Z", ip="192.0.2.30")],
+            False,
+        ),
+        ("token", None): (
+            [
+                _item(
+                    u,
+                    "authorize",
+                    {"app_name": "Some App", "client_id": "123.apps", "scope": ["https://mail.google.com/"]},
+                    time="2026-07-01T01:01:00.000Z",
+                    ip="192.0.2.10",
+                )
+            ],
+            False,
+        ),
+        ("drive", None): (
+            [
+                _item(u, "view", {"doc_id": "d1"}, time="2026-07-01T02:00:00.000Z", ip="192.0.2.10"),
+                _item(u, "view", {"doc_id": "d2"}, time="2026-07-01T02:01:00.000Z", ip="192.0.2.10"),
+                _item(
+                    u,
+                    "change_user_access",
+                    {
+                        "doc_id": "d1",
+                        "doc_title": "Budget",
+                        "target_user": "x@partner.example",
+                        "new_value": ["can_view"],
+                    },
+                    time="2026-07-01T02:05:00.000Z",
+                    ip="192.0.2.10",
+                ),
+            ],
+            True,
+        ),
+    }
+
+
+def test_user_activity_merges_applications_and_flags_posture_events(inject):
+    c = FakeDomainClient("example.edu", _activity_fixture())
+    inject([c], {"example.edu"})
+    out = server.user_activity("victim@example.edu", hours=24, max_pages=2)
+    assert out["domain"] == "example.edu"
+    assert out["window"]["hours"] == 24 and out["window"]["start"]
+    # Every default application was asked for THIS account, server-side.
+    own = [call for call in c.scoped_calls if call[1] is None]
+    assert {a for (a, *_rest) in own} == set(server.ACTIVITY_APPLICATIONS)
+    assert all(uk == "victim@example.edu" and aip is None and mp == 2 for (_a, _e, uk, aip, mp) in own)
+    # ... and Google's verdicts the way login_audit asks: one probe per name, userKey=all, own small budget.
+    verdicts = [call for call in c.scoped_calls if call[1] is not None]
+    assert {e for (_a, e, *_rest) in verdicts} == set(server.VERDICT_EVENTS)
+    assert all(a == "login" and uk == "all" and mp == server.VERDICT_MAX_PAGES for (a, _e, uk, _ip, mp) in verdicts)
+    assert out["applications"][server.LOGIN_VERDICTS] == {"count": 0, "capped": False, "events": {}}
+    # Per-application accounting counts everything, including the Drive noise.
+    assert out["applications"]["drive"] == {"count": 3, "capped": True, "events": {"view": 2, "change_user_access": 1}}
+    assert out["applications"]["login"]["count"] == 4
+    assert out["capped"] is True  # the union of the per-application flags
+    # Flags: suspicious login, 2sv_enroll ONCE (delivered under two applications),
+    # the blocked sensitive action, the OAuth authorize -- newest first.
+    assert [f["event"] for f in out["flags"]] == [
+        "risky_sensitive_action_blocked",
+        "2sv_enroll",
+        "login_success",
+        "authorize",
+    ]
+    by_event = {f["event"]: f for f in out["flags"]}
+    assert by_event["login_success"]["params"]["is_suspicious"] == "true"
+    assert by_event["risky_sensitive_action_blocked"]["params"]["sensitive_action_name"] == "ACCOUNT_RECOVERY_CHANGE"
+    assert by_event["authorize"]["params"] == {
+        "app_name": "Some App",
+        "client_id": "123.apps",
+        "scope": ["https://mail.google.com/"],
+    }
+    assert by_event["2sv_enroll"]["application"] in {"login", "user_accounts"}
+    # Timeline: newest first, Drive reads excluded, the share kept.
+    names = [r["event"] for r in out["timeline"]]
+    assert "view" not in names
+    assert names[0] == "risky_sensitive_action_blocked" and "change_user_access" in names
+    share = next(r for r in out["timeline"] if r["event"] == "change_user_access")
+    assert share["params"]["target_user"] == "x@partner.example" and share["params"]["doc_title"] == "Budget"
+    assert out["timeline_truncated"] is False
+    # Source addresses, most recently seen first, with the applications each touched.
+    ips = {r["ip"]: r for r in out["ips"]}
+    assert [r["ip"] for r in out["ips"]][0] == "192.0.2.40"
+    assert ips["192.0.2.10"]["applications"] == ["drive", "login", "token"]
+    assert ips["192.0.2.10"]["first"] == "2026-07-01T01:00:00.000Z"
+    assert ips["192.0.2.10"]["last"] == "2026-07-01T02:05:00.000Z"
+    assert ips["192.0.2.30"]["count"] == 2  # both deliveries of the enrolment count as activity
+
+
+def test_user_activity_one_failing_application_is_reported_not_fatal(inject):
+    from gwsadm_mcp.client import GwsError
+
+    canned = {
+        ("login", None): ([_item("u@example.edu", "login_success", ip="192.0.2.1")], False),
+        ("gmail", None): GwsError("[example.edu] reports API error (gmail): HTTP 400"),
+    }
+    c = FakeDomainClient("example.edu", canned)
+    inject([c], {"example.edu"})
+    out = server.user_activity("u@example.edu", applications="login, gmail")
+    assert "error" not in out
+    assert out["applications"]["login"]["count"] == 1
+    assert "HTTP 400" in out["applications"]["gmail"]["error"]
+    assert out["capped"] is True  # a window never scanned is partial coverage, not "nothing there"
+    assert set(out["applications"]) == {"login", "gmail", server.LOGIN_VERDICTS}
+
+
+def test_user_activity_auth_error_fails_the_whole_call(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    canned = {("login", None): GwsAuthError("[example.edu] auth failed: no scope")}
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.user_activity("u@example.edu", applications="login,token")
+    assert "auth failed" in out["error"]
+    assert out["domain"] == "example.edu" and "applications" not in out
+
+
+def test_user_activity_rejects_bad_input_before_any_fetch(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    assert "error" in server.user_activity("not-an-address")
+    assert "not a Reports API application" in server.user_activity("u@example.edu", applications="login,../x")["error"]
+    too_many = ",".join(f"app{i}" for i in range(server.MAX_ACTIVITY_APPLICATIONS + 1))
+    assert "at most" in server.user_activity("u@example.edu", applications=too_many)["error"]
+    assert "unknown domain" in server.user_activity("u@nope.example")["error"]
+    assert c.scoped_calls == []
+
+
+def test_user_activity_truncates_timeline_but_not_the_accounting(inject):
+    items = [
+        _item("u@example.edu", "login_success", time=f"2026-07-01T0{i}:00:00.000Z", ip="192.0.2.1") for i in range(5)
+    ]
+    inject([FakeDomainClient("example.edu", {("login", None): (items, False)})], {"example.edu"})
+    out = server.user_activity("u@example.edu", applications="login", max_events=2)
+    assert len(out["timeline"]) == 2 and out["timeline_truncated"] is True
+    assert out["timeline"][0]["time"] == "2026-07-01T04:00:00.000Z"  # newest first
+    assert out["applications"]["login"]["count"] == 5
+    assert out["ips"][0]["count"] == 5
+
+
+def test_user_activity_explicit_domain_and_whitespace(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.user_activity("  u@alias.edu ", applications="login", domain="example.edu")
+    assert out["domain"] == "example.edu" and out["username"] == "u@alias.edu"
+    assert [call for call in c.scoped_calls if call[1] is None] == [("login", None, "u@alias.edu", None, 5)]
+    assert out["timeline"] == [] and out["flags"] == [] and out["capped"] is False
+
+
+def test_ip_activity_lists_accounts_per_domain_and_scopes_the_fetch(inject):
+    staff = {
+        ("login", None): (
+            [
+                _item("a@example.edu", "login_failure", time="2026-07-01T01:00:00.000Z", ip="192.0.2.5"),
+                _item("a@example.edu", "login_success", time="2026-07-01T01:01:00.000Z", ip="192.0.2.5"),
+                _item("b@example.edu", "login_failure", time="2026-07-01T00:30:00.000Z", ip="192.0.2.5"),
+            ],
+            False,
+        ),
+        ("user_accounts", None): (
+            [_item("a@example.edu", "recovery_email_edit", time="2026-07-01T01:05:00.000Z", ip="192.0.2.5")],
+            False,
+        ),
+    }
+    students = {("login", None): ([_item("s@students.example.edu", "login_success", ip="192.0.2.5")], True)}
+    c1 = FakeDomainClient("example.edu", staff)
+    c2 = FakeDomainClient("students.example.edu", students)
+    inject([c1, c2], {"example.edu", "students.example.edu"})
+    out = server.ip_activity(" 192.0.2.5 ", hours=48, applications="login,user_accounts", max_pages=1, top=1)
+    assert out["ip"] == "192.0.2.5"  # normalised, whitespace gone
+    assert out["window"]["hours"] == 48
+    for c in (c1, c2):
+        assert set(c.scoped_calls) == {
+            ("login", None, "all", "192.0.2.5", 1),
+            ("user_accounts", None, "all", "192.0.2.5", 1),
+        }
+    d = out["domains"]["example.edu"]
+    assert d["accounts_total"] == 2 and len(d["accounts"]) == 1  # top=1 cuts the list, not the count
+    assert d["accounts"][0]["user"] == "a@example.edu"  # most recently seen first
+    assert d["accounts"][0]["count"] == 3 and d["accounts"][0]["applications"] == ["login", "user_accounts"]
+    assert d["applications"]["login"]["events"] == {"login_failure": 2, "login_success": 1}
+    assert [f["event"] for f in d["flags"]] == ["recovery_email_edit"]
+    assert d["capped"] is False
+    s = out["domains"]["students.example.edu"]
+    assert s["accounts"][0]["user"] == "s@students.example.edu" and s["capped"] is True
+
+
+def test_ip_activity_rejects_a_non_address_and_isolates_a_failing_domain(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    c1 = FakeDomainClient("example.edu", {("login", None): GwsAuthError("[example.edu] auth failed")})
+    c2 = FakeDomainClient("students.example.edu", {})
+    inject([c1, c2], {"example.edu", "students.example.edu"})
+    bad = server.ip_activity("192.0.2.999", applications="login")
+    assert "not an IP address" in bad["error"] and c1.scoped_calls == []
+    assert "not an IP address" in server.ip_activity("2001:db8::zz", applications="login")["error"]
+    out = server.ip_activity("2001:db8::1", applications="login")
+    assert out["ip"] == "2001:db8::1"
+    assert "auth failed" in out["domains"]["example.edu"]["error"]
+    assert out["domains"]["students.example.edu"]["accounts"] == []
+
+
+def test_ip_activity_domain_filter_limits_the_scan(inject):
+    c1 = FakeDomainClient("example.edu", {})
+    c2 = FakeDomainClient("students.example.edu", {})
+    inject([c1, c2], {"example.edu", "students.example.edu"})
+    out = server.ip_activity("192.0.2.5", applications="login", domain="students.example.edu")
+    assert list(out["domains"]) == ["students.example.edu"]
+    assert c1.scoped_calls == [] and len(c2.scoped_calls) == 1
+    assert "unknown domain" in server.ip_activity("192.0.2.5", domain="nope.example")["error"]
+
+
+def test_user_activity_keeps_distinct_grants_at_the_same_instant_but_collapses_twins(inject):
+    u = "u@example.edu"
+    t = "2026-07-01T01:00:00.000Z"
+    canned = {
+        ("token", None): (
+            [
+                _item(u, "authorize", {"client_id": "one.apps", "scope": ["a"]}, time=t, ip="192.0.2.1"),
+                _item(u, "authorize", {"client_id": "two.apps", "scope": ["b"]}, time=t, ip="192.0.2.1"),
+            ],
+            False,
+        ),
+        # The same enrolment delivered under both applications: one flag.
+        ("login", None): ([_item(u, "2sv_enroll", time=t, ip="192.0.2.1")], False),
+        ("user_accounts", None): ([_item(u, "2sv_enroll", time=t, ip="192.0.2.1")], False),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.user_activity(u, applications="token,login,user_accounts")
+    grants = sorted(f["params"]["client_id"] for f in out["flags"] if f["event"] == "authorize")
+    assert grants == ["one.apps", "two.apps"]
+    assert sum(1 for f in out["flags"] if f["event"] == "2sv_enroll") == 1
+
+
+def _google_verdict(event_name, affected, time="2026-07-01T03:00:00.000Z", ip="192.0.2.99"):
+    """A Google-initiated login verdict as the API delivers it: no actor email or
+    profileId, the account only in affected_email_address."""
+    return {
+        "id": {"time": time},
+        "actor": {"callerType": "KEY", "key": "Google"},
+        "ipAddress": ip,
+        "events": [{"name": event_name, "parameters": [{"name": "affected_email_address", "value": affected}]}],
+    }
+
+
+def test_user_activity_fetches_google_verdicts_by_affected_address(inject):
+    from gwsadm_mcp.client import GwsError
+
+    canned = {
+        ("login", None): ([_item("victim@example.edu", "login_success", ip="192.0.2.1")], False),
+        # Verdicts come back under userKey=all; only the one naming this account is kept.
+        ("login", "account_disabled_hijacked"): (
+            [
+                _google_verdict("account_disabled_hijacked", "victim@example.edu"),
+                _google_verdict("account_disabled_hijacked", "other@example.edu", time="2026-07-01T03:30:00.000Z"),
+            ],
+            False,
+        ),
+        ("login", "suspicious_login"): GwsError("[example.edu] reports API error (login): HTTP 503"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.user_activity("victim@example.edu", applications="login")
+    v = out["applications"][server.LOGIN_VERDICTS]
+    assert v["count"] == 1 and v["events"] == {"account_disabled_hijacked": 1}
+    assert "HTTP 503" in v["event_errors"]["suspicious_login"]
+    assert out["capped"] is True  # one verdict probe failed: partial coverage
+    verdict = next(f for f in out["flags"] if f["event"] == "account_disabled_hijacked")
+    assert verdict["user"] == "victim@example.edu" and verdict["application"] == server.LOGIN_VERDICTS
+    assert verdict["ip"] == "192.0.2.99"
+    assert "other@example.edu" not in {f["user"] for f in out["flags"]}
+    assert any(r["ip"] == "192.0.2.99" for r in out["ips"])  # the verdict's address is a source too
+
+
+def test_user_activity_verdict_auth_error_fails_the_whole_call(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    canned = {("login", "gov_attack_warning"): GwsAuthError("[example.edu] auth failed: no scope")}
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.user_activity("u@example.edu", applications="login")
+    assert "auth failed" in out["error"] and "applications" not in out
+
+
+def test_user_activity_collapses_a_twin_delivery_even_with_different_parameters(inject):
+    u = "u@example.edu"
+    t = "2026-07-01T01:00:00.000Z"
+    canned = {
+        ("login", None): ([_item(u, "2sv_enroll", {"login_type": "saml"}, time=t, ip="192.0.2.1")], False),
+        ("user_accounts", None): ([_item(u, "2sv_enroll", time=t, ip="192.0.2.1")], False),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.user_activity(u, applications="login,user_accounts")
+    assert [f["event"] for f in out["flags"]] == ["2sv_enroll"]
+    # The raw deliveries are still both counted where counts are raw.
+    assert out["applications"]["login"]["count"] == 1 and out["applications"]["user_accounts"]["count"] == 1
+    assert out["ips"][0]["count"] == 2
+
+
+def test_ip_activity_rejects_a_zone_scoped_ipv6_literal(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.ip_activity("fe80::1%eth0", applications="login")
+    assert "not an IP address" in out["error"] and c.scoped_calls == []
