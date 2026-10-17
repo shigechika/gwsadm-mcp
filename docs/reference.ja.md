@@ -11,6 +11,7 @@
 | `user_oauth_tokens` | Directory API `tokens().list` — **特定ユーザー1名**の第三者OAuthアプリ連携一覧。既存トークンはログイン不要で使えるため `login_audit` では検知できない侵害経路。ドメインはユーザー名のサフィックスから解決（エイリアス/セカンダリドメインのアドレス用に `domain` で明示指定も可） |
 | `user_activity` | Reports API `activities().list` を `userKey=<username>` で — **特定アカウント1名**がウィンドウ内に Workspace 全体で行ったことを、アプリ横断（既定: login・token・user_accounts・drive・groups・calendar・chat・meet・saml）で新しい順にまとめる。`flags` は量に関係なくアカウントのセキュリティ姿勢を変えるイベント（2SV の登録/解除、復旧用メール/電話の変更、パスワード変更、ドメイン外への転送、Google 自身の `risky_sensitive_action_*` / `suspicious_login` 判定、OAuth の `authorize` 全件とそのクライアント・スコープ）を先頭に出す — 攻撃者が登録した第2要素はパスワードリセット後も残るため。`ips` は送信元アドレスごとの初見/最終を列挙。Google 自身の `account_disabled_*` / `suspicious_login` 判定は本人の `userKey` では返らない（actor が Google）ため、`login_audit` と同じ取り方で別に取得し、擬似アプリ `login_verdicts` として返す。`login_audit` では答えられない侵害後の問い（あれは Google 自身が挙げたイベントのドメイン全体ビュー） |
 | `ip_activity` | Reports API `activities().list` を `actorIpAddress=<ip>` で — **特定の送信元アドレス1つ**が操作した全アカウントを、ドメイン別・アプリ別に、同じ `flags` 付きで。`user_activity` で攻撃者のアドレスが分かった後の追跡: 同じ送信元が他のアカウントにも届いたか。スプレーは成功前から `login_failure` の件数として現れる |
+| `compromise_sweep` | **特定アカウント1名**の侵害が確定した後の Google 側の追跡を 1 回で: `activity`（`user_activity`、flags を先頭に）、`state` / `grants`（`get_user`、メール・Drive・連絡先・管理のスコープを持つ OAuth 付与を `risky` として明示）、`ips`（攻撃者のアドレス — 指定するか、本人の flags から取る — で全ドメインに `ip_activity`。本人は除外）、`gmail`: 攻撃者がメールを読み続けるために残す設定（自動転送・転送先アドレス・転送/削除/アーカイブするフィルタ・委任・送信者名とreply-to）と、ウィンドウ内に送った通数・宛先ドメイン — 件名・本文は読まない。`gmail.kind` が読めたかどうかを示す: `ok` / `api_disabled`（サービスアカウント自身の Cloud プロジェクトで Gmail API が無効）/ `no_grant` / `error` — 失敗は失敗として返し、「何も無かった」とは読まない。`highlights` に対応すべき事実、`checklist` に手作業で残ること。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープ（設定の読み取りは `delegates.list` を含め全てこのスコープで通ることを実機で確認） |
 | `drive_external_sharing` | Reports API `drive` — 外部アドレス/ドメインへの ACL **付与**（取り消しは別集計）、リンク公開/一般公開への可視性**遷移** |
 | `drive_doc_activity` | Reports API `drive` をサーバー側 `doc_id` フィルタで — **特定1文書**の所有者・ACL 変更・ライフサイクル履歴。`drive_external_sharing` の検知トリアージ用: 所有者（個人か共有ドライブ名か）で誤検知クラスを切り分ける |
 | `shared_drive_membership_changes` | Reports API `drive`（`shared_drive_membership_change`）— 共有ドライブのメンバー追加/削除/ロール変更の履歴。対象メンバーの外部判定と、クライアント側ドライブ名フィルタ付き |
@@ -41,7 +42,7 @@
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
 | `https://www.googleapis.com/auth/admin.reports.usage.readonly` | `gmail_usage_report` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
-| `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace`、`dmarc_rua_summary` | それらのツールだけ宛先/ドメイン単位のエラーに縮退。他は動作を続ける |
+| `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace`、`dmarc_rua_summary`、`compromise_sweep`（`gmail` 節） | それらのツールだけ宛先/ドメイン単位のエラーに縮退。他は動作を続ける |
 | `https://www.googleapis.com/auth/apps.groups.settings` | `group_delivery_policy` | そのツールだけエラーに縮退。他は動作を続ける |
 | `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members`（グループ情報側） | この側だけが自分のエラーを返す。下のメンバー用スコープが付与されていればメンバー一覧側は独立して動作する |
 | `https://www.googleapis.com/auth/admin.directory.group.member.readonly` | `list_group_members`（メンバー一覧側） | 同上、上のグループ情報側とは独立 — 2つの呼び出しは互いをブロックしない |

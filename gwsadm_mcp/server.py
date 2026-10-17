@@ -39,6 +39,7 @@ import asyncio
 import collections
 import concurrent.futures
 import datetime
+import email.utils
 import functools
 import inspect
 import ipaddress
@@ -53,7 +54,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 
 from gwsadm_mcp import __version__
-from gwsadm_mcp.client import DomainClient, GwsAuthError, GwsError, event_parameters
+from gwsadm_mcp.client import DomainClient, GwsApiDisabledError, GwsAuthError, GwsError, event_parameters
 from gwsadm_mcp.config import ConfigError, config_path, is_external, load_config
 
 
@@ -378,15 +379,20 @@ def health_check() -> dict:
     """Report service status, version, and per-domain auth/API reachability.
 
     Always returns the same keys: status (healthy / degraded / error), service,
-    version, config, and domains (per-domain auth result). Lightweight: one
-    1-item login query per domain.
+    version, config, and domains (per-domain auth result plus ``gmail``:
+    ok / api_disabled / no_grant / error -- whether the per-user Gmail tools
+    can work there; it does not affect ``status``). Lightweight: one 1-item
+    login query and one ``users.getProfile`` per domain.
     """
     base = {"service": "gwsadm-mcp", "version": __version__, "config": config_path()}
     try:
         clients, _ = _clients()
     except ConfigError as e:
         return {**base, "status": "error", "detail": str(e), "domains": []}
-    results = [c.check() for c in clients]
+    # auth decides the overall status; gmail is a separately granted scope
+    # (README: without it every other tool keeps working), so it is reported
+    # per domain but does not degrade the service.
+    results = [{**c.check(), **c.check_gmail()} for c in clients]
     ok = sum(1 for r in results if r.get("auth") == "ok")
     status = "healthy" if ok == len(results) else ("degraded" if ok else "error")
     return {**base, "status": status, "domains": results}
@@ -1289,7 +1295,13 @@ def user_activity(
         picked = _select(clients, domain if domain is not None else suffix)
     except (ConfigError, GwsError) as e:
         return {"username": username, "error": str(e)}
-    c = picked[0]
+    return _user_activity_impl(picked[0], username, hours=hours, apps=apps, max_pages=max_pages, max_events=max_events)
+
+
+def _user_activity_impl(
+    c: DomainClient, username: str, *, hours: int, apps: list[str], max_pages: int, max_events: int
+) -> dict:
+    """``user_activity`` for a resolved client; shared with ``compromise_sweep``."""
     start = _window(hours)
     # One pool for the account's own applications and the verdict probes.
     jobs = _application_jobs([c], apps, start=start, max_pages=max_pages, user_key=username)
@@ -1380,6 +1392,13 @@ def ip_activity(
         picked = _select(clients, domain)
     except (ConfigError, GwsError) as e:
         return {"ip": ip, "error": str(e)}
+    return _ip_activity_impl(picked, ip, hours=hours, apps=apps, max_pages=max_pages, top=top)
+
+
+def _ip_activity_impl(
+    picked: list[DomainClient], ip: str, *, hours: int, apps: list[str], max_pages: int, top: int
+) -> dict:
+    """``ip_activity`` for resolved clients and a validated address; shared with ``compromise_sweep``."""
     start = _window(hours)
     # Every (domain × application) probe at once, then aggregate per domain.
     fetched = _fetch_per_application(picked, apps, start=start, max_pages=max_pages, actor_ip=ip)
@@ -1401,6 +1420,381 @@ def ip_activity(
         "ip": ip,
         "window": {"hours": hours, "start": start.isoformat(timespec="seconds")},
         "domains": out,
+    }
+
+
+# compromise_sweep: which of a user's OAuth grants can read or act on content
+# (mail, Drive, contacts, admin) -- the grants worth naming after a compromise,
+# as opposed to the sign-in-only ones (openid / userinfo) that every
+# "Sign in with Google" button leaves behind.
+_RISKY_SCOPE_RE = re.compile(r"mail\.google\.com|/auth/gmail\.|/auth/drive|/auth/contacts|/auth/admin\.")
+# Source addresses swept for other accounts when the caller gives none: those
+# on the account's own flags, newest first, capped so a noisy account does not
+# turn one call into dozens of cross-domain scans.
+SWEEP_MAX_IPS = 5
+SWEEP_IP_APPLICATIONS = ["login", "token", "user_accounts"]
+SWEEP_IP_MAX_PAGES = 2
+SWEEP_IP_TOP = 20
+SWEEP_ACTIVITY_EVENTS = 50
+
+
+def _parse_ips(raw: str | None) -> list[str]:
+    """Comma-separated addresses, each validated by ``_parse_ip``, deduplicated."""
+    out: list[str] = []
+    for part in (raw or "").split(","):
+        if part.strip():
+            ip = _parse_ip(part)
+            if ip not in out:
+                out.append(ip)
+    return out
+
+
+def _recipients(sampled: list[dict], internal: set[str]) -> dict:
+    """Reduce sent-message envelopes to counts: recipients, their domains, external ones."""
+    domains: collections.Counter = collections.Counter()
+    total = external = 0
+    for m in sampled:
+        # Only the headers that are present: in strict mode (the default
+        # since 3.13) one empty element makes getaddresses() reject the
+        # whole list as [("", "")] -- observed on 3.14.
+        fields = [v for v in (m.get("to"), m.get("cc"), m.get("bcc")) if v]
+        for _name, addr in email.utils.getaddresses(fields):
+            if not addr or "@" not in addr:
+                continue
+            total += 1
+            dom = addr.rsplit("@", 1)[-1].lower()
+            domains[dom] += 1
+            if is_external(addr, internal):
+                external += 1
+    return {
+        "recipients_total": total,
+        "external_recipients": external,
+        "recipient_domains": dict(domains.most_common(20)),
+    }
+
+
+def _filter_entry(f: dict) -> dict:
+    action = f.get("action") or {}
+    return {
+        "id": f.get("id"),
+        "criteria": f.get("criteria") or {},
+        "forward": action.get("forward"),
+        "deletes": "TRASH" in (action.get("addLabelIds") or []),
+        "archives": "INBOX" in (action.get("removeLabelIds") or []),
+    }
+
+
+def _send_as_entry(a: dict) -> dict:
+    return {
+        "send_as_email": a.get("sendAsEmail"),
+        "reply_to": a.get("replyToAddress") or None,
+        "is_primary": a.get("isPrimary"),
+        "is_default": a.get("isDefault"),
+        "treat_as_alias": a.get("treatAsAlias"),
+        "verification_status": a.get("verificationStatus"),
+    }
+
+
+def _gmail_section(
+    c: DomainClient, username: str, *, start: datetime.datetime, max_sent: int, internal: set[str]
+) -> dict:
+    """The Gmail half of a sweep, with its outcome made explicit in ``kind``.
+
+    ``ok`` -- settings and the sent summary were read; ``api_disabled`` -- the
+    Gmail API is off in the service account's project (Cloud console);
+    ``no_grant`` -- no ``gmail.readonly`` DWD grant (Admin console);
+    ``error`` -- something else failed. The three failures are reported, not
+    read as "nothing found".
+    """
+    try:
+        settings = c.gmail_security_settings(username)
+        sent = c.gmail_sent_summary(username, start=start, max_messages=max_sent)
+    except GwsApiDisabledError as e:
+        return {"kind": "api_disabled", "error": str(e)}
+    except GwsAuthError as e:
+        return {"kind": "no_grant", "error": str(e)}
+    except GwsError as e:
+        return {"kind": "error", "error": str(e)}
+    auto = settings.get("auto_forwarding") or {}
+    filters = [_filter_entry(f) for f in settings.get("filters") or []]
+    send_as = [_send_as_entry(a) for a in settings.get("send_as") or []]
+    return {
+        "kind": "ok",
+        "auto_forwarding": {
+            "enabled": auto.get("enabled"),
+            "email": auto.get("emailAddress"),
+            "disposition": auto.get("disposition"),
+        },
+        "forwarding_addresses": [
+            {"email": a.get("forwardingEmail"), "verification_status": a.get("verificationStatus")}
+            for a in settings.get("forwarding_addresses") or []
+        ],
+        # Only the filters that move mail out of sight: forward, delete, archive.
+        "filters": [f for f in filters if f["forward"] or f["deletes"] or f["archives"]],
+        "filters_total": len(filters),
+        "delegates": [
+            {"email": d.get("delegateEmail"), "verification_status": d.get("verificationStatus")}
+            for d in settings.get("delegates") or []
+        ],
+        # The primary address only when it carries a reply-to (a reply-to
+        # hijack); every non-primary alias.
+        "send_as": [a for a in send_as if not a["is_primary"] or a["reply_to"]],
+        "section_errors": settings.get("section_errors") or {},
+        "sent": {
+            "count": sent["count"],
+            "capped": sent["capped"],
+            "sampled": len(sent["sampled"]),
+            **_recipients(sent["sampled"], internal),
+        },
+    }
+
+
+def _highlights(username: str, activity: dict, grants: dict, ips: list[dict], gmail: dict) -> list[dict]:
+    """The facts a responder acts on, one line each, in the order they matter."""
+    out: list[dict] = []
+    for f in activity.get("flags", []):
+        ev = f.get("event")
+        if ev in ("2sv_enroll", "2sv_disable", "2sv_change_phone"):
+            out.append({"kind": "second_factor", "detail": f"{ev} at {f['time']} from {f.get('ip')}"})
+        elif ev in ("recovery_email_edit", "recovery_phone_edit", "recovery_secret_qa_edit", "password_edit"):
+            out.append({"kind": "credential_change", "detail": f"{ev} at {f['time']} from {f.get('ip')}"})
+        elif ev == "email_forwarding_out_of_domain":
+            dest = (f.get("params") or {}).get("email_forwarding_destination_address")
+            out.append({"kind": "forwarding", "detail": f"{ev} at {f['time']} to {dest}"})
+        elif ev in ("risky_sensitive_action_allowed", "risky_sensitive_action_blocked"):
+            name = (f.get("params") or {}).get("sensitive_action_name")
+            out.append({"kind": "sensitive_action", "detail": f"{ev} ({name}) at {f['time']} from {f.get('ip')}"})
+        elif f.get("application") == LOGIN_VERDICTS:
+            out.append({"kind": "google_verdict", "detail": f"{ev} at {f['time']}"})
+    for t in grants.get("risky", []):
+        out.append(
+            {
+                "kind": "oauth_grant",
+                "detail": f"{t.get('display_text')} ({t.get('client_id')}): {', '.join(t.get('scopes', []))}",
+            }
+        )
+    if gmail.get("kind") == "ok":
+        auto = gmail["auto_forwarding"]
+        if auto.get("enabled"):
+            out.append(
+                {
+                    "kind": "forwarding",
+                    "detail": f"auto-forwarding enabled to {auto.get('email')} ({auto.get('disposition')})",
+                }
+            )
+        for a in gmail["forwarding_addresses"]:
+            out.append(
+                {"kind": "forwarding", "detail": f"forwarding address {a['email']} ({a['verification_status']})"}
+            )
+        for flt in gmail["filters"]:
+            what = ", ".join(k for k in ("forward", "deletes", "archives") if flt[k])
+            out.append(
+                {
+                    "kind": "filter",
+                    "detail": f"filter {flt['id']}: {what}" + (f" -> {flt['forward']}" if flt["forward"] else ""),
+                }
+            )
+        for d in gmail["delegates"]:
+            out.append({"kind": "delegate", "detail": f"delegate {d['email']} ({d['verification_status']})"})
+        for a in gmail["send_as"]:
+            out.append(
+                {
+                    "kind": "send_as",
+                    "detail": f"send-as {a['send_as_email']} reply-to {a['reply_to']} ({a['verification_status']})",
+                }
+            )
+        sent = gmail["sent"]
+        if sent["count"]:
+            out.append(
+                {
+                    "kind": "sent_mail",
+                    "detail": f"{sent['count']} message(s) sent in the window"
+                    + (" (more exist)" if sent["capped"] else "")
+                    + f"; {sent['external_recipients']} external recipient(s) in the {sent['sampled']} sampled",
+                }
+            )
+    else:
+        out.append({"kind": "gmail_unreadable", "detail": f"gmail: {gmail.get('kind')} -- {gmail.get('error')}"})
+    for entry in ips:
+        others = entry.get("other_accounts") or []
+        if others:
+            out.append({"kind": "other_accounts_from_ip", "detail": f"{entry['ip']}: {len(others)} other account(s)"})
+    return out
+
+
+def _checklist(activity: dict, gmail: dict) -> list[str]:
+    """What this tool cannot settle and a person still has to."""
+    items = [
+        "Remove any second factor the attacker enrolled (Admin console > user > Security): a password reset alone "
+        "does not revoke it.",
+        "Reset the password and sign the account out of every session (Admin console > user > Security).",
+        "Review recovery email / phone in the Admin console; this tool does not read them.",
+        "Revoke the OAuth grants listed under grants.risky that the owner does not recognise.",
+    ]
+    if gmail.get("kind") != "ok":
+        items.append(
+            "Gmail settings and sent mail could not be read here ("
+            + str(gmail.get("kind"))
+            + "): check forwarding, filters, delegates and the Email Log Search in the Admin console by hand."
+        )
+    else:
+        items.append("Message content is never read here: use the Admin console's Email Log Search for what was sent.")
+    items.append("Drive: run drive_external_sharing for the window and look for this account as the actor.")
+    if activity.get("capped"):
+        items.append("The activity window was not fully covered (capped): narrow hours or raise max_pages and re-run.")
+    return items
+
+
+@mcp.tool()
+def compromise_sweep(
+    username: str,
+    hours: int = 24,
+    ips: str | None = None,
+    max_pages: int = 5,
+    max_sent: int = 50,
+    domain: str | None = None,
+) -> dict:
+    """The Google-side follow-through after ONE account is confirmed compromised, in one call.
+
+    Four questions, each answered from its own source and reported in its own
+    section so that a failure in one never hides the others:
+
+    - ``activity``: what the account did (``user_activity`` for the window,
+      flags first -- a ``2sv_enroll`` from the attacker is the item that
+      survives a password reset).
+    - ``state`` / ``grants``: what the account is now (``get_user``:
+      suspended, 2SV enrolled, last login) and which OAuth grants can read or
+      act on content (``grants.risky``: mail / Drive / contacts / admin
+      scopes; sign-in-only grants are listed but not called out).
+    - ``ips``: whether the same sources reached other accounts
+      (``ip_activity`` across every configured domain for the addresses in
+      ``ips``, or, when none are given, for the addresses on the account's
+      own flags -- which include the attacker's, and also the owner's own
+      when they authorized an app or re-authenticated -- capped at
+      SWEEP_MAX_IPS, newest first). The swept account itself is excluded
+      from ``other_accounts``; a shared egress address (a campus NAT, a
+      gateway host that impersonates accounts) legitimately shows other
+      accounts, so read ``other_accounts`` against where the address sits.
+    - ``gmail``: the settings an attacker leaves behind to keep reading mail
+      (auto-forwarding, forwarding addresses, filters that forward / delete /
+      archive, delegates, send-as aliases and reply-to) plus what the mailbox
+      sent in the window as counts and recipient domains -- never a subject
+      or body. Its ``kind`` says whether it could be read at all: ``ok``,
+      ``api_disabled`` (the Gmail API is off in the service account's own
+      Cloud project), ``no_grant`` (no ``gmail.readonly`` DWD grant) or
+      ``error``. A failure is reported as such, never as "nothing found".
+
+    ``highlights`` lists the facts a responder acts on, one line each, and
+    ``checklist`` what remains to do or verify by hand (second-factor
+    removal, session sign-out, recovery contacts, message content). Nothing
+    here changes the account; the identity provider's side of the incident
+    (and any other SaaS) stays with the caller.
+
+    Read-only: Reports API ``activities().list``, Directory ``users().get``
+    and ``tokens().list``, and Gmail ``settings.*`` reads plus
+    ``messages().list`` / ``messages().get(format="metadata")`` with the
+    To / Cc / Bcc / Date headers only.
+
+    Args:
+        username: Exact user email of the compromised account.
+        hours: Window length ending now, for activity, the IP sweep and sent
+            mail.
+        ips: Comma-separated attacker addresses to sweep. Default: the
+            addresses on the account's own flags.
+        max_pages: Page budget per application for the account's activity
+            (the IP sweep uses its own small budget).
+        max_sent: Sent messages whose envelope is fetched (the count covers
+            everything listed).
+        domain: Configured ``[domain.*]`` section for the account. Default:
+            resolved from the username's suffix. The IP sweep always covers
+            every configured domain.
+    """
+    username = username.strip()
+    try:
+        suffix = _domain_of(username)
+        given_ips = _parse_ips(ips)
+        clients, internal = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"username": username, "error": str(e)}
+    c = picked[0]
+    activity = _user_activity_impl(
+        c,
+        username,
+        hours=hours,
+        apps=list(ACTIVITY_APPLICATIONS),
+        max_pages=max_pages,
+        max_events=SWEEP_ACTIVITY_EVENTS,
+    )
+    if "error" in activity:
+        return {"domain": c.domain, "username": username, "error": activity["error"]}
+
+    try:
+        user = c.get_user(username)
+        state: dict = {"found": user is not None}
+        if user is not None:
+            entry = _user_entry(user)
+            state.update(
+                {
+                    k: entry[k]
+                    for k in (
+                        "email",
+                        "suspended",
+                        "suspension_reason",
+                        "suspension_time",
+                        "last_login",
+                        "is_enrolled_in_2sv",
+                        "is_enforced_in_2sv",
+                        "change_password_at_next_login",
+                    )
+                }
+            )
+    except (GwsAuthError, GwsError) as e:
+        state = {"error": str(e)}
+
+    try:
+        tokens = [_token_entry(t) for t in c.list_user_oauth_tokens(username)]
+        grants: dict = {
+            "count": len(tokens),
+            "risky": [t for t in tokens if any(_RISKY_SCOPE_RE.search(sc or "") for sc in t.get("scopes", []))],
+            "tokens": tokens,
+        }
+    except (GwsAuthError, GwsError) as e:
+        grants = {"error": str(e)}
+
+    sweep_ips = given_ips or [r["ip"] for r in activity["ips"] if r["ip"] in {f.get("ip") for f in activity["flags"]}]
+    sweep_ips = sweep_ips[:SWEEP_MAX_IPS]
+    me = username.lower()
+    ip_results: list[dict] = []
+    for ip in sweep_ips:
+        got = _ip_activity_impl(
+            clients, ip, hours=hours, apps=SWEEP_IP_APPLICATIONS, max_pages=SWEEP_IP_MAX_PAGES, top=SWEEP_IP_TOP
+        )
+        others: list[dict] = []
+        errors: dict = {}
+        capped = False
+        for dom, d in got["domains"].items():
+            if "error" in d:
+                errors[dom] = d["error"]
+                continue
+            capped = capped or d["capped"]
+            for a in d["accounts"]:
+                if str(a["user"]).lower() != me:
+                    others.append({"domain": dom, **a})
+        ip_results.append({"ip": ip, "other_accounts": others, "capped": capped, "domain_errors": errors})
+
+    gmail = _gmail_section(c, username, start=_window(hours), max_sent=max_sent, internal=internal)
+    return {
+        "domain": c.domain,
+        "username": username,
+        "window": activity["window"],
+        "highlights": _highlights(username, activity, grants, ip_results, gmail),
+        "activity": activity,
+        "state": state,
+        "grants": grants,
+        "ips": ip_results,
+        "gmail": gmail,
+        "checklist": _checklist(activity, gmail),
     }
 
 

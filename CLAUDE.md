@@ -40,7 +40,17 @@ configured `dmarc_rua_mailbox`, shares `gmail_message_trace`'s
 Groups Settings API, requires the separate `apps.groups.settings` DWD
 scope), `list_group_members` (a Google Group's metadata + member roster —
 Directory API, requires the separate `admin.directory.group.readonly` and
-`admin.directory.group.member.readonly` DWD scopes), and a `daily_brief`
+`admin.directory.group.member.readonly` DWD scopes), `compromise_sweep`
+(the post-compromise follow-through for one account: `user_activity` +
+`get_user` + `user_oauth_tokens` + `ip_activity` for the attacker's
+addresses + the Gmail settings an attacker leaves behind — Gmail API
+`users.settings.getAutoForwarding` / `forwardingAddresses.list` /
+`filters.list` / `delegates.list` / `sendAs.list`, all served by the
+`gmail.readonly` DWD scope, verified live — and the sent-mail envelope,
+`messages().list` + `messages().get(format="metadata")` with To/Cc/Bcc/Date
+only; its `gmail.kind` distinguishes `ok` / `api_disabled` (HTTP 403
+`accessNotConfigured`: the Gmail API is off in the key's own Cloud project,
+`GwsApiDisabledError`) / `no_grant` / `error`), and a `daily_brief`
 combining the Reports-based tools, to AI assistants via STDIO transport,
 built on the official `mcp` Python SDK's `MCPServer`. Read-only: the only
 Admin SDK / Groups Settings / Gmail API methods called anywhere in this
@@ -56,8 +66,12 @@ API, `format="metadata"` only, for `gmail_message_trace`), and
 `messages().list` / `messages().get` (`format="full"`) /
 `messages().attachments().get()` (Gmail API, for `dmarc_rua_summary` --
 this one DOES read message/attachment content, not just metadata, since a
-DMARC report's data lives in its attachment) — all read-only; no mutating
-call exists.
+DMARC report's data lives in its attachment), the Gmail settings reads
+`users().settings().getAutoForwarding()` / `.forwardingAddresses().list()`
+/ `.filters().list()` / `.delegates().list()` / `.sendAs().list()` plus
+`messages().list` / `messages().get` (`format="metadata"`, To/Cc/Bcc/Date
+headers only) for `compromise_sweep`, and `users().getProfile()` for the
+`health_check` Gmail probe — all read-only; no mutating call exists.
 The underlying `googleapiclient.discovery.build()` setup call also fetches
 Google's discovery document over HTTP, separately from this guarantee.
 
@@ -78,7 +92,7 @@ to guard against stdio newline regressions).
 
 - `gwsadm_mcp/server.py` — MCPServer server with `health_check`,
   `login_audit`, `gmail_usage_report`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
-  `user_activity`, `ip_activity`,
+  `user_activity`, `ip_activity`, `compromise_sweep`,
   `drive_external_sharing`, `drive_doc_activity`,
   `shared_drive_membership_changes`, `gmail_message_trace`,
   `dmarc_rua_summary`, `group_delivery_policy`, `list_group_members`, `daily_brief`,
