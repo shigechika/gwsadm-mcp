@@ -53,7 +53,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 
-from gwsadm_mcp import __version__
+from gwsadm_mcp import __version__, sites
 from gwsadm_mcp.client import DomainClient, GwsApiDisabledError, GwsAuthError, GwsError, event_parameters
 from gwsadm_mcp.config import ConfigError, config_path, is_external, load_config
 
@@ -382,10 +382,12 @@ def health_check() -> dict:
     version, config, and domains (per-domain auth result plus ``gmail``:
     ok / api_disabled / no_grant / error, with ``gmail_detail`` on an
     unexpected error -- whether the per-user Gmail tools can work there; it
-    does not affect ``status``). Lightweight: one 1-item login query and one
+    does not affect ``status``), and ``sites`` (the optional ``GWSADM_SITES_INI``
+    table: configured / ranges / error; informational, it does not affect
+    ``status``). Lightweight: one 1-item login query and one
     ``users.getProfile`` per domain.
     """
-    base = {"service": "gwsadm-mcp", "version": __version__, "config": config_path()}
+    base = {"service": "gwsadm-mcp", "version": __version__, "config": config_path(), "sites": sites.load().status()}
     try:
         clients, _ = _clients()
     except ConfigError as e:
@@ -2976,6 +2978,88 @@ def shared_drive_membership_changes(
     return {"window_days": days, "domains": out}
 
 
+# user_accounts audit log: what an account's owner (or whoever holds the session)
+# changed about how the account is protected and recovered. A compromise that
+# wants to outlive a password reset leaves exactly these behind (observed live,
+# 2026-10-16: ``2sv_enroll`` from the attacker's address fifteen minutes after
+# the first login). Read from ``user_accounts`` only: ``2sv_enroll`` is also
+# emitted under ``login``, and reading both would count it twice.
+ACCOUNT_CHANGE_EVENTS = (
+    "2sv_enroll",
+    "2sv_disable",
+    "2sv_change_phone",
+    "password_edit",
+    "recovery_email_edit",
+    "recovery_phone_edit",
+    "recovery_secret_qa_edit",
+)
+ACCOUNT_CHANGES_LISTED = 50
+
+
+def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_pages: int = 2) -> dict:
+    """Account-protection changes across each domain, flagged when they look like a takeover.
+
+    A change is ``flagged`` when its source address is outside the sites
+    table (``external: true``; ``null`` when no table is configured, so the
+    absence of a table never reads as "all internal") or when the same user had
+    a suspicious login (from ``logins``, the login audit of the same window)
+    at or before the change. Flagged rows are listed first; at most
+    ``ACCOUNT_CHANGES_LISTED`` rows are listed per domain, ``total`` counts all.
+    """
+    start = _window(hours)
+    table = sites.load()
+    fetched = _parallel_fetch(
+        [(c, "user_accounts", name, max_pages) for c in clients for name in ACCOUNT_CHANGE_EVENTS], start
+    )
+    out: dict = {}
+    for c in clients:
+        suspicious: dict = {}
+        for e in (logins.get(c.domain, {}).get("suspicious_logins") or {}).get("entries", []):
+            u = (e.get("user") or "").lower()
+            if u and e.get("time") and (u not in suspicious or e["time"] < suspicious[u]):
+                suspicious[u] = e["time"]
+        try:
+            rows: list[dict] = []
+            capped = False
+            errors: dict = {}
+            for name in ACCOUNT_CHANGE_EVENTS:
+                r = fetched[(c.domain, "user_accounts", name)]
+                if isinstance(r, GwsAuthError):
+                    raise r
+                if isinstance(r, GwsError):
+                    errors[name] = str(r)
+                    continue
+                items, part_capped = r
+                capped = capped or part_capped
+                for it in items:
+                    for ev in it.get("events", []):
+                        if ev.get("name") != name:
+                            continue
+                        row = _entry(it, ev)
+                        site = table.classify(row.get("ip"))
+                        row["site"] = site.code if site else None
+                        row["external"] = (site is None) if table.networks else None
+                        first = suspicious.get((row.get("user") or "").lower())
+                        row["after_suspicious_login"] = bool(first and row.get("time") and first <= row["time"])
+                        row["flagged"] = bool(row["external"]) or row["after_suspicious_login"]
+                        rows.append(row)
+            rows.sort(key=lambda x: (not x["flagged"], x.get("time") or ""))
+            dom = {
+                "total": len(rows),
+                "flagged": sum(1 for x in rows if x["flagged"]),
+                "by_event": dict(collections.Counter(x["event"] for x in rows)),
+                "entries": rows[:ACCOUNT_CHANGES_LISTED],
+                "capped": capped,
+                "sites": table.status(),
+            }
+            if errors:
+                dom["event_errors"] = errors
+            out[c.domain] = dom
+        except (GwsAuthError, GwsError) as e:
+            out[c.domain] = {"error": str(e)}
+    return out
+
+
 def _daily_brief_impl(hours: int, max_pages: int, samples: int) -> dict:
     """Compute the full daily_brief payload (shared by the sync tool and the job worker)."""
     try:
@@ -2983,11 +3067,12 @@ def _daily_brief_impl(hours: int, max_pages: int, samples: int) -> dict:
     except ConfigError as e:
         return {"error": str(e)}
     logins = _login_audit(clients, hours, include_failures=True, top=5)
+    changes = _account_changes(clients, hours, logins)
     sharing = _drive_external_sharing(clients, internal, hours, max_pages=max_pages, samples=samples)
     summary: dict = {}
     for c in clients:
         d = c.domain
-        la, ds = logins.get(d, {}), sharing.get(d, {})
+        la, ds, ac = logins.get(d, {}), sharing.get(d, {}), changes.get(d, {})
         if "error" in la or "error" in ds:
             summary[d] = {"error": la.get("error") or ds.get("error")}
             continue
@@ -2998,17 +3083,22 @@ def _daily_brief_impl(hours: int, max_pages: int, samples: int) -> dict:
             "external_sharing_targets": ds["external_targets_total"],
             "risky_visibility_events": ds["risky_visibility_events"],
             "untargeted_external_transitions": ds["untargeted_external_transitions"],
+            # None when the account-change scan failed for this domain (see account_changes[d].error).
+            "account_changes": ac.get("total"),
+            "account_changes_flagged": ac.get("flagged"),
             "capped": (
                 la["account_disabled"]["capped"]
                 or la["suspicious_logins"]["capped"]
                 or la.get("login_failures", {}).get("capped", False)
                 or ds["capped"]
+                or ac.get("capped", False)
             ),
         }
     return {
         "window_hours": hours,
         "summary": summary,
         "login_audit": logins,
+        "account_changes": changes,
         "drive_external_sharing": sharing,
     }
 
@@ -3017,7 +3107,12 @@ def _daily_brief_impl(hours: int, max_pages: int, samples: int) -> dict:
 def daily_brief(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
     """One-call security summary across all configured domains.
 
-    Aggregates login_audit (account locks, suspicious logins) and
+    Aggregates login_audit (account locks, suspicious logins),
+    account-protection changes (``account_changes``: 2-Step Verification
+    enrolled/disabled, password and recovery address/phone edits, from the
+    ``user_accounts`` log; a row is ``flagged`` when its address is outside
+    the ``GWSADM_SITES_INI`` table or the same user had a suspicious login
+    before it -- flagged rows first, at most 50 listed, ``total`` counts all) and
     drive_external_sharing (external grants, new link exposure, and
     ``untargeted_external_transitions`` — see that tool's docstring).
     ``max_pages`` / ``samples`` are passed through to the drive scan;

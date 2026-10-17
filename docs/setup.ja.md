@@ -78,7 +78,7 @@ dmarc_rua_recipient = postmaster+rua@example.edu   # 省略可。既定値: dmar
 宛先（プラスサブアドレスやグループ）で、検索の絞り込みに使う。`dmarc_rua_mailbox = none`
 でそのドメインを対象外にできる。詳しい理由は README を参照。
 
-`GWSADM_CONFIG` そのものが設定サーフェス全体であり、環境変数だけで
+`GWSADM_CONFIG` そのものが必須の設定サーフェス全体であり、環境変数だけで
 サーバーを設定する方法は存在しない。各 `service_account_file` はさらに
 独立したもう1つのファイルパス依存で、自分の GCP プロジェクト固有の
 Google Cloud サービスアカウント JSON 鍵を指す。どちらのファイルも
@@ -88,6 +88,22 @@ Google Cloud サービスアカウント JSON 鍵を指す。どちらのファ�
 `subject` / `customer_id` のいずれかが欠けている場合は全ツール呼び出しが
 失敗する — スコープ不足とは違い、設定欠落に対する縮退動作は無い。
 
+
+任意の追加設定は `GWSADM_SITES_INI` だけ。自組織のアドレス範囲を書いた INI ファイルで、
+keycloak-mcp の `KEYCLOAK_SITES_INI`・entraadm-mcp の `ENTRAADM_SITES_INI` と同じ形式なので、
+1 つのファイルを 3 つで共用できる:
+
+```ini
+[HQ]
+name = Head office
+ipv4 = 192.0.2.0/24, 198.51.100.0/25
+ipv6 = 2001:db8:1::/48
+```
+
+`daily_brief` は、アカウントの保護の変更（2 段階認証の登録・解除、パスワードや再設定用の
+メール・電話の変更）の送信元がどの範囲にも入らないとき `external` を付ける。未設定のときは
+`external` が `false` ではなく `null` になり、「全部内部」とは読ませない。その場合は、同じユーザーが
+その前に不審なログインをしていたときだけ印が付く。`health_check` は表の状態を `sites` に出す。
 ## 何かに組み込む前に確認する
 
 ```bash

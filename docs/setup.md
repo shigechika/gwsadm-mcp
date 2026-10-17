@@ -78,7 +78,7 @@ to read DMARC aggregate reports; `dmarc_rua_recipient` (optional) is the publish
 or a group); `dmarc_rua_mailbox = none` opts the domain out. See the README for the
 full rationale.
 
-`GWSADM_CONFIG` itself is the entire configuration surface — there is no way
+`GWSADM_CONFIG` itself is the entire required configuration surface — there is no way
 to configure the server through plain environment variables alone. Each
 `service_account_file` is a second, independent file-path dependency: a
 Google Cloud service-account JSON key unique to your own GCP project. Neither
@@ -87,6 +87,24 @@ manifest; both must exist on the machine running the server before any tool
 call succeeds. If the INI file is missing, or a domain section is missing
 `service_account_file` / `subject` / `customer_id`, every tool call fails —
 there is no degraded fallback for a missing config, unlike a missing scope.
+
+The one optional extra is `GWSADM_SITES_INI`: an INI file of your own address
+ranges, the same format as keycloak-mcp's `KEYCLOAK_SITES_INI` and
+entraadm-mcp's `ENTRAADM_SITES_INI`, so one file can serve all three:
+
+```ini
+[HQ]
+name = Head office
+ipv4 = 192.0.2.0/24, 198.51.100.0/25
+ipv6 = 2001:db8:1::/48
+```
+
+`daily_brief` uses it to mark an account-protection change (2-Step
+Verification enrolled or disabled, password or recovery address/phone edited)
+as `external` when its source address is outside every range. Unset, `external`
+is `null` rather than `false`, so a missing table never reads as "everything is
+internal"; changes are then flagged only when the same user had a suspicious
+login before them. `health_check` reports the table under `sites`.
 
 ## Verify before wiring it into anything
 
