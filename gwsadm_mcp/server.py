@@ -3029,7 +3029,9 @@ def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_
       (5 of those 107 in the same week, the known attacker among them);
     - ``unknown_origin``: the dataset is configured but the row has no address,
       or its address is outside the sites table and the dataset cannot place
-      it -- an origin that cannot be placed is not treated as home;
+      it (including when the dataset itself is missing or unreadable; ``geo``
+      then carries the error) -- an origin that cannot be placed is not
+      treated as home;
     - ``after_suspicious_login``: the same user had a suspicious login (from
       ``logins``, the login audit of the same window) at or before the change.
 
@@ -3066,7 +3068,9 @@ def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_
                 if isinstance(r, GwsAuthError):
                     raise r
                 if isinstance(r, GwsError):
+                    # one event type unscanned: the section is partial, not "nothing found"
                     errors[name] = str(r)
+                    capped = True
                     continue
                 items, part_capped = r
                 capped = capped or part_capped
@@ -3108,7 +3112,9 @@ def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_
             row["country"] = place["cc"] if place else None
             row["asn"] = place["asn"] if place else None
             row["as_name"] = place["name"] if place else None
-            if geo_table.usable and row["site"] is None:
+            # Gated on "configured", not "usable": a dataset that is missing or unreadable must not
+            # turn every unplaced origin into an unflagged one (fail-safe, as for is_external()).
+            if geo_table.configured and row["site"] is None:
                 if not row["country"]:
                     reasons.append("unknown_origin")
                 elif geo_table.home and row["country"] not in geo_table.home:

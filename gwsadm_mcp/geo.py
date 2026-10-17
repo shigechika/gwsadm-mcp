@@ -25,6 +25,7 @@ import ipaddress
 import os
 import re
 import time
+import zlib
 from dataclasses import dataclass, field
 
 PATH_VAR = "GWSADM_IP2ASN"
@@ -105,7 +106,7 @@ class GeoTable:
                             }
                         i += 1
                     ptr[ver] = i
-        except (OSError, EOFError, gzip.BadGzipFile) as e:
+        except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as e:
             self.error = f"cannot read {PATH_VAR}: {type(e).__name__}"
             return {}
         return found

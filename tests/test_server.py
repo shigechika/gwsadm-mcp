@@ -3567,6 +3567,7 @@ def test_account_changes_read_each_event_from_its_one_application(inject, monkey
     ac = server.daily_brief(hours=24)["account_changes"]["example.edu"]
     assert ac["total"] == 0
     assert ac["event_errors"] == {"recovery_phone_edit": "boom"}
+    assert ac["capped"] is True  # an unscanned event type is partial coverage, not "nothing found"
     asked = {(app, ev) for app, ev, *_ in fake.calls}
     assert ("user_accounts", "2sv_enroll") in asked and ("login", "2sv_enroll") not in asked
     # passkeys exist under login only; 2sv_change_phone is not a Reports API event (HTTP 400)
@@ -3633,3 +3634,19 @@ def test_account_changes_complete_coverage_leaves_capped_false(inject, monkeypat
     inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
     ac = server.daily_brief(hours=24)["account_changes"]["example.edu"]
     assert ac["suspicious_login_coverage"] == "complete" and ac["capped"] is False
+
+
+def test_account_changes_flag_unknown_origin_when_the_dataset_is_unusable(inject, tmp_path, monkeypatch):
+    _sites_ini(tmp_path, monkeypatch)
+    monkeypatch.setenv(server.geo.PATH_VAR, str(tmp_path / "missing.tsv"))
+    monkeypatch.setenv(server.geo.HOME_VAR, "JP")
+    canned = {
+        **_change("a@example.edu", "2sv_enroll", "2026-07-01T01:00:00.000Z", "198.51.100.9"),
+        **_change("b@example.edu", "password_edit", "2026-07-01T02:00:00.000Z", "192.0.2.10"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    ac = server.daily_brief(hours=24)["account_changes"]["example.edu"]
+    rows = {e["user"]: e for e in ac["entries"]}
+    assert rows["a@example.edu"]["flag_reasons"] == ["unknown_origin"]
+    assert rows["b@example.edu"]["flagged"] is False  # inside the sites table: never looked up
+    assert ac["geo"]["error"] is not None

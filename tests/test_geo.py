@@ -60,3 +60,17 @@ def test_corrupt_gzip_is_recorded_not_raised(tmp_path):
     t = geo.load(env={geo.PATH_VAR: str(p)})
     assert t.lookup(["198.51.100.7"]) == {}
     assert t.status()["error"] is not None and str(p) not in t.status()["error"]
+
+
+def test_damaged_deflate_stream_is_recorded_not_raised(tmp_path):
+    good = tmp_path / "good.tsv.gz"
+    with gzip.open(good, "wt", encoding="utf-8") as f:
+        f.write(TABLE * 200)
+    data = bytearray(good.read_bytes())
+    for i in range(30, min(len(data) - 10, 400)):  # keep the header, wreck the compressed body
+        data[i] ^= 0xFF
+    bad = tmp_path / "bad.tsv.gz"
+    bad.write_bytes(bytes(data))
+    t = geo.load(env={geo.PATH_VAR: str(bad)})
+    assert t.lookup(["2001:db8::1"]) == {}
+    assert t.status()["error"] is not None
