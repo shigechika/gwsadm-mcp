@@ -1221,17 +1221,20 @@ class DomainClient:
 
         ``ok`` / ``api_disabled`` (the key's project has the Gmail API off --
         a Cloud console fix) / ``no_grant`` (no ``gmail.readonly`` DWD grant
-        -- an Admin console fix) / ``error``. Always returns the ``gmail`` key.
+        -- an Admin console fix) / ``error`` (with the exception's type name
+        only). Always returns the ``gmail`` key and never the subject.
         """
         try:
             self._gmail_call(self.cfg.subject, "getProfile", lambda s: s.users().getProfile(userId="me"))
             return {"gmail": "ok"}
         except GwsApiDisabledError:
             return {"gmail": "api_disabled"}
-        except GwsAuthError as e:
-            return {"gmail": "no_grant", "detail": str(e)[:200]}
+        except GwsAuthError:
+            # No message text: it names the impersonated subject, which is
+            # parsed config and must not reach a tool answer.
+            return {"gmail": "no_grant"}
         except Exception as e:  # a health probe must always return the same keys
-            return {"gmail": "error", "detail": f"{type(e).__name__}: {str(e)[:200]}"}
+            return {"gmail": "error", "detail": type(e).__name__}
 
     def fetch_dmarc_rua_records(
         self,

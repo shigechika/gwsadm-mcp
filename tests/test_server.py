@@ -3375,8 +3375,28 @@ def test_compromise_sweep_degrades_per_section(inject):
     out = server.compromise_sweep("victim@example.edu")
     assert "error" in out["state"] and "error" in out["grants"]
     assert out["gmail"]["kind"] == "ok"  # independent of the directory failures
-    # ... but the activity failing is the whole call failing: nothing else is meaningful without it.
-    staff2 = FakeDomainClient("example.edu", {("login", None): GwsAuthError("[example.edu] auth failed")})
+    # ... and the activity failing stays inside its section: Directory and
+    # Gmail use their own grants and still answer; the IP sweep has no flags
+    # to start from unless addresses are given.
+    staff2, _ = _sweep_fixture()
+    staff2._canned = {("login", None): GwsAuthError("[example.edu] auth failed")}
     inject([staff2], {"example.edu"})
     out = server.compromise_sweep("victim@example.edu")
-    assert "auth failed" in out["error"] and "activity" not in out
+    assert "error" not in out and "auth failed" in out["activity"]["error"]
+    assert out["state"]["found"] is True and out["gmail"]["kind"] == "ok" and out["ips"] == []
+    assert out["highlights"][0]["kind"] == "activity_unreadable"
+    assert any("pass ips explicitly" in item for item in out["checklist"])
+    assert [e["ip"] for e in server.compromise_sweep("victim@example.edu", ips="192.0.2.1")["ips"]] == ["192.0.2.1"]
+
+
+def test_compromise_sweep_marks_an_ip_entry_capped_when_a_domain_fails(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    staff, _ = _sweep_fixture()
+    students = FakeDomainClient(
+        "students.example.edu", {("login", None): GwsAuthError("[students.example.edu] auth failed")}
+    )
+    inject([staff, students], {"example.edu", "students.example.edu"})
+    entry = server.compromise_sweep("victim@example.edu")["ips"][0]
+    assert entry["capped"] is True and "auth failed" in entry["domain_errors"]["students.example.edu"]
+    assert entry["other_accounts"] == []  # not "nobody else" -- one domain was never scanned

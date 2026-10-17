@@ -1570,6 +1570,8 @@ def _gmail_section(
 def _highlights(username: str, activity: dict, grants: dict, ips: list[dict], gmail: dict) -> list[dict]:
     """The facts a responder acts on, one line each, in the order they matter."""
     out: list[dict] = []
+    if "error" in activity:
+        out.append({"kind": "activity_unreadable", "detail": f"activity: {activity['error']}"})
     for f in activity.get("flags", []):
         ev = f.get("event")
         if ev in ("2sv_enroll", "2sv_disable", "2sv_change_phone"):
@@ -1676,6 +1678,11 @@ def _checklist(activity: dict, gmail: dict) -> list[str]:
             + "): check forwarding, filters, delegates and the Email Log Search in the Admin console by hand."
         )
     items.append("Drive: run drive_external_sharing for the window and look for this account as the actor.")
+    if "error" in activity:
+        items.append(
+            "The account's activity could not be read here (Reports API): the flags, source addresses and "
+            "the IP sweep from them are missing -- re-run once the audit grant works, or pass ips explicitly."
+        )
     if activity.get("capped"):
         items.append("The activity window was not fully covered (capped): narrow hours or raise max_pages and re-run.")
     return items
@@ -1697,7 +1704,8 @@ def compromise_sweep(
 
     - ``activity``: what the account did (``user_activity`` for the window,
       flags first -- a ``2sv_enroll`` from the attacker is the item that
-      survives a password reset).
+      survives a password reset). A Reports failure stays in this section
+      as ``error``; the others are still attempted with their own grants.
     - ``state`` / ``grants``: what the account is now (``get_user``:
       suspended, 2SV enrolled, last login) and which OAuth grants can read or
       act on content (``grants.risky``: mail / Drive / contacts / admin
@@ -1762,8 +1770,9 @@ def compromise_sweep(
         max_pages=max_pages,
         max_events=SWEEP_ACTIVITY_EVENTS,
     )
-    if "error" in activity:
-        return {"domain": c.domain, "username": username, "error": activity["error"]}
+    # A Reports failure stays inside ``activity``: the Directory and Gmail
+    # sections use their own grants and are still attempted.
+    activity_ok = "error" not in activity
 
     try:
         user = c.get_user(username)
@@ -1798,7 +1807,8 @@ def compromise_sweep(
     except (GwsAuthError, GwsError) as e:
         grants = {"error": str(e)}
 
-    sweep_ips = given_ips or [r["ip"] for r in activity["ips"] if r["ip"] in {f.get("ip") for f in activity["flags"]}]
+    flagged = {f.get("ip") for f in activity.get("flags", [])} if activity_ok else set()
+    sweep_ips = given_ips or [r["ip"] for r in activity.get("ips", []) if r["ip"] in flagged]
     sweep_ips = sweep_ips[:SWEEP_MAX_IPS]
     me = username.lower()
     ip_results: list[dict] = []
@@ -1812,6 +1822,7 @@ def compromise_sweep(
         for dom, d in got["domains"].items():
             if "error" in d:
                 errors[dom] = d["error"]
+                capped = True  # a domain never scanned is partial coverage
                 continue
             capped = capped or d["capped"]
             for a in d["accounts"]:
@@ -1819,11 +1830,12 @@ def compromise_sweep(
                     others.append({"domain": dom, **a})
         ip_results.append({"ip": ip, "other_accounts": others, "capped": capped, "domain_errors": errors})
 
-    gmail = _gmail_section(c, username, start=_window(hours), max_sent=max_sent, internal=internal)
+    start = _window(hours)
+    gmail = _gmail_section(c, username, start=start, max_sent=max_sent, internal=internal)
     return {
         "domain": c.domain,
         "username": username,
-        "window": activity["window"],
+        "window": activity.get("window") or {"hours": hours, "start": start.isoformat(timespec="seconds")},
         "highlights": _highlights(username, activity, grants, ip_results, gmail),
         "activity": activity,
         "state": state,
