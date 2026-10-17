@@ -3722,3 +3722,17 @@ def test_account_changes_list_newest_first_within_each_group(inject, tmp_path, m
     inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
     users = [e["user"] for e in server.daily_brief(hours=24)["account_changes"]["example.edu"]["entries"]]
     assert users == ["d@example.edu", "c@example.edu", "b@example.edu", "a@example.edu"]
+
+
+def test_account_changes_auth_error_on_a_correlation_probe_fails_the_section(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = {
+        ("login", "suspicious_login"): server.GwsAuthError("denied"),
+        **_change("v@example.edu", "2sv_enroll", "2026-07-01T09:00:00.000Z", "203.0.113.5"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    # auth is domain-wide: no rows are kept with a correlation that silently reads "no"
+    assert out["account_changes"]["example.edu"] == {"error": "denied"}
+    # the login audit reads the same probe, so the summary reports the domain as failed, not as complete
+    assert "error" in out["summary"]["example.edu"]
