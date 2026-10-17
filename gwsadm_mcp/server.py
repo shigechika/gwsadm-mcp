@@ -990,7 +990,7 @@ def _parse_ip(raw: str) -> str:
 
 
 def _fetch_per_application(
-    c: DomainClient,
+    picked: list[DomainClient],
     applications: list[str],
     *,
     start: datetime.datetime,
@@ -998,29 +998,32 @@ def _fetch_per_application(
     user_key: str = "all",
     actor_ip: str | None = None,
 ) -> dict:
-    """Run one unfiltered-by-event probe per application concurrently.
+    """Run one unfiltered-by-event probe per (domain × application) concurrently.
 
     Same worker-pool policy as ``_parallel_fetch``, whose task tuple cannot
-    carry the per-account / per-IP narrowing. Returns ``{application: (items,
-    capped) | Exception}`` so the caller applies its own degradation: a
-    ``GwsAuthError`` means the domain is unusable, a plain ``GwsError`` only
+    carry the per-account / per-IP narrowing: every domain's applications go
+    into ONE bounded pool, so a slow or retrying domain does not hold up the
+    others' results. Returns ``{domain: {application: (items, capped) |
+    Exception}}`` so the caller applies its own degradation: a
+    ``GwsAuthError`` means that domain is unusable, a plain ``GwsError`` only
     that one application (e.g. a tenant without ``gmail`` activity).
     """
-    results: dict = {}
-    if not applications:
+    results: dict = {c.domain: {} for c in picked}
+    tasks = [(c, app) for c in picked for app in applications]
+    if not tasks:
         return results
 
-    def _one(app: str):
+    def _one(c: DomainClient, app: str):
         return c.fetch_activities(app, start=start, max_pages=max_pages, user_key=user_key, actor_ip=actor_ip)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(applications))) as ex:
-        futs = {ex.submit(_one, app): app for app in applications}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(tasks))) as ex:
+        futs = {ex.submit(_one, c, app): (c.domain, app) for (c, app) in tasks}
         for fut in concurrent.futures.as_completed(futs):
-            app = futs[fut]
+            dom, app = futs[fut]
             try:
-                results[app] = fut.result()
+                results[dom][app] = fut.result()
             except (GwsAuthError, GwsError) as e:
-                results[app] = e
+                results[dom][app] = e
     return results
 
 
@@ -1186,9 +1189,9 @@ def user_activity(
         return {"username": username, "error": str(e)}
     c = picked[0]
     start = _window(hours)
-    fetched = _fetch_per_application(c, apps, start=start, max_pages=max_pages, user_key=username)
+    fetched = _fetch_per_application([c], apps, start=start, max_pages=max_pages, user_key=username)
     try:
-        got = _collect_activity(fetched, apps)
+        got = _collect_activity(fetched[c.domain], apps)
     except GwsAuthError as e:
         return {"domain": c.domain, "username": username, "error": str(e)}
     timeline = got["timeline"]
@@ -1254,11 +1257,12 @@ def ip_activity(
     except (ConfigError, GwsError) as e:
         return {"ip": ip, "error": str(e)}
     start = _window(hours)
+    # Every (domain × application) probe at once, then aggregate per domain.
+    fetched = _fetch_per_application(picked, apps, start=start, max_pages=max_pages, actor_ip=ip)
     out: dict = {}
     for c in picked:
-        fetched = _fetch_per_application(c, apps, start=start, max_pages=max_pages, actor_ip=ip)
         try:
-            got = _collect_activity(fetched, apps)
+            got = _collect_activity(fetched[c.domain], apps)
         except GwsAuthError as e:
             out[c.domain] = {"error": str(e)}
             continue

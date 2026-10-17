@@ -94,8 +94,9 @@ to guard against stdio newline regressions).
   through `_parallel_fetch` — or, for the single-probe doc/membership tools
   whose task shape carries a `filters` expression, the sibling
   `_fetch_drive_per_domain`, or, for `user_activity` / `ip_activity`, the
-  per-application sibling `_fetch_per_application` whose tasks carry the
-  `userKey` / `actorIpAddress` narrowing — onto a bounded `ThreadPoolExecutor`
+  sibling `_fetch_per_application` whose (domain × application) tasks carry
+  the `userKey` / `actorIpAddress` narrowing in one pool, so no domain waits
+  on another's pagination — onto a bounded `ThreadPoolExecutor`
   (`GWSADM_MAX_WORKERS`, default 8, clamped 1..32) — running them serially
   would blow past a gateway's request timeout on a large tenant — then
   aggregates the collected results serially.
