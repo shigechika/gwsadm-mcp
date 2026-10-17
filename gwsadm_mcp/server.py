@@ -1065,6 +1065,10 @@ def _collect_activity(fetched: dict, applications: list[str]) -> dict:
             raise r
         if isinstance(r, GwsError):
             apps[app] = {"error": str(r)}
+            # A failed probe is a window never scanned: partial coverage,
+            # reported the same way an over-budget one is (see login_audit's
+            # event_errors), so a caller never reads it as "nothing there".
+            capped = True
             continue
         items, app_capped = r
         capped = capped or app_capped
@@ -1080,8 +1084,12 @@ def _collect_activity(fetched: dict, applications: list[str]) -> dict:
                 if _is_posture_event(name, p):
                     # The same posture event can be delivered under two
                     # applications (2sv_enroll appears in both login and
-                    # user_accounts); one flag per occurrence.
-                    key = (row["time"], name, row["ip"], row["user"])
+                    # user_accounts); one flag per occurrence. The carried
+                    # parameters are part of the identity so that two
+                    # distinct grants or actions at the same instant (two
+                    # OAuth authorizations with different clients) both
+                    # survive -- only true twins collapse.
+                    key = (row["time"], name, row["ip"], row["user"], repr(sorted(row.get("params", {}).items())))
                     if key not in seen_flags:
                         seen_flags.add(key)
                         flags.append(row)

@@ -2906,6 +2906,7 @@ def test_user_activity_one_failing_application_is_reported_not_fatal(inject):
     assert "error" not in out
     assert out["applications"]["login"]["count"] == 1
     assert "HTTP 400" in out["applications"]["gmail"]["error"]
+    assert out["capped"] is True  # a window never scanned is partial coverage, not "nothing there"
     assert [a for (a, *_rest) in c.scoped_calls] and set(out["applications"]) == {"login", "gmail"}
 
 
@@ -3012,3 +3013,25 @@ def test_ip_activity_domain_filter_limits_the_scan(inject):
     assert list(out["domains"]) == ["students.example.edu"]
     assert c1.scoped_calls == [] and len(c2.scoped_calls) == 1
     assert "unknown domain" in server.ip_activity("192.0.2.5", domain="nope.example")["error"]
+
+
+def test_user_activity_keeps_distinct_grants_at_the_same_instant_but_collapses_twins(inject):
+    u = "u@example.edu"
+    t = "2026-07-01T01:00:00.000Z"
+    canned = {
+        ("token", None): (
+            [
+                _item(u, "authorize", {"client_id": "one.apps", "scope": ["a"]}, time=t, ip="192.0.2.1"),
+                _item(u, "authorize", {"client_id": "two.apps", "scope": ["b"]}, time=t, ip="192.0.2.1"),
+            ],
+            False,
+        ),
+        # The same enrolment delivered under both applications: one flag.
+        ("login", None): ([_item(u, "2sv_enroll", time=t, ip="192.0.2.1")], False),
+        ("user_accounts", None): ([_item(u, "2sv_enroll", time=t, ip="192.0.2.1")], False),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.user_activity(u, applications="token,login,user_accounts")
+    grants = sorted(f["params"]["client_id"] for f in out["flags"] if f["event"] == "authorize")
+    assert grants == ["one.apps", "two.apps"]
+    assert sum(1 for f in out["flags"] if f["event"] == "2sv_enroll") == 1
