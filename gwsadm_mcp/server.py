@@ -380,9 +380,10 @@ def health_check() -> dict:
 
     Always returns the same keys: status (healthy / degraded / error), service,
     version, config, and domains (per-domain auth result plus ``gmail``:
-    ok / api_disabled / no_grant / error -- whether the per-user Gmail tools
-    can work there; it does not affect ``status``). Lightweight: one 1-item
-    login query and one ``users.getProfile`` per domain.
+    ok / api_disabled / no_grant / error, with ``gmail_detail`` on an
+    unexpected error -- whether the per-user Gmail tools can work there; it
+    does not affect ``status``). Lightweight: one 1-item login query and one
+    ``users.getProfile`` per domain.
     """
     base = {"service": "gwsadm-mcp", "version": __version__, "config": config_path()}
     try:
@@ -1446,7 +1447,36 @@ def _parse_ips(raw: str | None) -> list[str]:
             ip = _parse_ip(part)
             if ip not in out:
                 out.append(ip)
+    if len(out) > SWEEP_MAX_IPS:
+        # Refused rather than silently truncated: an address not swept is an
+        # address the caller believes was.
+        raise GwsError(f"at most {SWEEP_MAX_IPS} addresses per sweep, got {len(out)}; split the call")
     return out
+
+
+_EMPTY_GROUP_RE = re.compile(r"^\s*[^:,;]*:\s*;\s*$")
+
+
+def _addresses(field: str | None) -> list[tuple[str, str]]:
+    """Parse one recipient header into ``(name, addr)`` pairs without losing the valid ones.
+
+    Strict ``getaddresses`` (the default since 3.13) answers ``[("", "")]``
+    for the WHOLE header when any one address in it is malformed, which would
+    drop every valid recipient next to it; on a header that strict parsing
+    rejects, the lenient parser is used so the valid ones survive and only
+    the malformed entry comes back empty (counted as unknown by the caller).
+    An empty group (``undisclosed-recipients:;``, the usual To of a BCC-only
+    send) names nobody and is not a recipient at all.
+    """
+    if not field or _EMPTY_GROUP_RE.match(field):
+        return []
+    pairs = email.utils.getaddresses([field])
+    if pairs == [("", "")]:
+        try:
+            pairs = email.utils.getaddresses([field], strict=False)
+        except TypeError:  # Python < 3.13 has no strict parameter (and no strict mode)
+            pass
+    return pairs
 
 
 def _recipients(sampled: list[dict], internal: set[str]) -> dict:
@@ -1459,9 +1489,7 @@ def _recipients(sampled: list[dict], internal: set[str]) -> dict:
         # [("", "")] when any element fails to parse -- observed on 3.14 for
         # an empty string -- so one malformed header must not blank the rest.
         for field in (m.get("to"), m.get("cc"), m.get("bcc")):
-            if not field:
-                continue
-            for _name, addr in email.utils.getaddresses([field]):
+            for _name, addr in _addresses(field):
                 total += 1
                 if not addr or "@" not in addr:
                     # A recipient that could not be parsed is still a
@@ -1484,11 +1512,13 @@ def _recipients(sampled: list[dict], internal: set[str]) -> dict:
 
 def _filter_entry(f: dict) -> dict:
     action = f.get("action") or {}
+    added = action.get("addLabelIds") or []
     return {
         "id": f.get("id"),
         "criteria": f.get("criteria") or {},
         "forward": action.get("forward"),
-        "deletes": "TRASH" in (action.get("addLabelIds") or []),
+        "deletes": "TRASH" in added,
+        "spams": "SPAM" in added,
         "archives": "INBOX" in (action.get("removeLabelIds") or []),
     }
 
@@ -1552,8 +1582,8 @@ def _gmail_section(
             {"email": a.get("forwardingEmail"), "verification_status": a.get("verificationStatus")}
             for a in settings.get("forwarding_addresses") or []
         ],
-        # Only the filters that move mail out of sight: forward, delete, archive.
-        "filters": [f for f in filters if f["forward"] or f["deletes"] or f["archives"]],
+        # Only the filters that move mail out of sight: forward, delete, mark as spam, archive.
+        "filters": [f for f in filters if f["forward"] or f["deletes"] or f["spams"] or f["archives"]],
         "filters_total": len(filters),
         "delegates": [
             {"email": d.get("delegateEmail"), "verification_status": d.get("verificationStatus")}
@@ -1607,7 +1637,7 @@ def _highlights(username: str, activity: dict, grants: dict, ips: list[dict], gm
                 {"kind": "forwarding", "detail": f"forwarding address {a['email']} ({a['verification_status']})"}
             )
         for flt in gmail["filters"]:
-            what = ", ".join(k for k in ("forward", "deletes", "archives") if flt[k])
+            what = ", ".join(k for k in ("forward", "deletes", "spams", "archives") if flt[k])
             out.append(
                 {
                     "kind": "filter",
@@ -1694,7 +1724,7 @@ def compromise_sweep(
     hours: int = 24,
     ips: str | None = None,
     max_pages: int = 5,
-    max_sent: int = 50,
+    max_sent: int = 20,
     domain: str | None = None,
 ) -> dict:
     """The Google-side follow-through after ONE account is confirmed compromised, in one call.
@@ -1724,6 +1754,8 @@ def compromise_sweep(
       archive, delegates, send-as aliases and reply-to) plus what the mailbox
       sent in the window as counts and recipient domains -- never a subject
       or body. Its ``kind`` says whether it could be read at all: ``ok``,
+      ``partial`` (a settings section or the sent summary failed --
+      ``section_errors`` / ``sent.error`` say which; the rest stands),
       ``api_disabled`` (the Gmail API is off in the service account's own
       Cloud project), ``no_grant`` (no ``gmail.readonly`` DWD grant) or
       ``error``. A failure is reported as such, never as "nothing found".
@@ -1743,12 +1775,13 @@ def compromise_sweep(
         username: Exact user email of the compromised account.
         hours: Window length ending now, for activity, the IP sweep and sent
             mail.
-        ips: Comma-separated attacker addresses to sweep. Default: the
-            addresses on the account's own flags.
+        ips: Comma-separated attacker addresses to sweep, at most
+            SWEEP_MAX_IPS (more is refused, not truncated). Default: the
+            addresses on the account's own flags, newest first, same cap.
         max_pages: Page budget per application for the account's activity
             (the IP sweep uses its own small budget).
-        max_sent: Sent messages whose envelope is fetched (the count covers
-            everything listed).
+        max_sent: Sent messages whose envelope is fetched, concurrently
+            (the count covers everything listed).
         domain: Configured ``[domain.*]`` section for the account. Default:
             resolved from the username's suffix. The IP sweep always covers
             every configured domain.
@@ -1762,21 +1795,38 @@ def compromise_sweep(
     except (ConfigError, GwsError) as e:
         return {"username": username, "error": str(e)}
     c = picked[0]
-    activity = _user_activity_impl(
-        c,
-        username,
-        hours=hours,
-        apps=list(ACTIVITY_APPLICATIONS),
-        max_pages=max_pages,
-        max_events=SWEEP_ACTIVITY_EVENTS,
+    start = _window(hours)
+    # The four sources at once: they are independent, each with its own
+    # grant, and serially they would not fit a client's tool-call budget.
+    # Each one answers with a dict (errors inside it) or, for the two raw
+    # Directory reads, raises a GwsError that _fan_out captures.
+    res = _fan_out(
+        {
+            "activity": functools.partial(
+                _user_activity_impl,
+                c,
+                username,
+                hours=hours,
+                apps=list(ACTIVITY_APPLICATIONS),
+                max_pages=max_pages,
+                max_events=SWEEP_ACTIVITY_EVENTS,
+            ),
+            "user": functools.partial(c.get_user, username),
+            "tokens": functools.partial(c.list_user_oauth_tokens, username),
+            "gmail": functools.partial(_gmail_section, c, username, start=start, max_sent=max_sent, internal=internal),
+        }
     )
     # A Reports failure stays inside ``activity``: the Directory and Gmail
-    # sections use their own grants and are still attempted.
+    # sections use their own grants and were attempted regardless.
+    activity = res["activity"]
     activity_ok = "error" not in activity
+    gmail = res["gmail"]
 
-    try:
-        user = c.get_user(username)
-        state: dict = {"found": user is not None}
+    user = res["user"]
+    if isinstance(user, GwsError):
+        state: dict = {"error": str(user)}
+    else:
+        state = {"found": user is not None}
         if user is not None:
             entry = _user_entry(user)
             state.update(
@@ -1794,28 +1844,40 @@ def compromise_sweep(
                     )
                 }
             )
-    except (GwsAuthError, GwsError) as e:
-        state = {"error": str(e)}
 
-    try:
-        tokens = [_token_entry(t) for t in c.list_user_oauth_tokens(username)]
-        grants: dict = {
-            "count": len(tokens),
-            "risky": [t for t in tokens if any(_RISKY_SCOPE_RE.search(sc or "") for sc in t.get("scopes", []))],
-            "tokens": tokens,
+    tokens = res["tokens"]
+    if isinstance(tokens, GwsError):
+        grants: dict = {"error": str(tokens)}
+    else:
+        entries = [_token_entry(t) for t in tokens]
+        grants = {
+            "count": len(entries),
+            "risky": [t for t in entries if any(_RISKY_SCOPE_RE.search(sc or "") for sc in t.get("scopes", []))],
+            "tokens": entries,
         }
-    except (GwsAuthError, GwsError) as e:
-        grants = {"error": str(e)}
 
     flagged = {f.get("ip") for f in activity.get("flags", [])} if activity_ok else set()
-    sweep_ips = given_ips or [r["ip"] for r in activity.get("ips", []) if r["ip"] in flagged]
-    sweep_ips = sweep_ips[:SWEEP_MAX_IPS]
-    me = username.lower()
+    sweep_ips = given_ips or [r["ip"] for r in activity.get("ips", []) if r["ip"] in flagged][:SWEEP_MAX_IPS]
+    # The account as typed AND its canonical primary address: an alias is a
+    # valid lookup key, but the Reports actor is always the primary.
+    me = {username.lower(), str(state.get("email") or "").lower()} - {""}
+    swept = _fan_out(
+        {
+            ip: functools.partial(
+                _ip_activity_impl,
+                clients,
+                ip,
+                hours=hours,
+                apps=SWEEP_IP_APPLICATIONS,
+                max_pages=SWEEP_IP_MAX_PAGES,
+                top=SWEEP_IP_TOP,
+            )
+            for ip in sweep_ips
+        }
+    )
     ip_results: list[dict] = []
     for ip in sweep_ips:
-        got = _ip_activity_impl(
-            clients, ip, hours=hours, apps=SWEEP_IP_APPLICATIONS, max_pages=SWEEP_IP_MAX_PAGES, top=SWEEP_IP_TOP
-        )
+        got = swept[ip]
         others: list[dict] = []
         errors: dict = {}
         capped = False
@@ -1826,12 +1888,10 @@ def compromise_sweep(
                 continue
             capped = capped or d["capped"]
             for a in d["accounts"]:
-                if str(a["user"]).lower() != me:
+                if str(a["user"]).lower() not in me:
                     others.append({"domain": dom, **a})
         ip_results.append({"ip": ip, "other_accounts": others, "capped": capped, "domain_errors": errors})
 
-    start = _window(hours)
-    gmail = _gmail_section(c, username, start=start, max_sent=max_sent, internal=internal)
     return {
         "domain": c.domain,
         "username": username,

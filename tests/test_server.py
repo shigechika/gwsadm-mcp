@@ -3400,3 +3400,51 @@ def test_compromise_sweep_marks_an_ip_entry_capped_when_a_domain_fails(inject):
     entry = server.compromise_sweep("victim@example.edu")["ips"][0]
     assert entry["capped"] is True and "auth failed" in entry["domain_errors"]["students.example.edu"]
     assert entry["other_accounts"] == []  # not "nobody else" -- one domain was never scanned
+
+
+def test_compromise_sweep_refuses_more_addresses_than_it_would_sweep(inject):
+    staff, _ = _sweep_fixture()
+    inject([staff], {"example.edu"})
+    too_many = ",".join(f"192.0.2.{i}" for i in range(server.SWEEP_MAX_IPS + 1))
+    out = server.compromise_sweep("victim@example.edu", ips=too_many)
+    assert "at most" in out["error"] and staff.scoped_calls == []
+
+
+def test_compromise_sweep_excludes_the_primary_address_when_looked_up_by_alias(inject):
+    staff, students = _sweep_fixture()
+    # The alias is what was typed; Google's record (and the Reports actor) is the primary.
+    staff._user = {**staff._user, "primaryEmail": "primary@example.edu"}
+    staff._canned[("login", None)] = (
+        [_item("primary@example.edu", "2sv_enroll", time="2026-07-01T01:20:00.000Z", ip="192.0.2.30")],
+        False,
+    )
+    students._canned[("login", None)] = (
+        [_item("primary@example.edu", "login_success", time="2026-07-01T01:26:00.000Z", ip="192.0.2.30")],
+        False,
+    )
+    inject([staff, students], {"example.edu", "students.example.edu"})
+    out = server.compromise_sweep("alias@example.edu")
+    assert out["state"]["email"] == "primary@example.edu"
+    assert out["ips"][0]["other_accounts"] == []  # the account's own primary is not "another account"
+
+
+def test_recipients_keep_valid_addresses_next_to_a_malformed_one_and_ignore_empty_groups():
+    sampled = [
+        {"internal_date": "1", "to": "a@example.edu, b@partner.example, not an address", "cc": "", "bcc": ""},
+        {"internal_date": "2", "to": "undisclosed-recipients:;", "cc": "", "bcc": "c@partner.example"},
+    ]
+    out = server._recipients(sampled, {"example.edu"})
+    assert out["recipients_total"] == 4 and out["unknown_recipients"] == 1
+    assert out["external_recipients"] == 3  # b, c and the unknown one
+    assert out["recipient_domains"] == {"partner.example": 2, "example.edu": 1}
+
+
+def test_compromise_sweep_lists_a_mark_as_spam_filter(inject):
+    staff, _ = _sweep_fixture()
+    staff._gmail_settings = {
+        "filters": [{"id": "f9", "criteria": {"from": "security@example.edu"}, "action": {"addLabelIds": ["SPAM"]}}]
+    }
+    inject([staff], {"example.edu"})
+    out = server.compromise_sweep("victim@example.edu")
+    assert [f["id"] for f in out["gmail"]["filters"]] == ["f9"] and out["gmail"]["filters"][0]["spams"] is True
+    assert any(h["kind"] == "filter" and "spams" in h["detail"] for h in out["highlights"])

@@ -120,6 +120,7 @@ _GMAIL_CACHE_MAX = 500
 _MESSAGE_LIST_MAX_RESULTS = 5
 # compromise_sweep: sent-mail listing page size (Gmail's own maximum is 500).
 _SENT_LIST_PAGE_SIZE = 100
+_SENT_GET_WORKERS = 8
 
 # messages().list page size for a DMARC RUA mailbox search. Gmail's hard cap
 # is 500; kept far below that so one page's worth of per-message fetches
@@ -446,11 +447,20 @@ def _is_api_disabled(e: HttpError) -> bool:
     blob = getattr(e, "content", b"") or b""
     if isinstance(blob, bytes):
         blob = blob.decode("utf-8", "replace")
+    # Every shape is guarded: a 403 body is whatever the API sent (a bare
+    # string under "error", a non-list "errors"), and this runs inside an
+    # exception handler where a second exception would escape as something
+    # no caller maps.
     try:
-        err = json.loads(blob).get("error", {})
+        err = json.loads(blob).get("error")
     except (ValueError, AttributeError):
         return False
-    return any(d.get("reason") == "accessNotConfigured" for d in err.get("errors", []) or [])
+    if not isinstance(err, dict):
+        return False
+    details = err.get("errors")
+    if not isinstance(details, list):
+        return False
+    return any(isinstance(d, dict) and d.get("reason") == "accessNotConfigured" for d in details)
 
 
 class GwsAuthError(GwsError):
@@ -1169,9 +1179,11 @@ class DomainClient:
         """What one user's mailbox SENT since ``start`` -- envelope only.
 
         ``messages().list`` with ``in:sent after:<epoch>`` (paged up to
-        ``max_pages``), then ``messages().get(format="metadata")`` for the
-        first ``max_messages`` of them with only the To / Cc / Bcc / Date
-        headers requested -- never Subject, never the body. Returns ``count``
+        ``max_pages``, spam and trash included so sent mail the attacker
+        already deleted still counts), then ``messages().get(format="metadata")``
+        for the first ``max_messages`` of them -- concurrently, on a bounded
+        pool -- with only the To / Cc / Bcc / Date headers requested -- never
+        Subject, never the body. Returns ``count``
         (all ids listed), ``capped`` (more pages existed) and ``sampled``
         (``{internal_date, to, cc, bcc}`` per fetched message); the server
         reduces the recipients to counts and domains. Raises as
@@ -1186,7 +1198,9 @@ class DomainClient:
                 user_email,
                 "messages.list",
                 lambda s, tok=token: (
-                    s.users().messages().list(userId="me", q=query, maxResults=_SENT_LIST_PAGE_SIZE, pageToken=tok)
+                    s.users()
+                    .messages()
+                    .list(userId="me", q=query, maxResults=_SENT_LIST_PAGE_SIZE, pageToken=tok, includeSpamTrash=True)
                 ),
             )
             ids.extend(m["id"] for m in resp.get("messages", []) or [])
@@ -1194,8 +1208,8 @@ class DomainClient:
             pages += 1
             if not token or pages >= max_pages:
                 break
-        sampled: list[dict] = []
-        for mid in ids[:max_messages]:
+
+        def _one(mid: str) -> dict:
             msg = self._gmail_call(
                 user_email,
                 "messages.get",
@@ -1206,14 +1220,20 @@ class DomainClient:
                 ),
             )
             headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", []) if "name" in h}
-            sampled.append(
-                {
-                    "internal_date": msg.get("internalDate"),
-                    "to": headers.get("to", ""),
-                    "cc": headers.get("cc", ""),
-                    "bcc": headers.get("bcc", ""),
-                }
-            )
+            return {
+                "internal_date": msg.get("internalDate"),
+                "to": headers.get("to", ""),
+                "cc": headers.get("cc", ""),
+                "bcc": headers.get("bcc", ""),
+            }
+
+        wanted = ids[:max_messages]
+        sampled: list[dict] = []
+        if wanted:
+            # One AuthorizedHttp per call (see _new_http), so the gets can run
+            # side by side; the first failure propagates as it would serially.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(_SENT_GET_WORKERS, len(wanted))) as ex:
+                sampled = list(ex.map(_one, wanted))
         return {"count": len(ids), "capped": bool(token), "sampled": sampled}
 
     def check_gmail(self) -> dict:
@@ -1234,7 +1254,8 @@ class DomainClient:
             # parsed config and must not reach a tool answer.
             return {"gmail": "no_grant"}
         except Exception as e:  # a health probe must always return the same keys
-            return {"gmail": "error", "detail": type(e).__name__}
+            # Its own key, so it never overwrites check()'s auth detail.
+            return {"gmail": "error", "gmail_detail": type(e).__name__}
 
     def fetch_dmarc_rua_records(
         self,
