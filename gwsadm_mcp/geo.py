@@ -7,7 +7,7 @@ iptoasn.com (PDDL), plain or gzip-compressed, one range per line::
 
 This server only reads the file; keeping it fresh is left to whatever already
 maintains it on the host (a weekly download is plenty, registrations move
-slowly). ``GWSADM_HOME_COUNTRIES`` (comma-separated ISO 3166-1 alpha-2 codes)
+slowly). ``GWSADM_HOME_COUNTRIES`` (ISO 3166-1 alpha-2 codes separated by commas, e.g. ``JP,US``)
 names the countries a change is expected to come from; without it a country is
 still reported but nothing is called foreign.
 
@@ -103,7 +103,8 @@ class GeoTable:
                     while i < len(w) and w[i][0] < lo_i:
                         i += 1
                     while i < len(w) and w[i][0] <= hi_i:
-                        asn = int(parts[2]) if parts[2].isdigit() else 0
+                        # isdigit() alone accepts Unicode digits ("²") that int() rejects
+                        asn = int(parts[2]) if parts[2].isascii() and parts[2].isdigit() else 0
                         cc = parts[3].strip().upper()
                         if asn:
                             found[w[i][1]] = {
@@ -113,7 +114,9 @@ class GeoTable:
                             }
                         i += 1
                     ptr[ver] = i
-        except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as e:
+        except (OSError, EOFError, gzip.BadGzipFile, zlib.error, ValueError) as e:
+            # Type name only: OSError messages embed the path. A malformed file degrades this
+            # lookup (rows become unknown_origin), it never aborts the caller.
             self.error = f"cannot read {PATH_VAR}: {type(e).__name__}"
             return {}
         return found
@@ -151,7 +154,8 @@ def load(env: dict | None = None) -> GeoTable:
     if bad:
         warnings.append(f"{HOME_VAR} has codes that are not ISO 3166-1 alpha-2, ignored: {', '.join(bad[:5])}")
     if path and not table.home:
-        warnings.append(f"{HOME_VAR} is not set: countries are reported but none is called foreign")
+        what = "has no valid code" if raw else "is not set"
+        warnings.append(f"{HOME_VAR} {what}: countries are reported but none is called foreign")
     table.warning = "; ".join(warnings) or None
     return table
 
@@ -167,6 +171,12 @@ def _probe(path: str) -> str | None:
     except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as e:
         # Type name only: OSError messages embed the path.
         return f"cannot read {PATH_VAR}: {type(e).__name__}"
-    if first.count("\t") < 4:
+    cols = first.rstrip("\n").split("\t")
+    if len(cols) < 5:
         return f"{PATH_VAR} does not look like an iptoasn table (expected 5 tab-separated columns)"
+    try:
+        ipaddress.ip_address(cols[0])
+    except ValueError:
+        # e.g. the u32 variant (integers): every lookup would silently find nothing
+        return f"{PATH_VAR} is not the combined table (the first column is not an IP address)"
     return None

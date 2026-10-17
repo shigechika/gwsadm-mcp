@@ -90,3 +90,40 @@ def test_health_sees_a_file_that_is_not_an_iptoasn_table(tmp_path):
 def test_missing_home_countries_is_a_warning(tmp_path):
     t = geo.load(env={geo.PATH_VAR: _table(tmp_path)})
     assert t.usable and "not set" in t.status()["warning"]
+
+
+def test_a_non_ascii_digit_in_the_as_column_does_not_escape(tmp_path):
+    p = tmp_path / "t.tsv"
+    p.write_text("198.51.100.0\t198.51.100.255\t\u00b2\tJP\tX\n", encoding="utf-8")
+    t = geo.load(env={geo.PATH_VAR: str(p), geo.HOME_VAR: "JP"})
+    assert t.lookup(["198.51.100.20"]) == {}  # treated as unrouted, no ValueError
+
+
+def test_probe_rejects_the_u32_variant(tmp_path):
+    p = tmp_path / "u32.tsv"
+    p.write_text("3325256704\t3325256959\t64500\tJP\tHOME-ISP\n", encoding="utf-8")
+    t = geo.load(env={geo.PATH_VAR: str(p), geo.HOME_VAR: "JP"})
+    assert not t.usable and "first column" in t.status()["error"]
+
+
+def test_a_truncated_gzip_passes_the_probe_but_lookup_degrades(tmp_path):
+    full = tmp_path / "full.tsv.gz"
+    with gzip.open(full, "wt", encoding="utf-8") as f:
+        f.write(
+            "1.0.0.0\t1.0.0.255\t13335\tUS\tX\n"
+            + "".join(f"10.{i // 256}.{i % 256}.0\t10.{i // 256}.{i % 256}.255\t64500\tJP\tY\n" for i in range(20000))
+        )
+    data = full.read_bytes()
+    cut = tmp_path / "cut.tsv.gz"
+    cut.write_bytes(data[: len(data) // 2])  # the first line decompresses, the rest is missing
+    t = geo.load(env={geo.PATH_VAR: str(cut), geo.HOME_VAR: "JP"})
+    assert t.usable  # _probe reads one line only
+    assert t.lookup(["198.51.100.1"]) == {}  # reaches the truncation: EOFError caught, not raised
+    assert t.status()["error"] is not None and str(tmp_path) not in t.status()["error"]
+
+
+def test_home_countries_warning_says_invalid_not_unset(tmp_path):
+    p = tmp_path / "t.tsv"
+    p.write_text(TABLE, encoding="utf-8")
+    w = geo.load(env={geo.PATH_VAR: str(p), geo.HOME_VAR: "JP US"}).status()["warning"]
+    assert "has no valid code" in w and "not set" not in w

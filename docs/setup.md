@@ -109,9 +109,10 @@ Each change then says which site it came from, or `external: true`. Unset,
 "everything is internal". `external` on its own is not a flag: most owners
 change these settings from home.
 
-`GWSADM_IP2ASN` points at the iptoasn.com "combined" table (plain or `.gz`,
-PDDL) and `GWSADM_HOME_COUNTRIES` lists the ISO 3166-1 alpha-2 codes changes are
-expected to come from, e.g. `JP`. The server only reads the file; refresh it
+`GWSADM_IP2ASN` points at the iptoasn.com "combined" table (`ip2asn-combined.tsv`,
+plain or `.gz`, PDDL; not the `u32` variant) and `GWSADM_HOME_COUNTRIES` lists the
+ISO 3166-1 alpha-2 codes changes are expected to come from, separated by commas,
+e.g. `JP` or `JP,US`. The server only reads the file; refresh it
 yourself (weekly is plenty). Each change from outside the sites table then
 carries `country` / `asn` / `as_name`, and a row is `flagged` with
 `flag_reasons`:
@@ -121,7 +122,8 @@ carries `country` / `asn` / `as_name`, and a row is `flagged` with
   that cannot be placed is not treated as home);
 - `after_suspicious_login` — the same user had a suspicious login before the
   change, looking 72 hours further back than the window (works without either
-  file; `null` when the row names only a profile id). When that login scan itself was partial
+  file; `null` when the row names only a profile id or every suspicious-login
+  probe failed). Probes that failed outright are named in `event_errors`. When that login scan itself was partial
   or failed, `suspicious_login_coverage` says so and the section is `capped`.
 
 Flagged rows come first, newest first. `health_check` reports both under

@@ -3736,3 +3736,17 @@ def test_account_changes_auth_error_on_a_correlation_probe_fails_the_section(inj
     assert out["account_changes"]["example.edu"] == {"error": "denied"}
     # the login audit reads the same probe, so the summary reports the domain as failed, not as complete
     assert "error" in out["summary"]["example.edu"]
+
+
+def test_account_changes_partial_when_one_suspicious_probe_failed(inject, monkeypatch):
+    _no_tables(monkeypatch)
+    canned = {
+        ("login", "suspicious_login"): server.GwsError("[example.edu] reports API error (login): HTTP 503"),
+        **_change("v@example.edu", "2sv_enroll", "2026-07-01T09:00:00.000Z", "203.0.113.5"),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    out = server.daily_brief(hours=24)
+    ac = out["account_changes"]["example.edu"]
+    assert ac["suspicious_login_coverage"] == "partial" and ac["capped"] is True
+    assert ac["event_errors"] == {"suspicious_login": "[example.edu] reports API error (login): HTTP 503"}
+    assert ac["entries"][0]["after_suspicious_login"] is False  # may be wrong: hence capped

@@ -108,15 +108,17 @@ ipv6 = 2001:db8:1::/48
 `false` ではなく `null` になり、「全部内部」とは読ませない。`external` だけでは印にしない
 （持ち主の多くは自宅から設定を変える）。
 
-`GWSADM_IP2ASN` は iptoasn.com の「combined」表（そのままか `.gz`、PDDL）を指し、
-`GWSADM_HOME_COUNTRIES` は変更が来るはずの国を ISO 3166-1 alpha-2 で並べる（例 `JP`）。
+`GWSADM_IP2ASN` は iptoasn.com の「combined」表（`ip2asn-combined.tsv`、そのままか `.gz`、PDDL。
+`u32` 版ではない）を指し、`GWSADM_HOME_COUNTRIES` は変更が来るはずの国を ISO 3166-1 alpha-2 で
+カンマ区切りで並べる（例 `JP`、`JP,US`）。
 サーバはファイルを読むだけで、更新は利用者側で行う（週 1 回で足りる）。範囲表の外から来た
 変更に `country`・`asn`・`as_name` が付き、次の `flag_reasons` で `flagged` になる:
 
 - `foreign` — 登録国が `GWSADM_HOME_COUNTRIES` の外
 - `unknown_origin` — アドレスが無いか、表で国が引けない（引けない出どころを国内扱いにしない）
 - `after_suspicious_login` — 同じユーザーが変更の前に不審なログインをしていた。窓より 72 時間前まで
-  さかのぼって見る（2 つのファイルが無くても働く。行の利用者がプロファイル ID だけのときは `null`）。そのログインの取得が途中までか失敗したときは `suspicious_login_coverage` にそう出て、
+  さかのぼって見る（2 つのファイルが無くても働く。行の利用者がプロファイル ID だけのときと、不審なログインの
+  取得がすべて失敗したときは `null`）。失敗した取得は `event_errors` に名前が出る。そのログインの取得が途中までか失敗したときは `suspicious_login_coverage` にそう出て、
   その節は `capped` になる
 
 印の付いた行が先で、それぞれ新しい順に並ぶ。`health_check` は両方を `sites`・`geo` に出す。表の 1 行目を

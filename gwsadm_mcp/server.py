@@ -3051,7 +3051,9 @@ def _account_changes(clients: list[DomainClient], hours: int, max_pages: int = 2
     so ``after_suspicious_login: false`` may be wrong) or ``unavailable``
     (every suspicious-login probe failed; ``after_suspicious_login`` is then
     ``null``). Anything but ``complete`` is ORed into ``capped``, as is a
-    failed change probe (``event_errors``): the counts are then lower bounds.
+    failed change probe: the counts are then lower bounds. ``event_errors``
+    names every probe that failed outright, change or suspicious-login, with
+    its error text, so a failure can be told from a page cap.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     start = now - datetime.timedelta(hours=hours)
@@ -3074,6 +3076,7 @@ def _account_changes(clients: list[DomainClient], hours: int, max_pages: int = 2
     for c in clients:
         try:
             suspicious: dict = {}
+            errors: dict = {}
             failed_corr = 0
             corr_partial = False
             for name in SUSPICIOUS_LOGIN_EVENTS:
@@ -3081,6 +3084,8 @@ def _account_changes(clients: list[DomainClient], hours: int, max_pages: int = 2
                 if isinstance(r, GwsAuthError):
                     raise r
                 if isinstance(r, GwsError):
+                    # recorded like a change probe's error (names do not collide with ACCOUNT_CHANGE_PROBES)
+                    errors[name] = str(r)
                     failed_corr += 1
                     continue
                 items, part_capped = r
@@ -3101,7 +3106,6 @@ def _account_changes(clients: list[DomainClient], hours: int, max_pages: int = 2
                 coverage = "complete"
             rows: list[dict] = []
             capped = coverage != "complete"
-            errors: dict = {}
             for app, name in ACCOUNT_CHANGE_PROBES:
                 r = fetched[(c.domain, "change", app, name)]
                 if isinstance(r, GwsAuthError):
