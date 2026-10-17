@@ -3014,7 +3014,13 @@ ACCOUNT_CHANGE_PROBES = (
 ACCOUNT_CHANGES_LISTED = 50
 
 
-def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_pages: int = 2) -> dict:
+# A takeover's first suspicious login can precede its account changes by more
+# than the brief's window (log in one evening, enroll a second factor the next
+# morning), so the correlation looks this much further back.
+CORRELATION_LOOKBACK_HOURS = 72
+
+
+def _account_changes(clients: list[DomainClient], hours: int, max_pages: int = 2) -> dict:
     """Account-protection changes across each domain, flagged when they look like a takeover.
 
     Every row carries where it came from: ``site`` / ``external`` from the
@@ -3032,39 +3038,72 @@ def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_
       it (including when the dataset itself is missing or unreadable; ``geo``
       then carries the error) -- an origin that cannot be placed is not
       treated as home;
-    - ``after_suspicious_login``: the same user had a suspicious login (from
-      ``logins``, the login audit of the same window) at or before the change.
+    - ``after_suspicious_login``: the same user had a suspicious login at or
+      before the change, looking ``CORRELATION_LOOKBACK_HOURS`` further back
+      than the window. A row whose user is only a profile id (no address to
+      match on) gets ``null`` here, not ``false``.
 
-    Flagged rows are listed first; at most ``ACCOUNT_CHANGES_LISTED`` rows are
-    listed per domain, ``total`` counts all.
+    Flagged rows are listed first, newest first within each group; at most
+    ``ACCOUNT_CHANGES_LISTED`` rows are listed per domain, ``total`` counts all.
 
     ``suspicious_login_coverage`` says how far the last reason can be trusted:
-    ``complete``, ``partial`` (the suspicious-login scan was capped or lost an
-    event probe, so ``after_suspicious_login: false`` may be wrong) or
-    ``unavailable`` (the login audit failed for the domain;
-    ``after_suspicious_login`` is then ``null``). Anything but ``complete`` is
-    ORed into ``capped``: the flagged count is a lower bound.
+    ``complete``, ``partial`` (a suspicious-login probe was capped or failed,
+    so ``after_suspicious_login: false`` may be wrong) or ``unavailable``
+    (every suspicious-login probe failed; ``after_suspicious_login`` is then
+    ``null``). Anything but ``complete`` is ORed into ``capped``, as is a
+    failed change probe (``event_errors``): the counts are then lower bounds.
     """
-    start = _window(hours)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = now - datetime.timedelta(hours=hours)
+    corr_start = start - datetime.timedelta(hours=CORRELATION_LOOKBACK_HOURS)
     table = sites.load()
     geo_table = geo.load()
-    fetched = _parallel_fetch(
-        [(c, app, name, max_pages) for c in clients for app, name in ACCOUNT_CHANGE_PROBES], start
-    )
+    # One fan-out for the change probes and their correlation probes (one worker bound, see _fan_out).
+    jobs: dict = {}
+    for c in clients:
+        for app, name in ACCOUNT_CHANGE_PROBES:
+            jobs[(c.domain, "change", app, name)] = functools.partial(
+                c.fetch_activities, app, start=start, event_name=name, max_pages=max_pages
+            )
+        for name in SUSPICIOUS_LOGIN_EVENTS:
+            jobs[(c.domain, "suspicious", "login", name)] = functools.partial(
+                c.fetch_activities, "login", start=corr_start, event_name=name, max_pages=max_pages
+            )
+    fetched = _fan_out(jobs)
     raw: dict = {}
     for c in clients:
-        la = logins.get(c.domain, {})
-        if "error" in la:
-            coverage = "unavailable"
-        else:
-            sl = la.get("suspicious_logins") or {}
-            coverage = "partial" if (sl.get("capped") or sl.get("event_errors")) else "complete"
         try:
+            suspicious: dict = {}
+            failed_corr = 0
+            corr_partial = False
+            for name in SUSPICIOUS_LOGIN_EVENTS:
+                r = fetched[(c.domain, "suspicious", "login", name)]
+                if isinstance(r, GwsAuthError):
+                    raise r
+                if isinstance(r, GwsError):
+                    failed_corr += 1
+                    continue
+                items, part_capped = r
+                corr_partial = corr_partial or part_capped
+                for it in items:
+                    for ev in it.get("events", []):
+                        if ev.get("name") != name:
+                            continue
+                        e = _entry(it, ev)
+                        u = (e.get("user") or "").lower()
+                        if u and e.get("time") and (u not in suspicious or e["time"] < suspicious[u]):
+                            suspicious[u] = e["time"]
+            if failed_corr == len(SUSPICIOUS_LOGIN_EVENTS):
+                coverage = "unavailable"
+            elif failed_corr or corr_partial:
+                coverage = "partial"
+            else:
+                coverage = "complete"
             rows: list[dict] = []
             capped = coverage != "complete"
             errors: dict = {}
             for app, name in ACCOUNT_CHANGE_PROBES:
-                r = fetched[(c.domain, app, name)]
+                r = fetched[(c.domain, "change", app, name)]
                 if isinstance(r, GwsAuthError):
                     raise r
                 if isinstance(r, GwsError):
@@ -3087,7 +3126,7 @@ def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_
                         row["site"] = site.code if site else None
                         row["external"] = (site is None) if table.networks else None
                         rows.append(row)
-            raw[c.domain] = (rows, capped, errors, coverage, la)
+            raw[c.domain] = (rows, capped, errors, coverage, suspicious)
         except (GwsAuthError, GwsError) as e:
             raw[c.domain] = e
     # One pass over the dataset for every domain's addresses outside the sites table.
@@ -3100,12 +3139,7 @@ def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_
         if isinstance(v, Exception):
             out[c.domain] = {"error": str(v)}
             continue
-        rows, capped, errors, coverage, la = v
-        suspicious: dict = {}
-        for e in (la.get("suspicious_logins") or {}).get("entries", []):
-            u = (e.get("user") or "").lower()
-            if u and e.get("time") and (u not in suspicious or e["time"] < suspicious[u]):
-                suspicious[u] = e["time"]
+        rows, capped, errors, coverage, suspicious = v
         for row in rows:
             reasons: list[str] = []
             place = places.get(row.get("ip") or "") if row["site"] is None else None
@@ -3119,16 +3153,20 @@ def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_
                     reasons.append("unknown_origin")
                 elif geo_table.home and row["country"] not in geo_table.home:
                     reasons.append("foreign")
-            if coverage == "unavailable":
+            user = (row.get("user") or "").lower()
+            if coverage == "unavailable" or "@" not in user:
+                # nothing to match on: say "unknown", never "no"
                 row["after_suspicious_login"] = None
             else:
-                first = suspicious.get((row.get("user") or "").lower())
+                first = suspicious.get(user)
                 row["after_suspicious_login"] = bool(first and row.get("time") and first <= row["time"])
                 if row["after_suspicious_login"]:
                     reasons.append("after_suspicious_login")
             row["flag_reasons"] = reasons
             row["flagged"] = bool(reasons)
-        rows.sort(key=lambda x: (not x["flagged"], x.get("time") or ""))
+        # newest first, then flagged rows ahead of the rest (sort is stable)
+        rows.sort(key=lambda x: x.get("time") or "", reverse=True)
+        rows.sort(key=lambda x: not x["flagged"])
         dom = {
             "total": len(rows),
             "flagged": sum(1 for x in rows if x["flagged"]),
@@ -3153,7 +3191,7 @@ def _daily_brief_impl(hours: int, max_pages: int, samples: int) -> dict:
     except ConfigError as e:
         return {"error": str(e)}
     logins = _login_audit(clients, hours, include_failures=True, top=5)
-    changes = _account_changes(clients, hours, logins)
+    changes = _account_changes(clients, hours)
     sharing = _drive_external_sharing(clients, internal, hours, max_pages=max_pages, samples=samples)
     summary: dict = {}
     for c in clients:
@@ -3177,7 +3215,8 @@ def _daily_brief_impl(hours: int, max_pages: int, samples: int) -> dict:
                 or la["suspicious_logins"]["capped"]
                 or la.get("login_failures", {}).get("capped", False)
                 or ds["capped"]
-                or ac.get("capped", False)
+                # a failed account-change scan is incomplete coverage, not "nothing changed"
+                or ac.get("capped", "error" in ac)
             ),
         }
     return {

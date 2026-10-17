@@ -115,11 +115,12 @@ ipv6 = 2001:db8:1::/48
 
 - `foreign` — 登録国が `GWSADM_HOME_COUNTRIES` の外
 - `unknown_origin` — アドレスが無いか、表で国が引けない（引けない出どころを国内扱いにしない）
-- `after_suspicious_login` — 同じユーザーが変更の前に不審なログインをしていた（2 つのファイルが
-  無くても働く）。そのログインの取得が途中までか失敗したときは `suspicious_login_coverage` にそう出て、
+- `after_suspicious_login` — 同じユーザーが変更の前に不審なログインをしていた。窓より 72 時間前まで
+  さかのぼって見る（2 つのファイルが無くても働く。行の利用者がプロファイル ID だけのときは `null`）。そのログインの取得が途中までか失敗したときは `suspicious_login_coverage` にそう出て、
   その節は `capped` になる
 
-`health_check` は両方を `sites`・`geo` に出す（30 日より古い表は `warning`）。
+印の付いた行が先で、それぞれ新しい順に並ぶ。`health_check` は両方を `sites`・`geo` に出す。表の 1 行目を
+読んで確かめるので、読めないファイルは `error`、30 日より古い表と `GWSADM_HOME_COUNTRIES` の未設定は `warning` になる。
 ## 何かに組み込む前に確認する
 
 ```bash

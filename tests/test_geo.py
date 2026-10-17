@@ -74,3 +74,19 @@ def test_damaged_deflate_stream_is_recorded_not_raised(tmp_path):
     t = geo.load(env={geo.PATH_VAR: str(bad)})
     assert t.lookup(["2001:db8::1"]) == {}
     assert t.status()["error"] is not None
+
+
+def test_health_sees_a_file_that_is_not_an_iptoasn_table(tmp_path):
+    p = tmp_path / "x.tsv"
+    p.write_text("hello world\n", encoding="utf-8")
+    t = geo.load(env={geo.PATH_VAR: str(p), geo.HOME_VAR: "JP"})
+    assert not t.usable and "5 tab-separated" in t.status()["error"]
+    p2 = tmp_path / "y.tsv.gz"
+    p2.write_bytes(b"plain text, not gzip")
+    t2 = geo.load(env={geo.PATH_VAR: str(p2), geo.HOME_VAR: "JP"})
+    assert not t2.usable and str(tmp_path) not in t2.status()["error"]
+
+
+def test_missing_home_countries_is_a_warning(tmp_path):
+    t = geo.load(env={geo.PATH_VAR: _table(tmp_path)})
+    assert t.usable and "not set" in t.status()["warning"]

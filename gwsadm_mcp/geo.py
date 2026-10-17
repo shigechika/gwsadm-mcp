@@ -87,11 +87,18 @@ class GeoTable:
                     parts = line.rstrip("\n").split("\t")
                     if len(parts) < 5:
                         continue
+                    # The family is visible without parsing; skip a family already matched out
+                    # (the table holds hundreds of thousands of ranges, most of them IPv4).
+                    ver = 6 if ":" in parts[0] else 4
+                    if ptr[ver] >= len(want[ver]):
+                        continue
                     try:
                         lo, hi = ipaddress.ip_address(parts[0]), ipaddress.ip_address(parts[1])
                     except ValueError:
                         continue
-                    ver, w = lo.version, want[lo.version]
+                    if lo.version != ver:
+                        continue
+                    w = want[ver]
                     i, lo_i, hi_i = ptr[ver], int(lo), int(hi)
                     while i < len(w) and w[i][0] < lo_i:
                         i += 1
@@ -138,8 +145,28 @@ def load(env: dict | None = None) -> GeoTable:
     raw = [c.strip().upper() for c in (e.get(HOME_VAR) or "").split(",") if c.strip()]
     bad = [c for c in raw if not _CC_RE.match(c)]
     table = GeoTable(path=path, home=frozenset(c for c in raw if _CC_RE.match(c)))
-    if path and not os.path.isfile(path):
-        table.error = f"cannot read {PATH_VAR}: no such file"
+    if path:
+        table.error = _probe(path)
+    warnings = []
     if bad:
-        table.warning = f"{HOME_VAR} has codes that are not ISO 3166-1 alpha-2, ignored: {', '.join(bad[:5])}"
+        warnings.append(f"{HOME_VAR} has codes that are not ISO 3166-1 alpha-2, ignored: {', '.join(bad[:5])}")
+    if path and not table.home:
+        warnings.append(f"{HOME_VAR} is not set: countries are reported but none is called foreign")
+    table.warning = "; ".join(warnings) or None
     return table
+
+
+def _probe(path: str) -> str | None:
+    """Read the first line, so health_check sees an unreadable or non-gzip file before a lookup does."""
+    if not os.path.isfile(path):
+        return f"cannot read {PATH_VAR}: no such file"
+    opener = gzip.open if path.endswith(".gz") else open
+    try:
+        with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+            first = f.readline()
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as e:
+        # Type name only: OSError messages embed the path.
+        return f"cannot read {PATH_VAR}: {type(e).__name__}"
+    if first.count("\t") < 4:
+        return f"{PATH_VAR} does not look like an iptoasn table (expected 5 tab-separated columns)"
+    return None

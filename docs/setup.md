@@ -120,11 +120,14 @@ carries `country` / `asn` / `as_name`, and a row is `flagged` with
 - `unknown_origin` — no address, or one the dataset cannot place (an origin
   that cannot be placed is not treated as home);
 - `after_suspicious_login` — the same user had a suspicious login before the
-  change (works without either file). When that login scan itself was partial
+  change, looking 72 hours further back than the window (works without either
+  file; `null` when the row names only a profile id). When that login scan itself was partial
   or failed, `suspicious_login_coverage` says so and the section is `capped`.
 
-`health_check` reports both under `sites` and `geo` (a dataset older than 30
-days is a `warning`).
+Flagged rows come first, newest first. `health_check` reports both under
+`sites` and `geo`; it reads the dataset's first line, so an unreadable file is an
+`error` there, and a dataset older than 30 days or a missing
+`GWSADM_HOME_COUNTRIES` is a `warning`.
 
 ## Verify before wiring it into anything
 
