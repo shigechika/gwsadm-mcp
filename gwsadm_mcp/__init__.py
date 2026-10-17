@@ -1,3 +1,3 @@
 """gwsadm-mcp — Google Workspace security-audit MCP (read-only)."""
 
-__version__ = "0.20.0"  # x-release-please-version
+__version__ = "0.21.0"  # x-release-please-version
