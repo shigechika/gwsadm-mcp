@@ -18,7 +18,11 @@ via `users().get`, on the same `admin.directory.user.readonly` scope
 applications via `userKey=<username>`, newest first, with the posture-changing
 events — 2SV enrol/disable, recovery changes, password change, outbound
 forwarding, `risky_sensitive_action_*`, OAuth `authorize` — surfaced as
-`flags` and the distinct source addresses as `ips`), `ip_activity` (every
+`flags` and the distinct source addresses as `ips`; Google's own
+`account_disabled_*` / `suspicious_*` verdicts are NOT served under the
+account's `userKey` — verified live — so they are fetched per event name
+with `userKey=all` and matched on `affected_email_address`, reported under
+the synthetic application `login_verdicts`), `ip_activity` (every
 account one source address acted as, per domain, via `actorIpAddress`; both
 on the same `admin.reports.audit.readonly` scope and the same
 `activities().list` call as `login_audit`),
@@ -94,9 +98,12 @@ to guard against stdio newline regressions).
   through `_parallel_fetch` — or, for the single-probe doc/membership tools
   whose task shape carries a `filters` expression, the sibling
   `_fetch_drive_per_domain`, or, for `user_activity` / `ip_activity`, the
-  sibling `_fetch_per_application` whose (domain × application) tasks carry
-  the `userKey` / `actorIpAddress` narrowing in one pool, so no domain waits
-  on another's pagination — onto a bounded `ThreadPoolExecutor`
+  `_application_jobs` / `_fetch_per_application` pair whose (domain ×
+  application) jobs carry the `userKey` / `actorIpAddress` narrowing (and,
+  for `user_activity`, the verdict probes in the same pool), so no domain
+  waits on another's pagination — all three through the one `_fan_out`
+  helper that owns the worker bound and the per-job error capture — onto a
+  bounded `ThreadPoolExecutor`
   (`GWSADM_MAX_WORKERS`, default 8, clamped 1..32) — running them serially
   would blow past a gateway's request timeout on a large tenant — then
   aggregates the collected results serially.

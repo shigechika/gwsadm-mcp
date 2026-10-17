@@ -175,20 +175,27 @@ async def _fake_account(call: Caller) -> dict[str, Any]:
 async def _some_ip(call: Caller) -> dict[str, Any]:
     """Discover a source address at run time for the per-IP tool.
 
-    Taken from whatever ``user_activity`` reports for the account
-    ``_some_account`` found: an address that acted in the tenant recently, so
-    the probe exercises the ``actorIpAddress`` filter against events that
-    exist. A tenant whose discovered account shows no activity in the window
-    is a skip, not a failure — there is no address to ask about.
+    An address that acted in the tenant recently, so the probe exercises the
+    ``actorIpAddress`` filter against events that exist. Two sources, cheapest
+    first: the ``ip`` on a Google verdict or a failing login that
+    ``login_audit`` already reports, then whatever ``user_activity`` shows for
+    a recently failing account (NOT ``_some_account``'s first choice, a
+    suspended account, which by definition has no recent activity and would
+    make this a skip on every tenant that has one). A tenant with neither is
+    a skip, not a failure — there is no address to ask about.
     """
-    account = await _some_account(call)
-    activity = await call(
-        "user_activity",
-        {**account, "hours": 24 * 7, "max_pages": MAX_PAGES, "max_events": 1},
-    )
-    ip = _first_field(activity, "ip", r"[0-9A-Fa-f.:]+")
+    audit = await call("login_audit", {"hours": 24 * 30, "include_failures": True, "top": 5})
+    ip = _first_field(audit, "ip", r"[0-9A-Fa-f.:]+")
     if not ip:
-        raise SkipProbe("no activity in the window to take a source address from")
+        address = _first_field(audit, "user", r"[^'\"]+@[^'\"]+")
+        if address:
+            args: dict[str, Any] = {"username": address, "hours": 24 * 7, "max_pages": MAX_PAGES, "max_events": 1}
+            configured = await _configured_domains(call)
+            if configured and address.rsplit("@", 1)[-1].lower() not in configured:
+                args["domain"] = configured[0]
+            ip = _first_field(await call("user_activity", args), "ip", r"[0-9A-Fa-f.:]+")
+    if not ip:
+        raise SkipProbe("no verdict, failing login or recent activity to take a source address from")
     return {"ip": ip}
 
 
@@ -318,18 +325,22 @@ PROBES: dict[str, Probe] = {
         args_factory=_some_account,
         require_keys=("domain", "username", "window", "applications", "flags", "ips", "timeline", "capped"),
         rows_key="timeline",
-        # A quiet account is a real answer. Deliberately no must_not_match on a
-        # nested "error": one application the tenant does not have (gmail on
-        # some tenants) is reported as that application's own error next to
-        # the others' results -- the tool WORKING as documented. A whole-call
-        # failure is a top-level error, which the harness already rejects.
+        # A quiet account is a real answer, but a quiet answer in which EVERY
+        # application failed is not: at least one application must have
+        # produced its accounting (a "count"). Deliberately no must_not_match
+        # on a nested "error" beyond that: one application the tenant does not
+        # have (gmail on some tenants) is reported as that application's own
+        # error next to the others' results -- the tool WORKING as documented.
+        # A whole-call failure is a top-level error, which the harness already
+        # rejects.
+        must_match=(r'"count": \d',),
         allow_empty=True,
     ),
     "ip_activity": Probe(
         args={"hours": WINDOW_HOURS * 7, "max_pages": MAX_PAGES, "top": 5},
         args_factory=_some_ip,
         require_keys=("ip", "window", "domains"),
-        must_match=(DOMAINS_NOT_EMPTY,),
+        must_match=(DOMAINS_NOT_EMPTY, r'"count": \d'),
         # Only a whole-domain failure (the domain's value IS {"error": ...})
         # fails the probe. A per-application error sits one level deeper,
         # under a key with no dot in it, and is the documented degradation.
