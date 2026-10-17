@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.20.0...v0.21.0) (2026-10-17)
+
+
+### Features
+
+* daily_brief reports account-protection changes and flags likely takeovers ([#98](https://github.com/shigechika/gwsadm-mcp/issues/98)) ([ed36ba7](https://github.com/shigechika/gwsadm-mcp/commit/ed36ba770194f1e40bc8b41af01195300e3c1bea))
+
 ## [0.20.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.19.0...v0.20.0) (2026-10-17)
 
 
