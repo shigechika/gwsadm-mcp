@@ -89,9 +89,13 @@ Google Cloud サービスアカウント JSON 鍵を指す。どちらのファ�
 失敗する — スコープ不足とは違い、設定欠落に対する縮退動作は無い。
 
 
-任意の追加設定は `GWSADM_SITES_INI` だけ。自組織のアドレス範囲を書いた INI ファイルで、
-keycloak-mcp の `KEYCLOAK_SITES_INI`・entraadm-mcp の `ENTRAADM_SITES_INI` と同じ形式なので、
-1 つのファイルを 3 つで共用できる:
+`daily_brief` のアカウントの保護の変更の節（2 段階認証の登録・解除、パスキーの追加・削除、
+高度な保護機能の解除、パスワードや再設定用のメール・電話の変更、ドメイン外への転送の有効化）を
+鋭くする任意の設定が 2 つある。ほかの機能には要らない。
+
+`GWSADM_SITES_INI` は自組織のアドレス範囲を書いた INI ファイルで、keycloak-mcp の
+`KEYCLOAK_SITES_INI`・entraadm-mcp の `ENTRAADM_SITES_INI` と同じ形式なので、1 つのファイルを
+3 つで共用できる:
 
 ```ini
 [HQ]
@@ -100,10 +104,22 @@ ipv4 = 192.0.2.0/24, 198.51.100.0/25
 ipv6 = 2001:db8:1::/48
 ```
 
-`daily_brief` は、アカウントの保護の変更（2 段階認証の登録・解除、パスワードや再設定用の
-メール・電話の変更）の送信元がどの範囲にも入らないとき `external` を付ける。未設定のときは
-`external` が `false` ではなく `null` になり、「全部内部」とは読ませない。その場合は、同じユーザーが
-その前に不審なログインをしていたときだけ印が付く。`health_check` は表の状態を `sites` に出す。
+各変更に、どの拠点から来たか、または `external: true` が付く。未設定のときは `external` が
+`false` ではなく `null` になり、「全部内部」とは読ませない。`external` だけでは印にしない
+（持ち主の多くは自宅から設定を変える）。
+
+`GWSADM_IP2ASN` は iptoasn.com の「combined」表（そのままか `.gz`、PDDL）を指し、
+`GWSADM_HOME_COUNTRIES` は変更が来るはずの国を ISO 3166-1 alpha-2 で並べる（例 `JP`）。
+サーバはファイルを読むだけで、更新は利用者側で行う（週 1 回で足りる）。範囲表の外から来た
+変更に `country`・`asn`・`as_name` が付き、次の `flag_reasons` で `flagged` になる:
+
+- `foreign` — 登録国が `GWSADM_HOME_COUNTRIES` の外
+- `unknown_origin` — アドレスが無いか、表で国が引けない（引けない出どころを国内扱いにしない）
+- `after_suspicious_login` — 同じユーザーが変更の前に不審なログインをしていた（2 つのファイルが
+  無くても働く）。そのログインの取得が途中までか失敗したときは `suspicious_login_coverage` にそう出て、
+  その節は `capped` になる
+
+`health_check` は両方を `sites`・`geo` に出す（30 日より古い表は `warning`）。
 ## 何かに組み込む前に確認する
 
 ```bash

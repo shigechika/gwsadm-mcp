@@ -82,7 +82,8 @@ def _parse(path: str) -> SiteTable:
         with open(path, encoding="utf-8") as f:
             parser.read_file(f)
     except (OSError, UnicodeDecodeError, configparser.Error) as e:
-        return SiteTable(path=path, error=f"cannot read {ENV_VAR}: {type(e).__name__}: {e}")
+        # Type name only: OSError and configparser messages embed the file path.
+        return SiteTable(path=path, error=f"cannot read {ENV_VAR}: {type(e).__name__}")
 
     networks: list[tuple[_Network, Site]] = []
     bad: list[str] = []
@@ -121,7 +122,7 @@ def load(env: dict | None = None) -> SiteTable:
     try:
         st = os.stat(path)
     except OSError as err:
-        return SiteTable(path=path, error=f"cannot read {ENV_VAR}: {type(err).__name__}: {err}")
+        return SiteTable(path=path, error=f"cannot read {ENV_VAR}: {type(err).__name__}")
 
     # ctime catches a chmod/chown repair; size and inode catch a rewrite within one mtime tick.
     key = (path, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)

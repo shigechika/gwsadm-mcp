@@ -53,7 +53,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 
-from gwsadm_mcp import __version__, sites
+from gwsadm_mcp import __version__, geo, sites
 from gwsadm_mcp.client import DomainClient, GwsApiDisabledError, GwsAuthError, GwsError, event_parameters
 from gwsadm_mcp.config import ConfigError, config_path, is_external, load_config
 
@@ -382,12 +382,19 @@ def health_check() -> dict:
     version, config, and domains (per-domain auth result plus ``gmail``:
     ok / api_disabled / no_grant / error, with ``gmail_detail`` on an
     unexpected error -- whether the per-user Gmail tools can work there; it
-    does not affect ``status``), and ``sites`` (the optional ``GWSADM_SITES_INI``
-    table: configured / ranges / error; informational, it does not affect
-    ``status``). Lightweight: one 1-item login query and one
+    does not affect ``status``), ``sites`` (the optional ``GWSADM_SITES_INI``
+    table: configured / ranges / error) and ``geo`` (the optional
+    ``GWSADM_IP2ASN`` dataset: configured / home_countries / age_days / error /
+    warning); both are informational and do not affect ``status``. Lightweight: one 1-item login query and one
     ``users.getProfile`` per domain.
     """
-    base = {"service": "gwsadm-mcp", "version": __version__, "config": config_path(), "sites": sites.load().status()}
+    base = {
+        "service": "gwsadm-mcp",
+        "version": __version__,
+        "config": config_path(),
+        "sites": sites.load().status(),
+        "geo": geo.load().status(),
+    }
     try:
         clients, _ = _clients()
     except ConfigError as e:
@@ -932,7 +939,9 @@ POSTURE_EVENTS = frozenset(
     {
         "2sv_enroll",
         "2sv_disable",
-        "2sv_change_phone",
+        "passkey_enrolled",
+        "passkey_removed",
+        "titanium_unenroll",
         "password_edit",
         "recovery_email_edit",
         "recovery_phone_edit",
@@ -1606,7 +1615,7 @@ def _highlights(username: str, activity: dict, grants: dict, ips: list[dict], gm
         out.append({"kind": "activity_unreadable", "detail": f"activity: {activity['error']}"})
     for f in activity.get("flags", []):
         ev = f.get("event")
-        if ev in ("2sv_enroll", "2sv_disable", "2sv_change_phone"):
+        if ev in ("2sv_enroll", "2sv_disable", "passkey_enrolled", "passkey_removed", "titanium_unenroll"):
             out.append({"kind": "second_factor", "detail": f"{ev} at {f['time']} from {f.get('ip')}"})
         elif ev in ("recovery_email_edit", "recovery_phone_edit", "recovery_secret_qa_edit", "password_edit"):
             out.append({"kind": "credential_change", "detail": f"{ev} at {f['time']} from {f.get('ip')}"})
@@ -2978,20 +2987,29 @@ def shared_drive_membership_changes(
     return {"window_days": days, "domains": out}
 
 
-# user_accounts audit log: what an account's owner (or whoever holds the session)
-# changed about how the account is protected and recovered. A compromise that
+# What an account's owner (or whoever holds the session) changed about how the
+# account is protected, recovered, or where its mail goes. A compromise that
 # wants to outlive a password reset leaves exactly these behind (observed live,
 # 2026-10-16: ``2sv_enroll`` from the attacker's address fifteen minutes after
-# the first login). Read from ``user_accounts`` only: ``2sv_enroll`` is also
-# emitted under ``login``, and reading both would count it twice.
-ACCOUNT_CHANGE_EVENTS = (
-    "2sv_enroll",
-    "2sv_disable",
-    "2sv_change_phone",
-    "password_edit",
-    "recovery_email_edit",
-    "recovery_phone_edit",
-    "recovery_secret_qa_edit",
+# the first login). Each name is probed with ``eventName=`` under the one
+# application that emits it, checked against the live Reports API (2026-10-18,
+# two tenants): ``2sv_enroll`` and the other ``user_accounts`` events are also
+# echoed under ``login`` with identical counts, so they are read from
+# ``user_accounts`` only to avoid counting them twice; ``passkey_enrolled`` /
+# ``passkey_removed`` exist under ``login`` only (a passkey the attacker adds
+# survives a password reset like a second factor does). There is no
+# ``2sv_change_phone`` event: both applications answer HTTP 400 for it.
+ACCOUNT_CHANGE_PROBES = (
+    ("user_accounts", "2sv_enroll"),
+    ("user_accounts", "2sv_disable"),
+    ("user_accounts", "titanium_unenroll"),
+    ("user_accounts", "password_edit"),
+    ("user_accounts", "recovery_email_edit"),
+    ("user_accounts", "recovery_phone_edit"),
+    ("user_accounts", "recovery_secret_qa_edit"),
+    ("user_accounts", "email_forwarding_out_of_domain"),
+    ("login", "passkey_enrolled"),
+    ("login", "passkey_removed"),
 )
 ACCOUNT_CHANGES_LISTED = 50
 
@@ -2999,31 +3017,52 @@ ACCOUNT_CHANGES_LISTED = 50
 def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_pages: int = 2) -> dict:
     """Account-protection changes across each domain, flagged when they look like a takeover.
 
-    A change is ``flagged`` when its source address is outside the sites
-    table (``external: true``; ``null`` when no table is configured, so the
-    absence of a table never reads as "all internal") or when the same user had
-    a suspicious login (from ``logins``, the login audit of the same window)
-    at or before the change. Flagged rows are listed first; at most
-    ``ACCOUNT_CHANGES_LISTED`` rows are listed per domain, ``total`` counts all.
+    Every row carries where it came from: ``site`` / ``external`` from the
+    ``GWSADM_SITES_INI`` table (``external`` is ``null`` without a table, never
+    ``false``) and ``country`` / ``asn`` / ``as_name`` from the
+    ``GWSADM_IP2ASN`` dataset. ``external`` alone is not a flag: most owners
+    change these settings from home (measured live, 2026-10-18: 107 of 133
+    changes in a week came from outside the sites table, 102 of those from the
+    home country). A row is ``flagged`` for one or more ``flag_reasons``:
+
+    - ``foreign``: registered country outside ``GWSADM_HOME_COUNTRIES``
+      (5 of those 107 in the same week, the known attacker among them);
+    - ``unknown_origin``: the dataset is configured but the row has no address,
+      or its address is outside the sites table and the dataset cannot place
+      it -- an origin that cannot be placed is not treated as home;
+    - ``after_suspicious_login``: the same user had a suspicious login (from
+      ``logins``, the login audit of the same window) at or before the change.
+
+    Flagged rows are listed first; at most ``ACCOUNT_CHANGES_LISTED`` rows are
+    listed per domain, ``total`` counts all.
+
+    ``suspicious_login_coverage`` says how far the last reason can be trusted:
+    ``complete``, ``partial`` (the suspicious-login scan was capped or lost an
+    event probe, so ``after_suspicious_login: false`` may be wrong) or
+    ``unavailable`` (the login audit failed for the domain;
+    ``after_suspicious_login`` is then ``null``). Anything but ``complete`` is
+    ORed into ``capped``: the flagged count is a lower bound.
     """
     start = _window(hours)
     table = sites.load()
+    geo_table = geo.load()
     fetched = _parallel_fetch(
-        [(c, "user_accounts", name, max_pages) for c in clients for name in ACCOUNT_CHANGE_EVENTS], start
+        [(c, app, name, max_pages) for c in clients for app, name in ACCOUNT_CHANGE_PROBES], start
     )
-    out: dict = {}
+    raw: dict = {}
     for c in clients:
-        suspicious: dict = {}
-        for e in (logins.get(c.domain, {}).get("suspicious_logins") or {}).get("entries", []):
-            u = (e.get("user") or "").lower()
-            if u and e.get("time") and (u not in suspicious or e["time"] < suspicious[u]):
-                suspicious[u] = e["time"]
+        la = logins.get(c.domain, {})
+        if "error" in la:
+            coverage = "unavailable"
+        else:
+            sl = la.get("suspicious_logins") or {}
+            coverage = "partial" if (sl.get("capped") or sl.get("event_errors")) else "complete"
         try:
             rows: list[dict] = []
-            capped = False
+            capped = coverage != "complete"
             errors: dict = {}
-            for name in ACCOUNT_CHANGE_EVENTS:
-                r = fetched[(c.domain, "user_accounts", name)]
+            for app, name in ACCOUNT_CHANGE_PROBES:
+                r = fetched[(c.domain, app, name)]
                 if isinstance(r, GwsAuthError):
                     raise r
                 if isinstance(r, GwsError):
@@ -3036,27 +3075,68 @@ def _account_changes(clients: list[DomainClient], hours: int, logins: dict, max_
                         if ev.get("name") != name:
                             continue
                         row = _entry(it, ev)
+                        if name == "email_forwarding_out_of_domain":
+                            row["destination"] = _scalar(
+                                event_parameters(ev).get("email_forwarding_destination_address")
+                            )
                         site = table.classify(row.get("ip"))
                         row["site"] = site.code if site else None
                         row["external"] = (site is None) if table.networks else None
-                        first = suspicious.get((row.get("user") or "").lower())
-                        row["after_suspicious_login"] = bool(first and row.get("time") and first <= row["time"])
-                        row["flagged"] = bool(row["external"]) or row["after_suspicious_login"]
                         rows.append(row)
-            rows.sort(key=lambda x: (not x["flagged"], x.get("time") or ""))
-            dom = {
-                "total": len(rows),
-                "flagged": sum(1 for x in rows if x["flagged"]),
-                "by_event": dict(collections.Counter(x["event"] for x in rows)),
-                "entries": rows[:ACCOUNT_CHANGES_LISTED],
-                "capped": capped,
-                "sites": table.status(),
-            }
-            if errors:
-                dom["event_errors"] = errors
-            out[c.domain] = dom
+            raw[c.domain] = (rows, capped, errors, coverage, la)
         except (GwsAuthError, GwsError) as e:
-            out[c.domain] = {"error": str(e)}
+            raw[c.domain] = e
+    # One pass over the dataset for every domain's addresses outside the sites table.
+    places = geo_table.lookup(
+        r["ip"] for v in raw.values() if not isinstance(v, Exception) for r in v[0] if r.get("ip") and r["site"] is None
+    )
+    out: dict = {}
+    for c in clients:
+        v = raw[c.domain]
+        if isinstance(v, Exception):
+            out[c.domain] = {"error": str(v)}
+            continue
+        rows, capped, errors, coverage, la = v
+        suspicious: dict = {}
+        for e in (la.get("suspicious_logins") or {}).get("entries", []):
+            u = (e.get("user") or "").lower()
+            if u and e.get("time") and (u not in suspicious or e["time"] < suspicious[u]):
+                suspicious[u] = e["time"]
+        for row in rows:
+            reasons: list[str] = []
+            place = places.get(row.get("ip") or "") if row["site"] is None else None
+            row["country"] = place["cc"] if place else None
+            row["asn"] = place["asn"] if place else None
+            row["as_name"] = place["name"] if place else None
+            if geo_table.usable and row["site"] is None:
+                if not row["country"]:
+                    reasons.append("unknown_origin")
+                elif geo_table.home and row["country"] not in geo_table.home:
+                    reasons.append("foreign")
+            if coverage == "unavailable":
+                row["after_suspicious_login"] = None
+            else:
+                first = suspicious.get((row.get("user") or "").lower())
+                row["after_suspicious_login"] = bool(first and row.get("time") and first <= row["time"])
+                if row["after_suspicious_login"]:
+                    reasons.append("after_suspicious_login")
+            row["flag_reasons"] = reasons
+            row["flagged"] = bool(reasons)
+        rows.sort(key=lambda x: (not x["flagged"], x.get("time") or ""))
+        dom = {
+            "total": len(rows),
+            "flagged": sum(1 for x in rows if x["flagged"]),
+            "by_reason": dict(collections.Counter(r for x in rows for r in x["flag_reasons"])),
+            "by_event": dict(collections.Counter(x["event"] for x in rows)),
+            "entries": rows[:ACCOUNT_CHANGES_LISTED],
+            "capped": capped,
+            "suspicious_login_coverage": coverage,
+            "sites": table.status(),
+            "geo": geo_table.status(),
+        }
+        if errors:
+            dom["event_errors"] = errors
+        out[c.domain] = dom
     return out
 
 
@@ -3109,10 +3189,14 @@ def daily_brief(hours: int = 24, max_pages: int = 5, samples: int = 10) -> dict:
 
     Aggregates login_audit (account locks, suspicious logins),
     account-protection changes (``account_changes``: 2-Step Verification
-    enrolled/disabled, password and recovery address/phone edits, from the
-    ``user_accounts`` log; a row is ``flagged`` when its address is outside
-    the ``GWSADM_SITES_INI`` table or the same user had a suspicious login
-    before it -- flagged rows first, at most 50 listed, ``total`` counts all) and
+    enrolled/disabled, passkeys added/removed, Advanced Protection turned off,
+    password and recovery address/phone edits, mail forwarding out of the
+    domain; each row says whether it came from outside the ``GWSADM_SITES_INI``
+    table and from which country (``GWSADM_IP2ASN``), and is ``flagged`` with
+    ``flag_reasons`` -- ``foreign`` (outside ``GWSADM_HOME_COUNTRIES``),
+    ``unknown_origin``, ``after_suspicious_login`` -- flagged rows first, at
+    most 50 listed, ``total`` counts all; ``suspicious_login_coverage`` says
+    whether the last reason is complete) and
     drive_external_sharing (external grants, new link exposure, and
     ``untargeted_external_transitions`` — see that tool's docstring).
     ``max_pages`` / ``samples`` are passed through to the drive scan;

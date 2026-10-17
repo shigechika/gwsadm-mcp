@@ -30,7 +30,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `dmarc_rua_summary` | Gmail API — DMARC 集約（RUA）レポートのドメイン別 PASS/FAIL 集計と、reject 候補となる送信元IPの上位一覧。ドメインの設定値 `dmarc_rua_mailbox`（実ユーザー。既定 `postmaster@<domain>`）になりすまし、`dmarc_rua_recipient`（公開している `rua=` 宛先、例 `postmaster+rua@`。既定は mailbox と同じ）宛のメールを検索してレポートの添付を読む。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープを使うが、こちらは（メタデータだけでなく）添付内容＝レポートXMLを実際に読む点が異なる — 下記「認証方式」参照 |
 | `group_delivery_policy` | Groups Settings API — Google グループ自体の投稿/配送ポリシー（`who_can_post`、`allow_external_members`、モデレーションレベル）。グループのアクセス制御は Gmail 配送の**手前**にある： 学内限定の投稿ポリシーは外部送信者のメールを、Gmail の配送イベントが1件も生成されないまま静かに落とす — ポリシーを直接読まない限り配送失敗と見分けがつかない。別付与の `apps.groups.settings` DWD スコープが必要（下記「認証方式」参照） |
 | `list_group_members` | Directory API — Google グループの基本情報とメンバー一覧を直接取得する。特定のメッセージがたまたま誰に届いたかから推測するのではない。別付与の `admin.directory.group.readonly` と `admin.directory.group.member.readonly` DWD スコープが必要（下記「認証方式」参照） |
-| `daily_brief` | 設定済み全ドメインを横断した一括サマリ。アカウントの保護の変更（2 段階認証・パスワード・再設定用のメールと電話）を含み、自組織の範囲（`GWSADM_SITES_INI`）の外から来たものと不審なログインの後のものに印を付ける |
+| `daily_brief` | 設定済み全ドメインを横断した一括サマリ。アカウントの保護の変更（2 段階認証・パスキー・高度な保護機能・パスワード・再設定用のメールと電話・ドメイン外への転送）を含み、国外（`GWSADM_IP2ASN`・`GWSADM_HOME_COUNTRIES`）から来たもの、出どころが引けないもの、不審なログインの後のものに印を付ける |
 | `daily_brief_start` / `daily_brief_result` | `daily_brief` をバックグラウンド実行： `start` が即座に `job_id` を返し、`result(job_id)` を `done` になるまでポーリングする。同期呼び出しがクライアントの ~60秒 tool-call タイムアウトに掛かる大規模テナント向け |
 
 計画中： `dlp_events`（Reports `rules`、DLP 対応の Workspace エディションが必要）、
