@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.18.0...v0.19.0) (2026-10-17)
+
+
+### Features
+
+* user_activity and ip_activity (one account's / one source address's Reports API timeline) ([#94](https://github.com/shigechika/gwsadm-mcp/issues/94)) ([41d2873](https://github.com/shigechika/gwsadm-mcp/commit/41d28736c5e974809faeb516db72a7674b3f05d1))
+
 ## [0.18.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.17.0...v0.18.0) (2026-09-29)
 
 
