@@ -1630,3 +1630,158 @@ def test_fetch_dmarc_reports_unknown_xml_encoding_is_a_non_report():
     )
     got = c.fetch_dmarc_reports(start=start, end=end)
     assert got["reports"] == [] and got["non_report_attachments"] == 1 and got["message_errors"] == 0
+
+
+# --- Gmail settings / sent summary / health probe (compromise_sweep) --------
+
+
+class _FakeSettingsResource:
+    """settings() of a fake Gmail users resource: each read answers (resp, exc) from a dict keyed by section."""
+
+    def __init__(self, answers):
+        self._a = answers  # section -> (resp, exc)
+        self.calls = []
+
+    def _req(self, name):
+        self.calls.append(name)
+        resp, exc = self._a.get(name, ({}, None))
+        return _Req(resp, exc)
+
+    def getAutoForwarding(self, **kw):
+        return self._req("auto_forwarding")
+
+    def forwardingAddresses(self):
+        return _ListOnly(lambda **kw: self._req("forwarding_addresses"))
+
+    def filters(self):
+        return _ListOnly(lambda **kw: self._req("filters"))
+
+    def delegates(self):
+        return _ListOnly(lambda **kw: self._req("delegates"))
+
+    def sendAs(self):
+        return _ListOnly(lambda **kw: self._req("send_as"))
+
+
+class _ListOnly:
+    def __init__(self, fn):
+        self.list = fn
+
+
+class _FakeGmailUsers:
+    def __init__(self, settings=None, messages=None, profile=None):
+        self._s, self._m, self._p = settings, messages, profile  # profile: (resp, exc)
+
+    def settings(self):
+        return self._s
+
+    def messages(self):
+        return self._m
+
+    def getProfile(self, **kw):
+        resp, exc = self._p or ({}, None)
+        return _Req(resp, exc)
+
+
+class _FakeGmail:
+    def __init__(self, users):
+        self._u = users
+
+    def users(self):
+        return self._u
+
+
+def _api_disabled_403(body=None):
+    blob = (
+        body
+        if body is not None
+        else (
+            b'{"error": {"code": 403, "message": "Gmail API has not been used in project 1 before or it is disabled.",'
+            b' "errors": [{"reason": "accessNotConfigured", "domain": "usageLimits"}], "status": "PERMISSION_DENIED"}}'
+        )
+    )
+    return HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), blob)
+
+
+def test_gmail_security_settings_reads_all_five_sections_and_records_a_failed_one():
+    settings = _FakeSettingsResource(
+        {
+            "auto_forwarding": ({"enabled": True, "emailAddress": "x@attacker.example"}, None),
+            "forwarding_addresses": ({"forwardingAddresses": [{"forwardingEmail": "x@attacker.example"}]}, None),
+            "filters": ({"filter": [{"id": "f1", "action": {"forward": "x@attacker.example"}}]}, None),
+            # A permission 403 (no rate/quota reason) is permanent: no backoff-retry, one call.
+            "delegates": (None, HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")),
+            "send_as": ({"sendAs": [{"sendAsEmail": "u@example.edu", "isPrimary": True}]}, None),
+        }
+    )
+    c = DomainClient(CFG, gmail_service_factory=lambda user_email: _FakeGmail(_FakeGmailUsers(settings=settings)))
+    out = c.gmail_security_settings("u@example.edu")
+    assert out["auto_forwarding"]["enabled"] is True
+    assert out["forwarding_addresses"][0]["forwardingEmail"] == "x@attacker.example"
+    assert out["filters"][0]["id"] == "f1" and out["send_as"][0]["isPrimary"] is True
+    assert out["delegates"] == [] and "HTTP 403" in out["section_errors"]["delegates"]
+    assert settings.calls == ["auto_forwarding", "forwarding_addresses", "filters", "delegates", "send_as"]
+
+
+def test_gmail_security_settings_api_disabled_is_its_own_error():
+    settings = _FakeSettingsResource({"auto_forwarding": (None, _api_disabled_403())})
+    c = DomainClient(CFG, gmail_service_factory=lambda user_email: _FakeGmail(_FakeGmailUsers(settings=settings)))
+    with pytest.raises(client.GwsApiDisabledError):
+        c.gmail_security_settings("u@example.edu")
+    assert settings.calls == ["auto_forwarding"]  # not worth trying the other four
+
+
+def test_is_api_disabled_guards_every_body_shape():
+    assert client._is_api_disabled(_api_disabled_403()) is True
+    for blob in (
+        b'{"error": "access_denied"}',
+        b'{"error": {"errors": "nope"}}',
+        b'{"error": {"errors": ["x"]}}',
+        b"not json",
+    ):
+        assert client._is_api_disabled(_api_disabled_403(blob)) is False
+    other = HttpError(
+        httplib2.Response({"status": "403", "reason": "forbidden"}), b'{"error": {"errors": [{"reason": "forbidden"}]}}'
+    )
+    assert client._is_api_disabled(other) is False
+
+
+def test_gmail_sent_summary_lists_with_spam_trash_and_fetches_metadata_concurrently():
+    messages = FakeGmailMessagesResource(
+        list_resp={"messages": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}], "nextPageToken": "more"},
+        get_resp={
+            "internalDate": "1",
+            "payload": {"headers": [{"name": "To", "value": "a@x.example"}, {"name": "Subject", "value": "secret"}]},
+        },
+    )
+    c = DomainClient(CFG, gmail_service_factory=lambda user_email: _FakeGmail(_FakeGmailUsers(messages=messages)))
+    import datetime as dt
+
+    out = c.gmail_sent_summary(
+        "u@example.edu", start=dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc), max_pages=1, max_messages=2
+    )
+    assert out["count"] == 3 and out["capped"] is True and len(out["sampled"]) == 2
+    assert (
+        messages.list_calls[0]["q"].startswith("in:sent after:") and messages.list_calls[0]["includeSpamTrash"] is True
+    )
+    assert all(call["format"] == "metadata" and "Subject" not in call["metadataHeaders"] for call in messages.get_calls)
+    assert out["sampled"][0] == {
+        "internal_date": "1",
+        "to": "a@x.example",
+        "cc": "",
+        "bcc": "",
+    }  # Subject never surfaces
+
+
+def test_check_gmail_reports_each_outcome_without_the_subject():
+    from google.auth.exceptions import GoogleAuthError
+
+    def make(profile):
+        return DomainClient(CFG, gmail_service_factory=lambda user_email: _FakeGmail(_FakeGmailUsers(profile=profile)))
+
+    assert make(({"emailAddress": "x"}, None)).check_gmail() == {"gmail": "ok"}
+    assert make((None, _api_disabled_403())).check_gmail() == {"gmail": "api_disabled"}
+    out = make((None, GoogleAuthError("unauthorized_client for audit-admin@example.edu"))).check_gmail()
+    assert out == {"gmail": "no_grant"}  # no detail: the text names the impersonated subject
+    out = make((None, RuntimeError("boom with /tmp/sa.json"))).check_gmail()
+    assert out == {"gmail": "error", "gmail_detail": "RuntimeError"}

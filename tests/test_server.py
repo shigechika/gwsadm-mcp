@@ -25,6 +25,9 @@ class FakeDomainClient:
         dmarc_rua=None,
         usage_by_date=None,
         dmarc_mailbox_configured=True,
+        gmail_settings=None,
+        gmail_sent=None,
+        gmail_check="ok",
     ):
         self.domain = domain
         # The server consults cfg.dmarc_rua_mailbox to skip domains that opted
@@ -63,6 +66,14 @@ class FakeDomainClient:
         # uncapped day; a bare Exception at a specific date key applies only
         # to that call, letting a test cover "one date fails, others don't")
         self._usage_by_date = usage_by_date
+        # gmail_settings: dict (raw settings resources) | Exception | None (empty settings)
+        # gmail_sent: dict {count, capped, sampled} | Exception | None (nothing sent)
+        # gmail_check: the value check_gmail() reports under "gmail"
+        self._gmail_settings = gmail_settings
+        self._gmail_sent = gmail_sent
+        self._gmail_check = gmail_check
+        self.gmail_settings_calls = []
+        self.gmail_sent_calls = []
         self.calls = []
         self.scoped_calls = []
         self.user_calls = []
@@ -186,6 +197,29 @@ class FakeDomainClient:
 
     def check(self):
         return {"domain": self.domain, "auth": self._auth}
+
+    def check_gmail(self):
+        return {"gmail": self._gmail_check}
+
+    def gmail_security_settings(self, user_email):
+        self.gmail_settings_calls.append(user_email)
+        if isinstance(self._gmail_settings, Exception):
+            raise self._gmail_settings
+        base = {
+            "auto_forwarding": None,
+            "forwarding_addresses": [],
+            "filters": [],
+            "delegates": [],
+            "send_as": [],
+            "section_errors": {},
+        }
+        return {**base, **(self._gmail_settings or {})}
+
+    def gmail_sent_summary(self, user_email, *, start, max_pages=2, max_messages=50):
+        self.gmail_sent_calls.append((user_email, max_pages, max_messages))
+        if isinstance(self._gmail_sent, Exception):
+            raise self._gmail_sent
+        return self._gmail_sent or {"count": 0, "capped": False, "sampled": []}
 
 
 def _item(email, event_name, params=None, time="2026-07-01T00:00:00.000Z", ip=None, profile_id=None):
@@ -2149,7 +2183,7 @@ def test_health_check_healthy(inject):
     out = server.health_check()
     assert out["status"] == "healthy"
     assert out["service"] == "gwsadm-mcp"
-    assert out["domains"] == [{"domain": "example.edu", "auth": "ok"}]
+    assert out["domains"] == [{"domain": "example.edu", "auth": "ok", "gmail": "ok"}]
 
 
 def test_health_check_degraded_when_one_domain_fails(inject):
@@ -2158,6 +2192,15 @@ def test_health_check_degraded_when_one_domain_fails(inject):
         {"a.example.edu", "b.example.edu"},
     )
     assert server.health_check()["status"] == "degraded"
+
+
+def test_health_check_reports_gmail_state_without_degrading(inject):
+    # The gmail scope is granted separately and every other tool works without
+    # it, so a domain whose Gmail API is off is reported, not counted as broken.
+    inject([FakeDomainClient("example.edu", {}, gmail_check="api_disabled")], {"example.edu"})
+    out = server.health_check()
+    assert out["status"] == "healthy"
+    assert out["domains"][0]["gmail"] == "api_disabled"
 
 
 def test_health_check_config_error(monkeypatch):
@@ -3108,3 +3151,300 @@ def test_ip_activity_rejects_a_zone_scoped_ipv6_literal(inject):
     inject([c], {"example.edu"})
     out = server.ip_activity("fe80::1%eth0", applications="login")
     assert "not an IP address" in out["error"] and c.scoped_calls == []
+
+
+# --- compromise_sweep -------------------------------------------------------
+
+
+def _sweep_fixture():
+    """A compromise as the sources deliver it: a flagged 2SV enrolment from one
+    address, a mail-reading OAuth grant, forwarding + a forwarding filter + a
+    delegate in Gmail, two sent messages, and the same address acting as a
+    second account in the other domain."""
+    u = "victim@example.edu"
+    activity = {
+        ("login", None): (
+            [
+                _item(u, "login_success", {"login_type": "saml"}, time="2026-07-01T01:00:00.000Z", ip="192.0.2.10"),
+                _item(u, "2sv_enroll", time="2026-07-01T01:20:00.000Z", ip="192.0.2.30"),
+            ],
+            False,
+        ),
+    }
+    tokens = [
+        {
+            "clientId": "mail.apps",
+            "displayText": "Mail Reader",
+            "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        },
+        {
+            "clientId": "signin.apps",
+            "displayText": "Some Site",
+            "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.email"],
+        },
+    ]
+    settings = {
+        "auto_forwarding": {"enabled": True, "emailAddress": "x@attacker.example", "disposition": "archive"},
+        "forwarding_addresses": [{"forwardingEmail": "x@attacker.example", "verificationStatus": "accepted"}],
+        "filters": [
+            {
+                "id": "f1",
+                "criteria": {"from": "bank"},
+                "action": {"forward": "x@attacker.example", "removeLabelIds": ["INBOX"]},
+            },
+            {"id": "f2", "criteria": {"subject": "newsletter"}, "action": {"addLabelIds": ["Label_1"]}},
+        ],
+        "delegates": [{"delegateEmail": "d@example.edu", "verificationStatus": "accepted"}],
+        "send_as": [
+            {"sendAsEmail": u, "isPrimary": True, "isDefault": True, "replyToAddress": "x@attacker.example"},
+            {
+                "sendAsEmail": "alias@example.edu",
+                "isPrimary": False,
+                "treatAsAlias": True,
+                "verificationStatus": "accepted",
+            },
+        ],
+    }
+    sent = {
+        "count": 7,
+        "capped": True,
+        "sampled": [
+            {"internal_date": "1", "to": "a@example.edu, b@partner.example", "cc": "", "bcc": ""},
+            {"internal_date": "2", "to": "Someone <c@partner.example>", "cc": "a@example.edu", "bcc": ""},
+        ],
+    }
+    user = {
+        "primaryEmail": u,
+        "suspended": True,
+        "suspensionReason": None,
+        "isEnrolledIn2Sv": True,
+        "lastLoginTime": "2026-07-01T01:20:00.000Z",
+    }
+    student_login = {
+        ("login", None): (
+            [
+                _item("s@students.example.edu", "login_success", time="2026-07-01T01:25:00.000Z", ip="192.0.2.30"),
+                _item(u, "login_success", time="2026-07-01T01:26:00.000Z", ip="192.0.2.30"),
+            ],
+            False,
+        )
+    }
+    staff = FakeDomainClient(
+        "example.edu", activity, user=user, tokens=tokens, gmail_settings=settings, gmail_sent=sent
+    )
+    students = FakeDomainClient("students.example.edu", student_login)
+    return staff, students
+
+
+def test_compromise_sweep_answers_all_four_questions(inject):
+    staff, students = _sweep_fixture()
+    inject([staff, students], {"example.edu", "students.example.edu"})
+    out = server.compromise_sweep("victim@example.edu", hours=24, max_pages=3, max_sent=10)
+    assert "error" not in out and out["domain"] == "example.edu"
+    # activity: the shared impl, with the flag on top
+    assert [f["event"] for f in out["activity"]["flags"]] == ["2sv_enroll"]
+    # state / grants
+    assert (
+        out["state"]["found"] is True
+        and out["state"]["suspended"] is True
+        and out["state"]["is_enrolled_in_2sv"] is True
+    )
+    assert [t["client_id"] for t in out["grants"]["risky"]] == ["mail.apps"]
+    assert out["grants"]["count"] == 2
+    # ips: the flagged address only, swept across both domains with the small budget, self excluded
+    assert [e["ip"] for e in out["ips"]] == ["192.0.2.30"]
+    others = out["ips"][0]["other_accounts"]
+    assert [(o["domain"], o["user"]) for o in others] == [("students.example.edu", "s@students.example.edu")]
+    for c in (staff, students):
+        swept = [call for call in c.scoped_calls if call[3] == "192.0.2.30"]
+        assert {a for (a, *_r) in swept} == set(server.SWEEP_IP_APPLICATIONS)
+        assert all(mp == server.SWEEP_IP_MAX_PAGES for (*_r, mp) in swept)
+    # gmail
+    g = out["gmail"]
+    assert g["kind"] == "ok"
+    assert g["auto_forwarding"] == {"enabled": True, "email": "x@attacker.example", "disposition": "archive"}
+    assert [f["id"] for f in g["filters"]] == ["f1"] and g["filters_total"] == 2  # the label-only filter is not listed
+    assert g["filters"][0]["forward"] == "x@attacker.example" and g["filters"][0]["archives"] is True
+    assert [d["email"] for d in g["delegates"]] == ["d@example.edu"]
+    # the primary only because of its reply-to, plus the alias
+    assert [a["send_as_email"] for a in g["send_as"]] == ["victim@example.edu", "alias@example.edu"]
+    assert g["sent"] == {
+        "count": 7,
+        "capped": True,
+        "sampled": 2,
+        "recipients_total": 4,
+        "external_recipients": 2,
+        "unknown_recipients": 0,
+        "recipient_domains": {"example.edu": 2, "partner.example": 2},
+    }
+    assert staff.gmail_sent_calls == [("victim@example.edu", 2, 10)]
+    # highlights carry each fact once, in order
+    kinds = [h["kind"] for h in out["highlights"]]
+    assert kinds == [
+        "second_factor",
+        "oauth_grant",
+        "forwarding",  # auto-forwarding
+        "forwarding",  # forwarding address
+        "filter",
+        "delegate",
+        "send_as",
+        "send_as",
+        "sent_mail",
+        "other_accounts_from_ip",
+    ]
+    assert any("Email Log Search" in item for item in out["checklist"])
+
+
+def test_compromise_sweep_reports_gmail_api_disabled_as_a_kind_not_a_failure(inject):
+    from gwsadm_mcp.client import GwsApiDisabledError
+
+    staff, _ = _sweep_fixture()
+    staff._gmail_settings = GwsApiDisabledError(
+        "[example.edu] gmail API is not enabled in the service account's project"
+    )
+    inject([staff], {"example.edu"})
+    out = server.compromise_sweep("victim@example.edu")
+    assert "error" not in out
+    assert out["gmail"]["kind"] == "api_disabled" and "not enabled" in out["gmail"]["error"]
+    assert out["activity"]["flags"] and out["grants"]["risky"]  # the other sections still answered
+    assert any(h["kind"] == "gmail_unreadable" for h in out["highlights"])
+    assert any("api_disabled" in item for item in out["checklist"])
+
+
+def test_compromise_sweep_reports_missing_gmail_grant_and_other_errors(inject):
+    from gwsadm_mcp.client import GwsAuthError, GwsError
+
+    staff, _ = _sweep_fixture()
+    staff._gmail_settings = GwsAuthError("[example.edu] auth failed for victim@example.edu: no gmail scope")
+    inject([staff], {"example.edu"})
+    assert server.compromise_sweep("victim@example.edu")["gmail"]["kind"] == "no_grant"
+    # A sent-mail failure keeps the settings already read and marks the section partial.
+    staff._gmail_settings = _sweep_fixture()[0]._gmail_settings
+    staff._gmail_sent = GwsError("[example.edu] gmail API error (messages.list, victim@example.edu): HTTP 500")
+    out = server.compromise_sweep("victim@example.edu")
+    assert out["gmail"]["kind"] == "partial"
+    assert out["gmail"]["auto_forwarding"]["enabled"] is True and "HTTP 500" in out["gmail"]["sent"]["error"]
+    assert any(h["kind"] == "forwarding" for h in out["highlights"])
+    assert any(h["kind"] == "gmail_unreadable" and "sent mail" in h["detail"] for h in out["highlights"])
+    assert any("Email Log Search" in item and "could not be listed" in item for item in out["checklist"])
+
+
+def test_compromise_sweep_marks_a_failed_settings_section_partial(inject):
+    staff, _ = _sweep_fixture()
+    staff._gmail_settings = {
+        "section_errors": {"delegates": "[example.edu] gmail API error (settings.delegates): HTTP 500"}
+    }
+    inject([staff], {"example.edu"})
+    out = server.compromise_sweep("victim@example.edu")
+    assert out["gmail"]["kind"] == "partial"
+    assert out["gmail"]["delegates"] == []  # not "no delegates" -- the checklist says so
+    assert any(h["kind"] == "gmail_unreadable" and "settings.delegates" in h["detail"] for h in out["highlights"])
+    assert any("delegates" in item and "by hand" in item for item in out["checklist"])
+
+
+def test_compromise_sweep_counts_unparseable_recipients_as_unknown_and_external(inject):
+    staff, _ = _sweep_fixture()
+    staff._gmail_sent = {
+        "count": 1,
+        "capped": False,
+        "sampled": [{"internal_date": "1", "to": "a@example.edu", "cc": "not an address", "bcc": ""}],
+    }
+    inject([staff], {"example.edu"})
+    sent = server.compromise_sweep("victim@example.edu")["gmail"]["sent"]
+    assert sent["recipients_total"] == 2 and sent["unknown_recipients"] == 1
+    assert sent["external_recipients"] == 1  # the unknown one, fail-safe; a@example.edu is internal
+    assert sent["recipient_domains"] == {"example.edu": 1}
+
+
+def test_compromise_sweep_uses_given_ips_and_validates_them(inject):
+    staff, students = _sweep_fixture()
+    inject([staff, students], {"example.edu", "students.example.edu"})
+    bad = server.compromise_sweep("victim@example.edu", ips="192.0.2.1, nope")
+    assert "not an IP address" in bad["error"] and staff.scoped_calls == []
+    out = server.compromise_sweep("victim@example.edu", ips=" 2001:db8::7 ,192.0.2.1, 2001:db8::7")
+    assert [e["ip"] for e in out["ips"]] == ["2001:db8::7", "192.0.2.1"]  # normalised, deduplicated, not the flag's
+
+
+def test_compromise_sweep_degrades_per_section(inject):
+    from gwsadm_mcp.client import GwsAuthError, GwsError
+
+    staff, _ = _sweep_fixture()
+    staff._user = GwsError("[example.edu] directory API error (users.get): HTTP 500")
+    staff._tokens = GwsError("[example.edu] directory API error (tokens.list): HTTP 403")
+    inject([staff], {"example.edu"})
+    out = server.compromise_sweep("victim@example.edu")
+    assert "error" in out["state"] and "error" in out["grants"]
+    assert out["gmail"]["kind"] == "ok"  # independent of the directory failures
+    # ... and the activity failing stays inside its section: Directory and
+    # Gmail use their own grants and still answer; the IP sweep has no flags
+    # to start from unless addresses are given.
+    staff2, _ = _sweep_fixture()
+    staff2._canned = {("login", None): GwsAuthError("[example.edu] auth failed")}
+    inject([staff2], {"example.edu"})
+    out = server.compromise_sweep("victim@example.edu")
+    assert "error" not in out and "auth failed" in out["activity"]["error"]
+    assert out["state"]["found"] is True and out["gmail"]["kind"] == "ok" and out["ips"] == []
+    assert out["highlights"][0]["kind"] == "activity_unreadable"
+    assert any("pass ips explicitly" in item for item in out["checklist"])
+    assert [e["ip"] for e in server.compromise_sweep("victim@example.edu", ips="192.0.2.1")["ips"]] == ["192.0.2.1"]
+
+
+def test_compromise_sweep_marks_an_ip_entry_capped_when_a_domain_fails(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    staff, _ = _sweep_fixture()
+    students = FakeDomainClient(
+        "students.example.edu", {("login", None): GwsAuthError("[students.example.edu] auth failed")}
+    )
+    inject([staff, students], {"example.edu", "students.example.edu"})
+    entry = server.compromise_sweep("victim@example.edu")["ips"][0]
+    assert entry["capped"] is True and "auth failed" in entry["domain_errors"]["students.example.edu"]
+    assert entry["other_accounts"] == []  # not "nobody else" -- one domain was never scanned
+
+
+def test_compromise_sweep_refuses_more_addresses_than_it_would_sweep(inject):
+    staff, _ = _sweep_fixture()
+    inject([staff], {"example.edu"})
+    too_many = ",".join(f"192.0.2.{i}" for i in range(server.SWEEP_MAX_IPS + 1))
+    out = server.compromise_sweep("victim@example.edu", ips=too_many)
+    assert "at most" in out["error"] and staff.scoped_calls == []
+
+
+def test_compromise_sweep_excludes_the_primary_address_when_looked_up_by_alias(inject):
+    staff, students = _sweep_fixture()
+    # The alias is what was typed; Google's record (and the Reports actor) is the primary.
+    staff._user = {**staff._user, "primaryEmail": "primary@example.edu"}
+    staff._canned[("login", None)] = (
+        [_item("primary@example.edu", "2sv_enroll", time="2026-07-01T01:20:00.000Z", ip="192.0.2.30")],
+        False,
+    )
+    students._canned[("login", None)] = (
+        [_item("primary@example.edu", "login_success", time="2026-07-01T01:26:00.000Z", ip="192.0.2.30")],
+        False,
+    )
+    inject([staff, students], {"example.edu", "students.example.edu"})
+    out = server.compromise_sweep("alias@example.edu")
+    assert out["state"]["email"] == "primary@example.edu"
+    assert out["ips"][0]["other_accounts"] == []  # the account's own primary is not "another account"
+
+
+def test_recipients_keep_valid_addresses_next_to_a_malformed_one_and_ignore_empty_groups():
+    sampled = [
+        {"internal_date": "1", "to": "a@example.edu, b@partner.example, not an address", "cc": "", "bcc": ""},
+        {"internal_date": "2", "to": "undisclosed-recipients:;", "cc": "", "bcc": "c@partner.example"},
+    ]
+    out = server._recipients(sampled, {"example.edu"})
+    assert out["recipients_total"] == 4 and out["unknown_recipients"] == 1
+    assert out["external_recipients"] == 3  # b, c and the unknown one
+    assert out["recipient_domains"] == {"partner.example": 2, "example.edu": 1}
+
+
+def test_compromise_sweep_lists_a_mark_as_spam_filter(inject):
+    staff, _ = _sweep_fixture()
+    staff._gmail_settings = {
+        "filters": [{"id": "f9", "criteria": {"from": "security@example.edu"}, "action": {"addLabelIds": ["SPAM"]}}]
+    }
+    inject([staff], {"example.edu"})
+    out = server.compromise_sweep("victim@example.edu")
+    assert [f["id"] for f in out["gmail"]["filters"]] == ["f9"] and out["gmail"]["filters"][0]["spams"] is True
+    assert any(h["kind"] == "filter" and "spams" in h["detail"] for h in out["highlights"])

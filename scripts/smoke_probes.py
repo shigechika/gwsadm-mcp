@@ -347,6 +347,28 @@ PROBES: dict[str, Probe] = {
         must_not_match=(r'"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+": \{"error":',),
         allow_empty=True,
     ),
+    "compromise_sweep": Probe(
+        args={"hours": WINDOW_HOURS * 7, "max_pages": MAX_PAGES, "max_sent": 5},
+        args_factory=_some_account,
+        require_keys=(
+            "domain",
+            "username",
+            "window",
+            "highlights",
+            "activity",
+            "state",
+            "grants",
+            "ips",
+            "gmail",
+            "checklist",
+        ),
+        # The activity section must have produced accounting; the gmail
+        # section may legitimately be api_disabled / no_grant on a tenant
+        # (reported in its "kind", with an "error" next to it -- the tool
+        # working as documented), so no must_not_match on a nested error.
+        must_match=(r'"count": \d',),
+        allow_empty=True,
+    ),
     "gmail_message_trace": Probe(
         args_factory=_fake_message_and_recipient,
         require_keys=("message_id", "recipients_checked", "found", "not_found", "errors", "results"),

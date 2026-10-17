@@ -31,6 +31,7 @@ import concurrent.futures
 import datetime
 import gzip
 import io
+import json
 import random
 import threading
 import time
@@ -117,6 +118,9 @@ _GMAIL_CACHE_MAX = 500
 # len(matches) >= this constant, which is also true of a mailbox with
 # EXACTLY this many matches and nothing more) and sets match_count_capped.
 _MESSAGE_LIST_MAX_RESULTS = 5
+# compromise_sweep: sent-mail listing page size (Gmail's own maximum is 500).
+_SENT_LIST_PAGE_SIZE = 100
+_SENT_GET_WORKERS = 8
 
 # messages().list page size for a DMARC RUA mailbox search. Gmail's hard cap
 # is 500; kept far below that so one page's worth of per-message fetches
@@ -423,6 +427,40 @@ def _is_retryable(e: HttpError) -> bool:
 
 class GwsError(Exception):
     """Base error for Workspace Admin API failures."""
+
+
+class GwsApiDisabledError(GwsError):
+    """The Gmail API is not enabled in the service account's own GCP project.
+
+    HTTP 403 with reason ``accessNotConfigured`` -- distinct from a missing
+    DWD grant (``GwsAuthError``, fixed in the Admin console) in that this one
+    is fixed in the Cloud console of the project the key belongs to, and the
+    DWD grant can be in place while every per-user Gmail call still fails.
+    """
+
+
+def _is_api_disabled(e: HttpError) -> bool:
+    """True for the 403 that says the API is not enabled in the key's project."""
+    status = int(getattr(getattr(e, "resp", None), "status", 0) or 0)
+    if status != 403:
+        return False
+    blob = getattr(e, "content", b"") or b""
+    if isinstance(blob, bytes):
+        blob = blob.decode("utf-8", "replace")
+    # Every shape is guarded: a 403 body is whatever the API sent (a bare
+    # string under "error", a non-list "errors"), and this runs inside an
+    # exception handler where a second exception would escape as something
+    # no caller maps.
+    try:
+        err = json.loads(blob).get("error")
+    except (ValueError, AttributeError):
+        return False
+    if not isinstance(err, dict):
+        return False
+    details = err.get("errors")
+    if not isinstance(details, list):
+        return False
+    return any(isinstance(d, dict) and d.get("reason") == "accessNotConfigured" for d in details)
 
 
 class GwsAuthError(GwsError):
@@ -1055,6 +1093,169 @@ class DomainClient:
             # the true count.
             "match_count_capped": bool(resp.get("nextPageToken")),
         }
+
+    def _gmail_call(self, user_email: str, label: str, make_request):
+        """One Gmail API request impersonating ``user_email``, errors mapped.
+
+        ``make_request(svc)`` builds the request from the user's Gmail service.
+        An HTTP 403 whose body says ``accessNotConfigured`` becomes
+        ``GwsApiDisabledError`` (the Gmail API is off in the key's own
+        project), any other HttpError ``GwsError``, an auth failure
+        ``GwsAuthError`` -- the same three the per-recipient tools distinguish.
+        """
+        try:
+            svc, creds = self._gmail_service(user_email)
+            http = self._new_http(creds)
+            return self._execute(lambda: make_request(svc), http)
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            if _is_api_disabled(e):
+                raise GwsApiDisabledError(
+                    f"[{self.domain}] gmail API is not enabled in the service account's project ({label}, {user_email})"
+                ) from e
+            raise GwsError(f"[{self.domain}] gmail API error ({label}, {user_email}): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Typical: gmail.readonly DWD scope not granted for this client.
+            # The text is Google's token-endpoint reason ("unauthorized_client:
+            # ..."), not the key file: loading the key is guarded separately
+            # in _gmail_service, which omits its text on purpose. Bounded so
+            # an unexpected variant cannot dump a body into a tool answer.
+            raise GwsAuthError(f"[{self.domain}] auth failed for {user_email}: {str(e)[:200]}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error ({label}, {user_email}): {type(e).__name__}") from e
+
+    def gmail_security_settings(self, user_email: str) -> dict:
+        """One user's Gmail settings that an attacker uses to keep reading mail.
+
+        Impersonates ``user_email`` via domain-wide delegation and reads, in
+        order: auto-forwarding (``settings.getAutoForwarding``), forwarding
+        addresses, filters, delegates and send-as aliases (each ``.list``).
+        All five are served by the ``gmail.readonly`` DWD scope -- verified
+        live, ``delegates.list`` included -- so no grant beyond
+        ``gmail_message_trace``'s is needed. Settings only: no message is
+        listed or read here.
+
+        A ``GwsAuthError`` or ``GwsApiDisabledError`` on any section is raised
+        (the whole mailbox is unreadable for that reason); any other
+        ``GwsError`` is recorded under ``section_errors`` and the remaining
+        sections are still read. Raw resources are returned; the server
+        projects them.
+        """
+        out: dict = {
+            "auto_forwarding": None,
+            "forwarding_addresses": [],
+            "filters": [],
+            "delegates": [],
+            "send_as": [],
+            "section_errors": {},
+        }
+        sections = (
+            ("auto_forwarding", lambda s: s.users().settings().getAutoForwarding(userId="me"), lambda r: r),
+            (
+                "forwarding_addresses",
+                lambda s: s.users().settings().forwardingAddresses().list(userId="me"),
+                lambda r: r.get("forwardingAddresses", []),
+            ),
+            ("filters", lambda s: s.users().settings().filters().list(userId="me"), lambda r: r.get("filter", [])),
+            (
+                "delegates",
+                lambda s: s.users().settings().delegates().list(userId="me"),
+                lambda r: r.get("delegates", []),
+            ),
+            ("send_as", lambda s: s.users().settings().sendAs().list(userId="me"), lambda r: r.get("sendAs", [])),
+        )
+        for name, req, pick in sections:
+            try:
+                out[name] = pick(self._gmail_call(user_email, f"settings.{name}", req) or {})
+            except (GwsAuthError, GwsApiDisabledError):
+                raise
+            except GwsError as e:
+                out["section_errors"][name] = str(e)
+        return out
+
+    def gmail_sent_summary(
+        self, user_email: str, *, start: datetime.datetime, max_pages: int = 2, max_messages: int = 50
+    ) -> dict:
+        """What one user's mailbox SENT since ``start`` -- envelope only.
+
+        ``messages().list`` with ``in:sent after:<epoch>`` (paged up to
+        ``max_pages``, spam and trash included so sent mail the attacker
+        already deleted still counts), then ``messages().get(format="metadata")``
+        for the first ``max_messages`` of them -- concurrently, on a bounded
+        pool -- with only the To / Cc / Bcc / Date headers requested -- never
+        Subject, never the body. Returns ``count``
+        (all ids listed), ``capped`` (more pages existed) and ``sampled``
+        (``{internal_date, to, cc, bcc}`` per fetched message); the server
+        reduces the recipients to counts and domains. Raises as
+        ``_gmail_call`` does.
+        """
+        query = f"in:sent after:{int(start.timestamp())}"
+        ids: list[str] = []
+        token = None
+        pages = 0
+        while True:
+            resp = self._gmail_call(
+                user_email,
+                "messages.list",
+                lambda s, tok=token: (
+                    s.users()
+                    .messages()
+                    .list(userId="me", q=query, maxResults=_SENT_LIST_PAGE_SIZE, pageToken=tok, includeSpamTrash=True)
+                ),
+            )
+            ids.extend(m["id"] for m in resp.get("messages", []) or [])
+            token = resp.get("nextPageToken")
+            pages += 1
+            if not token or pages >= max_pages:
+                break
+
+        def _one(mid: str) -> dict:
+            msg = self._gmail_call(
+                user_email,
+                "messages.get",
+                lambda s, mid=mid: (
+                    s.users()
+                    .messages()
+                    .get(userId="me", id=mid, format="metadata", metadataHeaders=["To", "Cc", "Bcc", "Date"])
+                ),
+            )
+            headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", []) if "name" in h}
+            return {
+                "internal_date": msg.get("internalDate"),
+                "to": headers.get("to", ""),
+                "cc": headers.get("cc", ""),
+                "bcc": headers.get("bcc", ""),
+            }
+
+        wanted = ids[:max_messages]
+        sampled: list[dict] = []
+        if wanted:
+            # One AuthorizedHttp per call (see _new_http), so the gets can run
+            # side by side; the first failure propagates as it would serially.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(_SENT_GET_WORKERS, len(wanted))) as ex:
+                sampled = list(ex.map(_one, wanted))
+        return {"count": len(ids), "capped": bool(token), "sampled": sampled}
+
+    def check_gmail(self) -> dict:
+        """Can per-user Gmail calls work on this domain? ``users.getProfile`` as ``cfg.subject``.
+
+        ``ok`` / ``api_disabled`` (the key's project has the Gmail API off --
+        a Cloud console fix) / ``no_grant`` (no ``gmail.readonly`` DWD grant
+        -- an Admin console fix) / ``error`` (with the exception's type name
+        only). Always returns the ``gmail`` key and never the subject.
+        """
+        try:
+            self._gmail_call(self.cfg.subject, "getProfile", lambda s: s.users().getProfile(userId="me"))
+            return {"gmail": "ok"}
+        except GwsApiDisabledError:
+            return {"gmail": "api_disabled"}
+        except GwsAuthError:
+            # No message text: it names the impersonated subject, which is
+            # parsed config and must not reach a tool answer.
+            return {"gmail": "no_grant"}
+        except Exception as e:  # a health probe must always return the same keys
+            # Its own key, so it never overwrites check()'s auth detail.
+            return {"gmail": "error", "gmail_detail": type(e).__name__}
 
     def fetch_dmarc_rua_records(
         self,
