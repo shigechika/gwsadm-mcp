@@ -1450,25 +1450,34 @@ def _parse_ips(raw: str | None) -> list[str]:
 
 
 def _recipients(sampled: list[dict], internal: set[str]) -> dict:
-    """Reduce sent-message envelopes to counts: recipients, their domains, external ones."""
+    """Reduce sent-message envelopes to counts: recipients, their domains, external and unparseable ones."""
     domains: collections.Counter = collections.Counter()
-    total = external = 0
+    total = external = unknown = 0
     for m in sampled:
-        # Only the headers that are present: in strict mode (the default
-        # since 3.13) one empty element makes getaddresses() reject the
-        # whole list as [("", "")] -- observed on 3.14.
-        fields = [v for v in (m.get("to"), m.get("cc"), m.get("bcc")) if v]
-        for _name, addr in email.utils.getaddresses(fields):
-            if not addr or "@" not in addr:
+        # One header at a time, and only the ones present: in strict mode
+        # (the default since 3.13) getaddresses() rejects a whole list as
+        # [("", "")] when any element fails to parse -- observed on 3.14 for
+        # an empty string -- so one malformed header must not blank the rest.
+        for field in (m.get("to"), m.get("cc"), m.get("bcc")):
+            if not field:
                 continue
-            total += 1
-            dom = addr.rsplit("@", 1)[-1].lower()
-            domains[dom] += 1
-            if is_external(addr, internal):
-                external += 1
+            for _name, addr in email.utils.getaddresses([field]):
+                total += 1
+                if not addr or "@" not in addr:
+                    # A recipient that could not be parsed is still a
+                    # recipient: counted as unknown AND as external (the
+                    # fail-safe is_external() applies to an unreadable
+                    # address), never silently dropped.
+                    unknown += 1
+                    external += 1
+                    continue
+                domains[addr.rsplit("@", 1)[-1].lower()] += 1
+                if is_external(addr, internal):
+                    external += 1
     return {
         "recipients_total": total,
         "external_recipients": external,
+        "unknown_recipients": unknown,
         "recipient_domains": dict(domains.most_common(20)),
     }
 
@@ -1500,26 +1509,40 @@ def _gmail_section(
 ) -> dict:
     """The Gmail half of a sweep, with its outcome made explicit in ``kind``.
 
-    ``ok`` -- settings and the sent summary were read; ``api_disabled`` -- the
-    Gmail API is off in the service account's project (Cloud console);
+    ``ok`` -- every settings section and the sent summary were read;
+    ``partial`` -- the mailbox is readable but one or more settings sections
+    (``section_errors``) or the sent summary (``sent.error``) failed, so
+    "nothing found" does not hold for those; ``api_disabled`` -- the Gmail
+    API is off in the service account's project (Cloud console);
     ``no_grant`` -- no ``gmail.readonly`` DWD grant (Admin console);
-    ``error`` -- something else failed. The three failures are reported, not
-    read as "nothing found".
+    ``error`` -- the settings could not be read for another reason. The
+    settings and the sent summary are read independently: a sent-mail
+    failure never discards a forwarding rule already found.
     """
     try:
         settings = c.gmail_security_settings(username)
-        sent = c.gmail_sent_summary(username, start=start, max_messages=max_sent)
     except GwsApiDisabledError as e:
         return {"kind": "api_disabled", "error": str(e)}
     except GwsAuthError as e:
         return {"kind": "no_grant", "error": str(e)}
     except GwsError as e:
         return {"kind": "error", "error": str(e)}
+    try:
+        got = c.gmail_sent_summary(username, start=start, max_messages=max_sent)
+        sent: dict = {
+            "count": got["count"],
+            "capped": got["capped"],
+            "sampled": len(got["sampled"]),
+            **_recipients(got["sampled"], internal),
+        }
+    except GwsError as e:  # GwsAuthError / GwsApiDisabledError included: the settings still stand
+        sent = {"error": str(e)}
+    section_errors = settings.get("section_errors") or {}
     auto = settings.get("auto_forwarding") or {}
     filters = [_filter_entry(f) for f in settings.get("filters") or []]
     send_as = [_send_as_entry(a) for a in settings.get("send_as") or []]
     return {
-        "kind": "ok",
+        "kind": "partial" if section_errors or "error" in sent else "ok",
         "auto_forwarding": {
             "enabled": auto.get("enabled"),
             "email": auto.get("emailAddress"),
@@ -1539,13 +1562,8 @@ def _gmail_section(
         # The primary address only when it carries a reply-to (a reply-to
         # hijack); every non-primary alias.
         "send_as": [a for a in send_as if not a["is_primary"] or a["reply_to"]],
-        "section_errors": settings.get("section_errors") or {},
-        "sent": {
-            "count": sent["count"],
-            "capped": sent["capped"],
-            "sampled": len(sent["sampled"]),
-            **_recipients(sent["sampled"], internal),
-        },
+        "section_errors": section_errors,
+        "sent": sent,
     }
 
 
@@ -1573,7 +1591,7 @@ def _highlights(username: str, activity: dict, grants: dict, ips: list[dict], gm
                 "detail": f"{t.get('display_text')} ({t.get('client_id')}): {', '.join(t.get('scopes', []))}",
             }
         )
-    if gmail.get("kind") == "ok":
+    if gmail.get("kind") in ("ok", "partial"):
         auto = gmail["auto_forwarding"]
         if auto.get("enabled"):
             out.append(
@@ -1604,15 +1622,20 @@ def _highlights(username: str, activity: dict, grants: dict, ips: list[dict], gm
                 }
             )
         sent = gmail["sent"]
-        if sent["count"]:
+        if sent.get("count"):
             out.append(
                 {
                     "kind": "sent_mail",
                     "detail": f"{sent['count']} message(s) sent in the window"
                     + (" (more exist)" if sent["capped"] else "")
-                    + f"; {sent['external_recipients']} external recipient(s) in the {sent['sampled']} sampled",
+                    + f"; {sent['external_recipients']} external recipient(s) in the {sent['sampled']} sampled"
+                    + (f", {sent['unknown_recipients']} unparseable" if sent.get("unknown_recipients") else ""),
                 }
             )
+        for section, err in gmail.get("section_errors", {}).items():
+            out.append({"kind": "gmail_unreadable", "detail": f"gmail settings.{section} not read -- {err}"})
+        if "error" in sent:
+            out.append({"kind": "gmail_unreadable", "detail": f"gmail sent mail not read -- {sent['error']}"})
     else:
         out.append({"kind": "gmail_unreadable", "detail": f"gmail: {gmail.get('kind')} -- {gmail.get('error')}"})
     for entry in ips:
@@ -1631,14 +1654,27 @@ def _checklist(activity: dict, gmail: dict) -> list[str]:
         "Review recovery email / phone in the Admin console; this tool does not read them.",
         "Revoke the OAuth grants listed under grants.risky that the owner does not recognise.",
     ]
-    if gmail.get("kind") != "ok":
+    kind = gmail.get("kind")
+    if kind in ("ok", "partial"):
+        failed = list(gmail.get("section_errors", {}))
+        if failed:
+            items.append(
+                "These Gmail settings could not be read here and must be checked in the Admin console by hand: "
+                + ", ".join(failed)
+                + "."
+            )
+        if "error" in gmail.get("sent", {}):
+            items.append("Sent mail could not be listed here: use the Admin console's Email Log Search.")
+        else:
+            items.append(
+                "Message content is never read here: use the Admin console's Email Log Search for what was sent."
+            )
+    else:
         items.append(
             "Gmail settings and sent mail could not be read here ("
-            + str(gmail.get("kind"))
+            + str(kind)
             + "): check forwarding, filters, delegates and the Email Log Search in the Admin console by hand."
         )
-    else:
-        items.append("Message content is never read here: use the Admin console's Email Log Search for what was sent.")
     items.append("Drive: run drive_external_sharing for the window and look for this account as the actor.")
     if activity.get("capped"):
         items.append("The activity window was not fully covered (capped): narrow hours or raise max_pages and re-run.")

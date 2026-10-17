@@ -1106,7 +1106,11 @@ class DomainClient:
             raise GwsError(f"[{self.domain}] gmail API error ({label}, {user_email}): HTTP {status}") from e
         except GoogleAuthError as e:
             # Typical: gmail.readonly DWD scope not granted for this client.
-            raise GwsAuthError(f"[{self.domain}] auth failed for {user_email}: {e}") from e
+            # The text is Google's token-endpoint reason ("unauthorized_client:
+            # ..."), not the key file: loading the key is guarded separately
+            # in _gmail_service, which omits its text on purpose. Bounded so
+            # an unexpected variant cannot dump a body into a tool answer.
+            raise GwsAuthError(f"[{self.domain}] auth failed for {user_email}: {str(e)[:200]}") from e
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error ({label}, {user_email}): {type(e).__name__}") from e
 

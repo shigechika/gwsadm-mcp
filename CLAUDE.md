@@ -48,7 +48,7 @@ addresses + the Gmail settings an attacker leaves behind — Gmail API
 `filters.list` / `delegates.list` / `sendAs.list`, all served by the
 `gmail.readonly` DWD scope, verified live — and the sent-mail envelope,
 `messages().list` + `messages().get(format="metadata")` with To/Cc/Bcc/Date
-only; its `gmail.kind` distinguishes `ok` / `api_disabled` (HTTP 403
+only; its `gmail.kind` distinguishes `ok` / `partial` / `api_disabled` (HTTP 403
 `accessNotConfigured`: the Gmail API is off in the key's own Cloud project,
 `GwsApiDisabledError`) / `no_grant` / `error`), and a `daily_brief`
 combining the Reports-based tools, to AI assistants via STDIO transport,

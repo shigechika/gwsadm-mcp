@@ -3274,6 +3274,7 @@ def test_compromise_sweep_answers_all_four_questions(inject):
         "sampled": 2,
         "recipients_total": 4,
         "external_recipients": 2,
+        "unknown_recipients": 0,
         "recipient_domains": {"example.edu": 2, "partner.example": 2},
     }
     assert staff.gmail_sent_calls == [("victim@example.edu", 2, 10)]
@@ -3317,9 +3318,42 @@ def test_compromise_sweep_reports_missing_gmail_grant_and_other_errors(inject):
     staff._gmail_settings = GwsAuthError("[example.edu] auth failed for victim@example.edu: no gmail scope")
     inject([staff], {"example.edu"})
     assert server.compromise_sweep("victim@example.edu")["gmail"]["kind"] == "no_grant"
-    staff._gmail_settings = None
+    # A sent-mail failure keeps the settings already read and marks the section partial.
+    staff._gmail_settings = _sweep_fixture()[0]._gmail_settings
     staff._gmail_sent = GwsError("[example.edu] gmail API error (messages.list, victim@example.edu): HTTP 500")
-    assert server.compromise_sweep("victim@example.edu")["gmail"]["kind"] == "error"
+    out = server.compromise_sweep("victim@example.edu")
+    assert out["gmail"]["kind"] == "partial"
+    assert out["gmail"]["auto_forwarding"]["enabled"] is True and "HTTP 500" in out["gmail"]["sent"]["error"]
+    assert any(h["kind"] == "forwarding" for h in out["highlights"])
+    assert any(h["kind"] == "gmail_unreadable" and "sent mail" in h["detail"] for h in out["highlights"])
+    assert any("Email Log Search" in item and "could not be listed" in item for item in out["checklist"])
+
+
+def test_compromise_sweep_marks_a_failed_settings_section_partial(inject):
+    staff, _ = _sweep_fixture()
+    staff._gmail_settings = {
+        "section_errors": {"delegates": "[example.edu] gmail API error (settings.delegates): HTTP 500"}
+    }
+    inject([staff], {"example.edu"})
+    out = server.compromise_sweep("victim@example.edu")
+    assert out["gmail"]["kind"] == "partial"
+    assert out["gmail"]["delegates"] == []  # not "no delegates" -- the checklist says so
+    assert any(h["kind"] == "gmail_unreadable" and "settings.delegates" in h["detail"] for h in out["highlights"])
+    assert any("delegates" in item and "by hand" in item for item in out["checklist"])
+
+
+def test_compromise_sweep_counts_unparseable_recipients_as_unknown_and_external(inject):
+    staff, _ = _sweep_fixture()
+    staff._gmail_sent = {
+        "count": 1,
+        "capped": False,
+        "sampled": [{"internal_date": "1", "to": "a@example.edu", "cc": "not an address", "bcc": ""}],
+    }
+    inject([staff], {"example.edu"})
+    sent = server.compromise_sweep("victim@example.edu")["gmail"]["sent"]
+    assert sent["recipients_total"] == 2 and sent["unknown_recipients"] == 1
+    assert sent["external_recipients"] == 1  # the unknown one, fail-safe; a@example.edu is internal
+    assert sent["recipient_domains"] == {"example.edu": 1}
 
 
 def test_compromise_sweep_uses_given_ips_and_validates_them(inject):
