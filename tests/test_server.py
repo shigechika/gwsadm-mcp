@@ -1,12 +1,13 @@
 """Tests for the MCP tools (aggregation, external/grant classification, degradation)."""
 
+import datetime
 import inspect
 import types
 
 import pytest
 
 import gwsadm_mcp.server as server
-from gwsadm_mcp.client import GwsError
+from gwsadm_mcp.client import GwsAuthError, GwsError
 
 
 class FakeDomainClient:
@@ -3750,3 +3751,179 @@ def test_account_changes_partial_when_one_suspicious_probe_failed(inject, monkey
     assert ac["suspicious_login_coverage"] == "partial" and ac["capped"] is True
     assert ac["event_errors"] == {"suspicious_login": "[example.edu] reports API error (login): HTTP 503"}
     assert ac["entries"][0]["after_suspicious_login"] is False  # may be wrong: hence capped
+
+
+# --- admin_actions ---
+
+
+def _admin_item(actor, event_name, params, time="2026-10-21T01:00:00.000Z", qualifier="1", event_type="USER_SETTINGS"):
+    item = _item(actor, event_name, params, time=time, ip="198.51.100.7")
+    item["id"]["uniqueQualifier"] = qualifier
+    item["events"][0]["type"] = event_type
+    return item
+
+
+def test_admin_actions_for_one_user_reads_both_target_filters(inject):
+    target = "alice@example.edu"
+    canned = {
+        ("admin", f"USER_EMAIL=={target}"): (
+            [
+                _admin_item("it@example.edu", "SUSPEND_USER", {"USER_EMAIL": target}, time="2026-10-21T02:00:00Z"),
+                _admin_item(
+                    "it@example.edu",
+                    "ADD_GROUP_MEMBER",
+                    {"USER_EMAIL": "Alice@example.edu", "GROUP_EMAIL": "staff@example.edu"},
+                    qualifier="2",
+                    event_type="GROUP_SETTINGS",
+                ),
+            ],
+            False,
+        ),
+        ("admin", f"GROUP_EMAIL=={target}"): ([], False),
+    }
+    c = FakeDomainClient("example.edu", canned)
+    other = FakeDomainClient("students.example.edu", {})
+    inject([c, other], {"example.edu", "students.example.edu"})
+    result = server.admin_actions(target=" alice@example.edu ")
+    assert sorted(f for (_, _, _, f) in c.calls) == [f"GROUP_EMAIL=={target}", f"USER_EMAIL=={target}"]
+    assert other.calls == []  # the target's suffix picks the domain
+    dom = result["domains"]["example.edu"]
+    assert dom["count"] == 2 and [r["event"] for r in dom["events"]] == ["SUSPEND_USER", "ADD_GROUP_MEMBER"]
+    assert dom["events"][0] == {
+        "time": "2026-10-21T02:00:00Z",
+        "actor": "it@example.edu",
+        "actor_ip": "198.51.100.7",
+        "event_type": "USER_SETTINGS",
+        "event": "SUSPEND_USER",
+        "parameters": {"USER_EMAIL": target},
+    }
+    assert dom["by_actor"] == {"it@example.edu": 2} and result["capped"] is False
+
+
+def test_admin_actions_skips_bulk_siblings_and_counts_duplicates_once(inject):
+    target = "staff@example.edu"
+    bulk = _admin_item("it@example.edu", "ADD_GROUP_MEMBER", {"GROUP_EMAIL": target, "USER_EMAIL": "a@example.edu"})
+    bulk["events"].append(
+        {"name": "ADD_GROUP_MEMBER", "parameters": [{"name": "GROUP_EMAIL", "value": "x@example.edu"}]}
+    )
+    canned = {
+        ("admin", f"USER_EMAIL=={target}"): ([], False),
+        ("admin", f"GROUP_EMAIL=={target}"): ([bulk, bulk], False),
+    }
+    inject([FakeDomainClient("example.edu", canned)], {"example.edu"})
+    dom = server.admin_actions(target=target)["domains"]["example.edu"]
+    assert dom["count"] == 1 and dom["sibling_events_skipped"] == 2
+
+
+def test_admin_actions_tenant_wide_reads_every_domain_unfiltered(inject):
+    a = FakeDomainClient(
+        "example.edu",
+        {
+            ("admin", "CHANGE_PASSWORD"): (
+                [_admin_item("it@example.edu", "CHANGE_PASSWORD", {"USER_EMAIL": "b@example.edu"})],
+                True,
+            )
+        },
+    )
+    b = FakeDomainClient("students.example.edu", {})
+    inject([a, b], {"example.edu", "students.example.edu"})
+    result = server.admin_actions(event="change_password", hours=48)
+    assert a.calls == [("admin", "CHANGE_PASSWORD", 5, None)] and b.calls == [("admin", "CHANGE_PASSWORD", 5, None)]
+    assert result["domains"]["example.edu"]["capped"] is True and result["capped"] is True
+    assert result["event"] == "CHANGE_PASSWORD" and result["window_hours"] == 48
+
+
+def test_admin_actions_probe_error_and_auth_error_degrade_differently(inject):
+    target = "alice@example.edu"
+    c = FakeDomainClient(
+        "example.edu",
+        {("admin", f"USER_EMAIL=={target}"): GwsError("boom"), ("admin", f"GROUP_EMAIL=={target}"): ([], False)},
+    )
+    inject([c], {"example.edu"})
+    dom = server.admin_actions(target=target)["domains"]["example.edu"]
+    assert dom["errors"] == {f"USER_EMAIL=={target}": "boom"} and dom["capped"] is True
+    d = FakeDomainClient("example.edu", {("admin", f"GROUP_EMAIL=={target}"): GwsAuthError("denied")})
+    inject([d], {"example.edu"})
+    result = server.admin_actions(target=target)
+    assert result["domains"]["example.edu"] == {"error": "denied"} and result["capped"] is True
+
+
+@pytest.mark.parametrize("bad", ["a,b@example.edu", "a==b@example.edu", "a@example", "a b@example.edu", "a<>b@x.edu"])
+def test_admin_actions_rejects_targets_that_could_reshape_the_filter(inject, bad):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    assert "error" in server.admin_actions(target=bad) and c.calls == []
+
+
+def test_admin_actions_rejects_a_bad_event_name(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    assert "error" in server.admin_actions(event="SUSPEND USER") and c.calls == []
+
+
+# --- workspace_status ---
+
+
+def _incident(iid, service, begin, end, text="**Summary:**\nSomething broke.\n**Description:**\nx"):
+    return {
+        "id": iid,
+        "service_name": service,
+        "affected_products": [{"title": service, "id": "p"}],
+        "severity": "medium",
+        "status_impact": "SERVICE_DISRUPTION",
+        "begin": begin,
+        "end": end,
+        "uri": f"incidents/{iid}",
+        "most_recent_update": {"when": begin, "text": text},
+    }
+
+
+def test_workspace_status_splits_open_and_recent(monkeypatch):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    iso = lambda dt: dt.isoformat()  # noqa: E731
+    feed = [
+        _incident("open1", "Gmail", iso(now - datetime.timedelta(hours=1)), None),
+        _incident(
+            "recent1", "Google Drive", iso(now - datetime.timedelta(hours=10)), iso(now - datetime.timedelta(hours=5))
+        ),
+        _incident("old1", "Gmail", iso(now - datetime.timedelta(days=30)), iso(now - datetime.timedelta(days=29))),
+        _incident("bad uri", "Gmail", iso(now - datetime.timedelta(hours=2)), None),
+    ]
+    feed[3]["uri"] = "https://evil.example/x"
+    monkeypatch.setattr(server, "_fetch_workspace_incidents", lambda: feed)
+    result = server.workspace_status(hours=24)
+    assert [r["id"] for r in result["open"]] == ["open1", "bad uri"] and result["open_count"] == 2
+    assert result["open"][0]["summary"] == "Something broke." and result["open"][0]["url"].endswith("incidents/open1")
+    assert result["open"][1]["url"] is None  # a uri that is not an incident path is not turned into a link
+    assert [r["id"] for r in result["recent"]] == ["recent1"]
+    gmail = server.workspace_status(hours=24 * 60, service="gmail")
+    assert [r["id"] for r in gmail["open"]] == ["open1", "bad uri"] and [r["id"] for r in gmail["recent"]] == ["old1"]
+
+
+def test_workspace_status_reports_a_failed_fetch_without_raising(monkeypatch):
+    def boom():
+        raise OSError("timed out")
+
+    monkeypatch.setattr(server, "_fetch_workspace_incidents", boom)
+    result = server.workspace_status()
+    assert "could not read the status dashboard" in result["error"] and "open" not in result
+
+
+def test_workspace_status_rejects_a_bad_service_filter():
+    assert "error" in server.workspace_status(service="Gmail; rm")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "**Summary:**\nMail is slow.\n**Description:**\nx",
+        "**Summary**\nMail is slow.\n**Description**\nx",
+        "**summary**\nMail is slow.",
+        "**Title**\nMail is slow.\n**Description**\nx",
+        "# Incident Report\n## Summary\nMail is slow.\nMore.",
+        "**Summary:** Mail is slow.",
+        "Mail is slow.\nMore.",
+    ],
+)
+def test_incident_summary_reads_each_heading_style(text):
+    assert server._incident_summary(text) == "Mail is slow."

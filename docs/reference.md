@@ -16,6 +16,8 @@
 | `drive_external_sharing` | Reports API `drive` — ACL **grants** to external addresses or domains (revocations reported separately) and visibility **transitions** into link/public exposure |
 | `drive_doc_activity` | Reports API `drive` with a server-side `doc_id` filter — **one document's** owner, ACL changes, and lifecycle events. Triage companion to `drive_external_sharing`: the owner (an individual vs. a shared drive's name) disambiguates the shared-drive false-positive class |
 | `shared_drive_membership_changes` | Reports API `drive` (`shared_drive_membership_change`) — who added/removed/re-roled shared-drive members and when, with external classification of the affected member and a client-side drive-name filter |
+| `admin_actions` | Reports API `admin` — what administrators (people, or a sync or API client acting as one) did in the Admin console: to **one user or group** (server-side `USER_EMAIL` / `GROUP_EMAIL` filters on the target's domain) or tenant-wide. Answers "who suspended this account / reset its password / took it out of a group?", which `user_activity` cannot: an admin event's actor is the administrator, not the account acted upon |
+| `workspace_status` | Google Workspace Status Dashboard (public feed, no credential) — open incidents and those that ended within the window, optionally for one product (`Gmail`, `Drive`, ...). Answers "is it Google?" before a tenant-side investigation |
 | `gmail_message_trace` | Gmail API — did a **known** Message-ID reach **specific** mailboxes, and where (inbox/spam/trash/archived)? For each recipient it impersonates that user via DWD and searches their own mailbox. Requires the separate `gmail.readonly` DWD scope; a domain missing that grant reports a per-recipient error, never a false "not found" |
 | `dmarc_rua_summary` | Gmail API — DMARC aggregate (RUA) report pass/fail summary and top reject-candidate source IPs, per domain. Impersonates the domain's configured `dmarc_rua_mailbox` (a real user; default `postmaster@<domain>`), searches for mail addressed to `dmarc_rua_recipient` (default: the mailbox) and reads the compressed report attachments. Domains with `dmarc_rua_mailbox = none` are reported as `skipped`. Shares `gmail_message_trace`'s `gmail.readonly` DWD scope, but reads attachment content, not just metadata |
 | `group_delivery_policy` | Groups Settings API — a Google Group's own posting/delivery policy (`who_can_post`, `allow_external_members`, moderation levels). Requires the separate `apps.groups.settings` DWD scope |
@@ -33,7 +35,7 @@ front:
 
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
-| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `user_activity`, `ip_activity`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `user_activity`, `ip_activity`, `admin_actions`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user` | those two tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
 

@@ -43,11 +43,13 @@ import email.utils
 import functools
 import inspect
 import ipaddress
+import json
 import os
 import re
 import secrets
 import threading
 import time
+import urllib.request
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -2985,6 +2987,293 @@ def shared_drive_membership_changes(
             "entries": entries,
         }
     return {"window_days": days, "domains": out}
+
+
+# Admin console audit (Reports API ``applicationName=admin``): what an
+# administrator -- a person, or a directory sync or API client acting as one --
+# did to an account, a group, or a setting. ``user_activity`` cannot answer
+# "who suspended this account": it asks for what one account DID
+# (``userKey``), and an admin event's actor is the administrator, with the
+# account acted upon in the event's ``USER_EMAIL`` parameter.
+ADMIN_TARGET_PARAMETERS = ("USER_EMAIL", "GROUP_EMAIL")
+ADMIN_ACTIONS_MAX_HOURS = 24 * 180
+_ADMIN_EVENT_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,80}$")
+# A target is interpolated into a ``filters`` expression (an operator language:
+# ``,`` separates terms, ``==`` / ``<>`` compare), so it is held to a plain
+# address charset that contains none of those characters.
+_FILTER_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
+_ADMIN_VALUE_CHARS = 300
+
+
+def _short_value(v) -> str | int | bool | None:
+    if isinstance(v, list):
+        v = ", ".join(str(x) for x in v)
+    if isinstance(v, str) and len(v) > _ADMIN_VALUE_CHARS:
+        return v[:_ADMIN_VALUE_CHARS] + "…"
+    return v
+
+
+def _admin_row(item: dict, event: dict, p: dict) -> dict:
+    actor = item.get("actor", {})
+    return {
+        "time": item.get("id", {}).get("time"),
+        "actor": actor.get("email") or actor.get("profileId"),
+        "actor_ip": item.get("ipAddress"),
+        "event_type": event.get("type"),
+        "event": event.get("name"),
+        "parameters": {k: _short_value(v) for k, v in p.items()},
+    }
+
+
+@mcp.tool()
+def admin_actions(
+    target: str | None = None,
+    hours: int = 24,
+    event: str | None = None,
+    domain: str | None = None,
+    max_pages: int = 5,
+    max_events: int = 100,
+) -> dict:
+    """What administrators did in the Admin console: to one account or group, or tenant-wide.
+
+    Answers "did someone (IT staff, a sync job) suspend this account, reset
+    its password, move it to another org unit, or take it out of a group?"
+    from the Admin console audit log (Reports API ``applicationName=admin``).
+    Each row names the ``actor`` (the administrator's address, or a profile
+    id for a service account or sync client), ``actor_ip``, the
+    ``event_type`` (``USER_SETTINGS``, ``GROUP_SETTINGS``, ...), the
+    ``event`` (``SUSPEND_USER``, ``UNSUSPEND_USER``, ``CHANGE_PASSWORD``,
+    ``CHANGE_USER_ORGANIZATION``, ``ADD_GROUP_MEMBER``,
+    ``REMOVE_GROUP_MEMBER``, ``CREATE_USER``, ``DELETE_USER``,
+    ``CHANGE_APPLICATION_SETTING``, ...) and its ``parameters`` as the API
+    names them (``USER_EMAIL``, ``GROUP_EMAIL``, ``ORG_UNIT_NAME``,
+    ``SETTING_NAME``, ``OLD_VALUE``, ``NEW_VALUE``, ...; long values cut at
+    300 characters). What the account did itself (its own password change,
+    a second factor it enrolled) is not here: use ``user_activity``.
+
+    With ``target`` (a user or group address), the domain is taken from its
+    suffix and two server-side filters run, ``USER_EMAIL==<target>`` and
+    ``GROUP_EMAIL==<target>``; an event of a bulk activity that names some
+    other address is skipped and counted in ``sibling_events_skipped``.
+    Without it, every admin action of the window is read (each configured
+    domain, or ``domain``). ``event`` narrows to one event name.
+
+    Per domain: ``events`` newest first (cut at ``max_events``,
+    ``events_truncated``), ``by_event`` and ``by_actor`` counts over every
+    matching event, ``capped`` (more pages existed) and ``errors`` (a probe
+    that failed; a domain whose credentials failed is ``{"error": ...}``).
+    ``capped`` at the top is set when any domain was capped or failed.
+    Reports data can lag by hours, so an empty window right after the fact
+    is "not visible yet", not "nothing happened". Read-only, the same
+    ``admin.reports.audit.readonly`` DWD scope as ``login_audit``.
+
+    Args:
+        target: A user or group email address (``name@domain``), or omit for
+            every admin action.
+        hours: Window length ending now (at most 4320, the ~6 months the
+            Reports API keeps).
+        event: One admin event name in upper case, e.g. ``SUSPEND_USER``.
+        domain: Configured domain to read (default: the target's suffix, or
+            every configured domain).
+        max_pages: Reports page budget per probe (1000 events per page).
+        max_events: Rows listed per domain; the counts cover everything fetched.
+    """
+    hours = max(1, min(ADMIN_ACTIONS_MAX_HOURS, hours))
+    target = target.strip() if target is not None and target.strip() else None
+    event = event.strip().upper() if event is not None and event.strip() else None
+    head: dict = {"target": target, "event": event, "window_hours": hours}
+    if target is not None and not _FILTER_EMAIL_RE.match(target):
+        return {**head, "error": "target must be a plain email address (name@domain)"}
+    if event is not None and not _ADMIN_EVENT_RE.match(event):
+        return {**head, "error": "event must be an admin event name such as SUSPEND_USER"}
+    try:
+        clients, _ = _clients()
+        if target is not None:
+            picked = _select(clients, domain if domain is not None else _domain_of(target))[:1]
+        else:
+            picked = _select(clients, domain)
+    except (ConfigError, GwsError) as e:
+        return {**head, "error": str(e)}
+    start = _window(hours)
+    filters = [f"{param}=={target}" for param in ADMIN_TARGET_PARAMETERS] if target is not None else [None]
+    fetched = _fan_out(
+        {
+            (c.domain, f): functools.partial(
+                c.fetch_activities, "admin", start=start, event_name=event, filters=f, max_pages=max_pages
+            )
+            for c in picked
+            for f in filters
+        }
+    )
+    out: dict = {}
+    any_capped = False
+    for c in picked:
+        results = {f: fetched[(c.domain, f)] for f in filters}
+        auth = next((r for r in results.values() if isinstance(r, GwsAuthError)), None)
+        if auth is not None:
+            out[c.domain] = {"error": str(auth)}
+            any_capped = True
+            continue
+        errors = {f or "all": str(r) for f, r in results.items() if isinstance(r, Exception)}
+        capped = any(r[1] for r in results.values() if not isinstance(r, Exception)) or bool(errors)
+        rows: list[dict] = []
+        seen: set = set()
+        skipped = 0
+        for f, r in results.items():
+            if isinstance(r, Exception):
+                continue
+            param = f.split("==", 1)[0] if f else None
+            for it in r[0]:
+                ident = it.get("id", {})
+                for ev in it.get("events", []):
+                    p = event_parameters(ev)
+                    if param is not None and _scalar_lower(p.get(param)) != target.lower():
+                        skipped += 1
+                        continue
+                    key = (ident.get("time"), ident.get("uniqueQualifier"), ev.get("name"), repr(sorted(p.items())))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(_admin_row(it, ev, p))
+        rows.sort(key=lambda r: r["time"] or "", reverse=True)
+        out[c.domain] = {
+            "count": len(rows),
+            "by_event": dict(collections.Counter(r["event"] or "(unnamed)" for r in rows).most_common()),
+            "by_actor": dict(collections.Counter(r["actor"] or "(unknown)" for r in rows).most_common()),
+            "events": rows[:max_events],
+            "events_truncated": len(rows) > max_events,
+            "sibling_events_skipped": skipped,
+            "capped": capped,
+            "errors": errors,
+        }
+        any_capped = any_capped or capped
+    return {**head, "window_start": start.isoformat(), "domains": out, "capped": any_capped}
+
+
+# Google Workspace Status Dashboard: the public incident feed Google publishes
+# for every Workspace product. No credential is involved; the tool works even
+# when the domain configuration does not.
+WORKSPACE_STATUS_URL = "https://www.google.com/appsstatus/dashboard/incidents.json"
+WORKSPACE_STATUS_PAGE = "https://www.google.com/appsstatus/dashboard/"
+WORKSPACE_STATUS_TIMEOUT = 15
+WORKSPACE_STATUS_MAX_BYTES = 8 * 1024 * 1024
+WORKSPACE_STATUS_MAX_HOURS = 24 * 90
+_SERVICE_FILTER_RE = re.compile(r"^[\w .&+-]{1,60}$")
+_INCIDENT_URI_RE = re.compile(r"^incidents/[A-Za-z0-9_-]{1,64}$")
+
+
+def _fetch_workspace_incidents() -> list:
+    req = urllib.request.Request(WORKSPACE_STATUS_URL, headers={"User-Agent": f"gwsadm-mcp/{__version__}"})
+    with urllib.request.urlopen(req, timeout=WORKSPACE_STATUS_TIMEOUT) as resp:
+        body = resp.read(WORKSPACE_STATUS_MAX_BYTES + 1)
+    if len(body) > WORKSPACE_STATUS_MAX_BYTES:
+        raise ValueError("status feed larger than expected")
+    data = json.loads(body)
+    if not isinstance(data, list):
+        raise ValueError("status feed is not a list")
+    return data
+
+
+def _heading(line: str) -> str | None:
+    """The lower-cased text of a Markdown heading line (``# x``, ``**x**``, ``**x:**``), else None."""
+    if line.startswith("#"):
+        return line.lstrip("#").strip().rstrip(":").strip().lower()
+    if line.startswith("**") and line.endswith("**") and len(line) > 4:
+        return line.strip("*").strip().rstrip(":").strip().lower()
+    return None
+
+
+def _incident_summary(text) -> str | None:
+    """The first line under a Summary / Title heading of an update, else its first non-heading line.
+
+    Google writes these headings several ways (``**Summary:**``, ``**Summary**``,
+    ``**summary**``, ``**Title**``, ``# Incident Report`` / ``## Summary``).
+    """
+    if not isinstance(text, str):
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        if _heading(ln) in ("summary", "title"):
+            following = [x for x in lines[i + 1 :] if _heading(x) is None]
+            if following:
+                return following[0][:_ADMIN_VALUE_CHARS]
+        if ln.lower().startswith("**summary:**") and len(ln) > len("**summary:**"):
+            return ln[len("**summary:**") :].strip()[:_ADMIN_VALUE_CHARS]
+    plain = [ln for ln in lines if _heading(ln) is None]
+    return plain[0][:_ADMIN_VALUE_CHARS] if plain else None
+
+
+def _incident_row(inc: dict) -> dict:
+    latest = inc.get("most_recent_update") if isinstance(inc.get("most_recent_update"), dict) else {}
+    uri = inc.get("uri")
+    products = inc.get("affected_products") if isinstance(inc.get("affected_products"), list) else []
+    return {
+        "id": inc.get("id"),
+        "service": inc.get("service_name"),
+        "affected_products": [p.get("title") for p in products if isinstance(p, dict) and p.get("title")],
+        "severity": inc.get("severity"),
+        "status_impact": inc.get("status_impact"),
+        "begin": inc.get("begin"),
+        "end": inc.get("end"),
+        "open": not inc.get("end"),
+        "summary": _incident_summary(latest.get("text")) or _incident_summary(inc.get("external_desc")),
+        "last_update": latest.get("when"),
+        "url": WORKSPACE_STATUS_PAGE + uri if isinstance(uri, str) and _INCIDENT_URI_RE.match(uri) else None,
+    }
+
+
+@mcp.tool()
+def workspace_status(hours: int = 72, service: str | None = None) -> dict:
+    """Is a Google Workspace service down? Open and recent incidents from Google's status dashboard.
+
+    Reads the public Google Workspace Status Dashboard feed (no credential,
+    no DWD scope): the incidents Google has declared for Gmail, Drive, Meet,
+    Calendar, Chat and the other Workspace products. ``open`` lists the
+    incidents not yet resolved; ``recent`` those that ended within the last
+    ``hours``. Each row: ``service``, ``affected_products``, ``severity``,
+    ``status_impact``, ``begin`` / ``end`` (UTC), ``summary`` (the latest
+    update's summary line), ``last_update`` and the incident's ``url``.
+    The dashboard is global: an empty answer means Google has declared no
+    incident, not that this tenant cannot be affected, and a local problem
+    (a network path, one account) never appears here.
+
+    Args:
+        hours: How far back ``recent`` reaches (at most 2160, 90 days).
+        service: Keep incidents whose service or affected product name
+            contains this text (case-insensitive), e.g. ``Gmail``.
+    """
+    hours = max(1, min(WORKSPACE_STATUS_MAX_HOURS, hours))
+    wanted = service.strip() if service is not None and service.strip() else None
+    head: dict = {"source": WORKSPACE_STATUS_PAGE, "window_hours": hours, "service": wanted}
+    if wanted is not None and not _SERVICE_FILTER_RE.match(wanted):
+        return {**head, "error": "service must be a product name such as Gmail"}
+    try:
+        incidents = _fetch_workspace_incidents()
+    except (OSError, ValueError) as e:
+        # urllib's messages name only the URL above and the HTTP status; nothing of this server's config.
+        return {**head, "error": f"could not read the status dashboard ({type(e).__name__}: {e})"}
+    since = _window(hours)
+    rows = [_incident_row(i) for i in incidents if isinstance(i, dict)]
+    if wanted is not None:
+        needle = wanted.lower()
+        rows = [
+            r
+            for r in rows
+            if needle in (r["service"] or "").lower() or any(needle in p.lower() for p in r["affected_products"])
+        ]
+    open_rows = [r for r in rows if r["open"]]
+    recent = []
+    for r in rows:
+        if r["open"]:
+            continue
+        try:
+            ended = datetime.datetime.fromisoformat(r["end"])
+        except (TypeError, ValueError):
+            continue
+        if ended.tzinfo is not None and ended >= since:
+            recent.append(r)
+    recent.sort(key=lambda r: r["end"] or "", reverse=True)
+    return {**head, "open": open_rows, "recent": recent, "open_count": len(open_rows)}
 
 
 # What an account's owner (or whoever holds the session) changed about how the

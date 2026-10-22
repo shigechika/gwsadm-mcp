@@ -15,13 +15,15 @@ anything.
 |---|---|
 | Morning patrol | `health_check`, `daily_brief`, `daily_brief_start`, `daily_brief_result` |
 | Logins & accounts | `login_audit`, `suspended_accounts`, `get_user` |
+| Admin console | `admin_actions` |
+| Service status | `workspace_status` |
 | OAuth | `user_oauth_tokens` |
 | Drive | `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes` |
 | Gmail | `gmail_message_trace` |
 | Groups | `group_delivery_policy`, `list_group_members` |
 
 Planned: `dlp_events` (Reports `rules`; requires a Workspace edition with
-DLP), `token_events`, `admin_events`.
+DLP), `token_events`.
 
 ## Design notes
 
@@ -43,7 +45,8 @@ issued anywhere in this package are `activities().list()` (Reports API),
 `members().list()` (Directory API), `groups().get()` (Groups Settings API),
 and `messages().list()` / `messages().get()` (Gmail API, metadata only). No
 insert, update, patch, or delete call exists in the client — there is no
-scope grant that turns this server into a write tool.
+scope grant that turns this server into a write tool. The one request made
+without a credential is `workspace_status`'s GET of Google's public status feed.
 
 ## Next steps
 

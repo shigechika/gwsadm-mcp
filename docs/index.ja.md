@@ -14,13 +14,15 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 |---|---|
 | 朝の点検 | `health_check`、`daily_brief`、`daily_brief_start`、`daily_brief_result` |
 | ログイン・アカウント | `login_audit`、`suspended_accounts`、`get_user` |
+| 管理コンソール | `admin_actions` |
+| サービス状態 | `workspace_status` |
 | OAuth | `user_oauth_tokens` |
 | Drive | `drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes` |
 | Gmail | `gmail_message_trace` |
 | グループ | `group_delivery_policy`、`list_group_members` |
 
 計画中: `dlp_events`（Reports `rules`、DLP 対応の Workspace エディションが
-必要）、`token_events`、`admin_events`。
+必要）、`token_events`。
 
 ## 設計方針
 
@@ -42,7 +44,8 @@ cron・MCP ゲートウェイ・CI から無人実行できます。
 `groups().get()`（Groups Settings API）、`messages().list()` /
 `messages().get()`（Gmail API、メタデータのみ）だけです。クライアントのどこにも
 insert・update・patch・delete の呼び出しは存在せず、どんなスコープを付与しても
-このサーバーが書き込みツールに変わることはありません。
+このサーバーが書き込みツールに変わることはありません。認証情報を付けずに出す要求は、
+`workspace_status` が Google の公開ステータスフィードを GET するものだけです。
 
 ## 次に読むもの
 

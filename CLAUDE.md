@@ -14,6 +14,11 @@ API's own UTC-8:00/PST anchor -- requires the separate
 via `users().get`, on the same `admin.directory.user.readonly` scope
 `suspended_accounts` uses; a 404 answers `found: false`, never an error),
 `user_oauth_tokens` (one user's third-party OAuth app grants),
+`admin_actions` (Reports API `applicationName=admin`: what administrators did
+to one user or group via server-side `USER_EMAIL` / `GROUP_EMAIL` filters on the
+target's domain, or tenant-wide; same `admin.reports.audit.readonly` scope),
+`workspace_status` (Google's public Workspace status feed, no credential:
+open incidents and those ended within the window),
 `user_activity` (one account's activity merged across Reports API
 applications via `userKey=<username>`, newest first, with the posture-changing
 events — 2SV enrol/disable, recovery changes, password change, outbound
@@ -92,7 +97,8 @@ to guard against stdio newline regressions).
 
 - `gwsadm_mcp/server.py` — MCPServer server with `health_check`,
   `login_audit`, `gmail_usage_report`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
-  `user_activity`, `ip_activity`, `compromise_sweep`,
+  `user_activity`, `ip_activity`, `compromise_sweep`, `admin_actions`,
+  `workspace_status`,
   `drive_external_sharing`, `drive_doc_activity`,
   `shared_drive_membership_changes`, `gmail_message_trace`,
   `dmarc_rua_summary`, `group_delivery_policy`, `list_group_members`, `daily_brief`,

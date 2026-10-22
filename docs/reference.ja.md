@@ -15,6 +15,8 @@
 | `drive_external_sharing` | Reports API `drive` — 外部アドレス/ドメインへの ACL **付与**（取り消しは別集計）、リンク公開/一般公開への可視性**遷移** |
 | `drive_doc_activity` | Reports API `drive` をサーバー側 `doc_id` フィルタで — **特定1文書**の所有者・ACL 変更・ライフサイクル履歴。`drive_external_sharing` の検知トリアージ用: 所有者（個人か共有ドライブ名か）で誤検知クラスを切り分ける |
 | `shared_drive_membership_changes` | Reports API `drive`（`shared_drive_membership_change`）— 共有ドライブのメンバー追加/削除/ロール変更の履歴。対象メンバーの外部判定と、クライアント側ドライブ名フィルタ付き |
+| `admin_actions` | Reports API `admin` — 管理者（人、または管理者として動く同期・API クライアント）が管理コンソールで何をしたか。**特定の利用者・グループ**に対して（対象のドメインでサーバー側 `USER_EMAIL` / `GROUP_EMAIL` フィルタ）か、テナント全体。「このアカウントを停止した・パスワードを変えた・グループから外したのは誰か」に答える。管理イベントの行為者は管理者で、操作された側ではないので `user_activity` では答えられない |
+| `workspace_status` | Google Workspace ステータスダッシュボード（公開フィード、認証不要）— 未解決の障害と、期間内に終わった障害。製品（`Gmail`、`Drive` など）で絞れる。テナント側を調べる前に「Google 側か」に答える |
 | `gmail_message_trace` | Gmail API — **既知の** Message-ID が**特定の**メールボックスに届いたか、届いたならどこに入っているか（受信トレイ/迷惑メール/ゴミ箱/アーカイブ）を確認する。宛先ごとに DWD でそのユーザーになりすまし、本人のメールボックスを検索する。別付与の `gmail.readonly` DWD スコープが必要。未付与のドメインは宛先ごとのエラーとして報告され、誤って「届いていない」扱いにはならない |
 | `gmail_usage_report` | Reports API `customerUsageReports` — ドメイン別・日次のGmail送受信通数、昨日まで（APIの日付基準はUTC-8:00／PST）。別付与の `admin.reports.usage.readonly` DWD スコープが必要 — `admin.reports.audit.readonly` とは同じReports APIでも別のグラント |
 | `dmarc_rua_summary` | Gmail API — DMARC 集約（RUA）レポートのドメイン別 PASS/FAIL 集計と reject 候補送信元IPの上位一覧。ドメインの設定値 `dmarc_rua_mailbox`（実ユーザー。既定 `postmaster@<domain>`）になりすまし、`dmarc_rua_recipient`（既定は mailbox と同じ）宛のメールを検索して圧縮された添付レポートを読む。`dmarc_rua_mailbox = none` のドメインは `skipped` として返る。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープを使うが、メタデータだけでなく添付内容を読む |
@@ -33,7 +35,7 @@
 
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
-| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`user_activity`、`ip_activity`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`user_activity`、`ip_activity`、`admin_actions`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`、`get_user` | その2つのツールだけエラーに縮退（`suspended_accounts` はドメイン単位）。他は動作を続ける |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
