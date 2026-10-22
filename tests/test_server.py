@@ -3931,7 +3931,38 @@ def test_workspace_status_rejects_a_bad_service_filter():
         "# Incident Report\n## Summary\nMail is slow.\nMore.",
         "**Summary:** Mail is slow.",
         "Mail is slow.\nMore.",
+        "**Summary**: Mail is slow.",
+        "**Title:** Mail is slow.",
+        "**We are investigating reports that mail is slow.**\nMail is slow.",
     ],
 )
 def test_incident_summary_reads_each_heading_style(text):
-    assert server._incident_summary(text) == "Mail is slow."
+    expected = "We are investigating reports that mail is slow." if text.startswith("**We") else "Mail is slow."
+    assert server._incident_summary(text) == expected
+
+
+def test_admin_actions_lowercases_the_target_in_the_filter_and_clamps_budgets(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    result = server.admin_actions(target="Alice@Example.edu", max_pages=999, max_events=-1)
+    assert sorted(f for (_, _, _, f) in c.calls) == ["GROUP_EMAIL==alice@example.edu", "USER_EMAIL==alice@example.edu"]
+    assert {mp for (_, _, mp, _) in c.calls} == {server.ADMIN_ACTIONS_MAX_PAGES}
+    assert result["domains"]["example.edu"]["events_truncated"] is False
+
+
+def test_workspace_status_reads_z_timestamps_and_keeps_an_unreadable_end(monkeypatch):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    z = (now - datetime.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    feed = [_incident("zend", "Gmail", z, z), _incident("weird", "Gmail", z, "not a time")]
+    monkeypatch.setattr(server, "_fetch_workspace_incidents", lambda: feed)
+    assert [r["id"] for r in server.workspace_status(hours=24)["recent"]] == ["zend", "weird"]
+
+
+def test_workspace_status_reports_a_broken_http_response(monkeypatch):
+    import http.client
+
+    def boom():
+        raise http.client.IncompleteRead(b"")
+
+    monkeypatch.setattr(server, "_fetch_workspace_incidents", boom)
+    assert "could not read the status dashboard" in server.workspace_status()["error"]

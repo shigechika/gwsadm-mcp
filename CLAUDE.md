@@ -57,7 +57,9 @@ only; its `gmail.kind` distinguishes `ok` / `partial` / `api_disabled` (HTTP 403
 `accessNotConfigured`: the Gmail API is off in the key's own Cloud project,
 `GwsApiDisabledError`) / `no_grant` / `error`), and a `daily_brief`
 combining the Reports-based tools, to AI assistants via STDIO transport,
-built on the official `mcp` Python SDK's `MCPServer`. Read-only: the only
+built on the official `mcp` Python SDK's `MCPServer`. Read-only (the one
+request without a credential is `workspace_status`'s GET of
+`https://www.google.com/appsstatus/dashboard/incidents.json`): the only
 Admin SDK / Groups Settings / Gmail API methods called anywhere in this
 package are `activities().list` (Reports API), `customerUsageReports().get()`
 (Reports API, for `gmail_usage_report` -- same discovery document as

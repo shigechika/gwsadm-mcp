@@ -41,6 +41,7 @@ import concurrent.futures
 import datetime
 import email.utils
 import functools
+import http.client
 import inspect
 import ipaddress
 import json
@@ -2997,6 +2998,8 @@ def shared_drive_membership_changes(
 # account acted upon in the event's ``USER_EMAIL`` parameter.
 ADMIN_TARGET_PARAMETERS = ("USER_EMAIL", "GROUP_EMAIL")
 ADMIN_ACTIONS_MAX_HOURS = 24 * 180
+ADMIN_ACTIONS_MAX_PAGES = 20
+ADMIN_ACTIONS_MAX_EVENTS = 1000
 _ADMIN_EVENT_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,80}$")
 # A target is interpolated into a ``filters`` expression (an operator language:
 # ``,`` separates terms, ``==`` / ``<>`` compare), so it is held to a plain
@@ -3076,10 +3079,12 @@ def admin_actions(
         event: One admin event name in upper case, e.g. ``SUSPEND_USER``.
         domain: Configured domain to read (default: the target's suffix, or
             every configured domain).
-        max_pages: Reports page budget per probe (1000 events per page).
-        max_events: Rows listed per domain; the counts cover everything fetched.
+        max_pages: Reports page budget per probe (1000 events per page; 1..20).
+        max_events: Rows listed per domain (1..1000); the counts cover everything fetched.
     """
     hours = max(1, min(ADMIN_ACTIONS_MAX_HOURS, hours))
+    max_pages = max(1, min(ADMIN_ACTIONS_MAX_PAGES, max_pages))
+    max_events = max(1, min(ADMIN_ACTIONS_MAX_EVENTS, max_events))
     target = target.strip() if target is not None and target.strip() else None
     event = event.strip().upper() if event is not None and event.strip() else None
     head: dict = {"target": target, "event": event, "window_hours": hours}
@@ -3096,7 +3101,8 @@ def admin_actions(
     except (ConfigError, GwsError) as e:
         return {**head, "error": str(e)}
     start = _window(hours)
-    filters = [f"{param}=={target}" for param in ADMIN_TARGET_PARAMETERS] if target is not None else [None]
+    # Google stores these addresses lower-cased and the filter compares exactly.
+    filters = [f"{param}=={target.lower()}" for param in ADMIN_TARGET_PARAMETERS] if target is not None else [None]
     fetched = _fan_out(
         {
             (c.domain, f): functools.partial(
@@ -3179,33 +3185,60 @@ def _fetch_workspace_incidents() -> list:
     return data
 
 
+_INLINE_HEADING_RE = re.compile(r"^\*\*(summary|title)\s*:?\s*\*\*\s*:?\s*(.*)$", re.IGNORECASE)
+_HEADING_MAX_CHARS = 40
+
+
 def _heading(line: str) -> str | None:
-    """The lower-cased text of a Markdown heading line (``# x``, ``**x**``, ``**x:**``), else None."""
+    """The lower-cased text of a short Markdown heading line (``# x``, ``**x**``, ``**x:**``), else None.
+
+    A bold line longer than a heading (``**We are investigating an issue.**``) is text, not a heading.
+    """
     if line.startswith("#"):
-        return line.lstrip("#").strip().rstrip(":").strip().lower()
-    if line.startswith("**") and line.endswith("**") and len(line) > 4:
-        return line.strip("*").strip().rstrip(":").strip().lower()
-    return None
+        text = line.lstrip("#").strip()
+    elif line.startswith("**") and line.endswith("**") and len(line) > 4:
+        text = line.strip("*").strip()
+    else:
+        return None
+    text = text.rstrip(":").strip()
+    return text.lower() if len(text) <= _HEADING_MAX_CHARS else None
+
+
+def _plain(line: str) -> str:
+    return line.strip("*").strip()[:_ADMIN_VALUE_CHARS]
 
 
 def _incident_summary(text) -> str | None:
     """The first line under a Summary / Title heading of an update, else its first non-heading line.
 
     Google writes these headings several ways (``**Summary:**``, ``**Summary**``,
-    ``**summary**``, ``**Title**``, ``# Incident Report`` / ``## Summary``).
+    ``**summary**``, ``**Title**``, ``# Incident Report`` / ``## Summary``), sometimes
+    with the text on the same line (``**Summary:** x``, ``**Summary**: x``).
     """
     if not isinstance(text, str):
         return None
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for i, ln in enumerate(lines):
+        inline = _INLINE_HEADING_RE.match(ln)
+        if inline and inline.group(2).strip():
+            return _plain(inline.group(2))
         if _heading(ln) in ("summary", "title"):
             following = [x for x in lines[i + 1 :] if _heading(x) is None]
             if following:
-                return following[0][:_ADMIN_VALUE_CHARS]
-        if ln.lower().startswith("**summary:**") and len(ln) > len("**summary:**"):
-            return ln[len("**summary:**") :].strip()[:_ADMIN_VALUE_CHARS]
+                return _plain(following[0])
     plain = [ln for ln in lines if _heading(ln) is None]
-    return plain[0][:_ADMIN_VALUE_CHARS] if plain else None
+    return _plain(plain[0]) if plain else None
+
+
+def _feed_time(value) -> datetime.datetime | None:
+    """A feed timestamp as an aware datetime (``Z`` accepted on every supported Python), else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _incident_row(inc: dict) -> dict:
@@ -3254,31 +3287,36 @@ def workspace_status(hours: int = 72, service: str | None = None) -> dict:
         return {**head, "error": "service must be a product name such as Gmail"}
     try:
         incidents = _fetch_workspace_incidents()
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, http.client.HTTPException) as e:
         # urllib's messages name only the URL above and the HTTP status; nothing of this server's config.
         return {**head, "error": f"could not read the status dashboard ({type(e).__name__}: {e})"}
     since = _window(hours)
-    rows = [_incident_row(i) for i in incidents if isinstance(i, dict)]
+    epoch = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    open_rows: list[dict] = []
+    recent: list[tuple[datetime.datetime, dict]] = []
+    for inc in incidents:
+        if not isinstance(inc, dict):
+            continue
+        if inc.get("end"):
+            ended = _feed_time(inc.get("end"))
+            # An end time that cannot be read is kept (sorted last), not silently dropped.
+            if ended is not None and ended < since:
+                continue
+            recent.append((ended or epoch, _incident_row(inc)))
+        else:
+            open_rows.append(_incident_row(inc))
     if wanted is not None:
         needle = wanted.lower()
-        rows = [
-            r
-            for r in rows
-            if needle in (r["service"] or "").lower() or any(needle in p.lower() for p in r["affected_products"])
-        ]
-    open_rows = [r for r in rows if r["open"]]
-    recent = []
-    for r in rows:
-        if r["open"]:
-            continue
-        try:
-            ended = datetime.datetime.fromisoformat(r["end"])
-        except (TypeError, ValueError):
-            continue
-        if ended.tzinfo is not None and ended >= since:
-            recent.append(r)
-    recent.sort(key=lambda r: r["end"] or "", reverse=True)
-    return {**head, "open": open_rows, "recent": recent, "open_count": len(open_rows)}
+
+        def matches(r: dict) -> bool:
+            return needle in (r["service"] or "").lower() or any(needle in p.lower() for p in r["affected_products"])
+
+        open_rows = [r for r in open_rows if matches(r)]
+        recent = [(t, r) for t, r in recent if matches(r)]
+    open_rows.sort(key=lambda r: _feed_time(r["begin"]) or epoch, reverse=True)
+    recent.sort(key=lambda tr: tr[0], reverse=True)
+    recent_rows = [r for _, r in recent]
+    return {**head, "open": open_rows, "recent": recent_rows, "open_count": len(open_rows)}
 
 
 # What an account's owner (or whoever holds the session) changed about how the
