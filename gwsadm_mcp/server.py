@@ -3054,7 +3054,8 @@ def admin_actions(
     With ``target`` (a user or group address), the domain is taken from its
     suffix and two server-side filters run, ``USER_EMAIL==<target>`` and
     ``GROUP_EMAIL==<target>``; an event of a bulk activity that names some
-    other address is skipped and counted in ``sibling_events_skipped``.
+    other address is skipped and counted in ``sibling_events_skipped``, as
+    is a sibling of another name when ``event`` is given.
     Without it, every admin action of the window is read (each configured
     domain, or ``domain``). ``event`` narrows to one event name.
 
@@ -3127,7 +3128,11 @@ def admin_actions(
                 ident = it.get("id", {})
                 for ev in it.get("events", []):
                     p = event_parameters(ev)
-                    if param is not None and _scalar_lower(p.get(param)) != target.lower():
+                    # ``eventName`` and ``filters`` select whole activities; one activity
+                    # can carry sibling events of another name or about another address.
+                    if (event is not None and ev.get("name") != event) or (
+                        param is not None and _scalar_lower(p.get(param)) != target.lower()
+                    ):
                         skipped += 1
                         continue
                     key = (ident.get("time"), ident.get("uniqueQualifier"), ev.get("name"), repr(sorted(p.items())))

@@ -3833,6 +3833,14 @@ def test_admin_actions_tenant_wide_reads_every_domain_unfiltered(inject):
     assert result["event"] == "CHANGE_PASSWORD" and result["window_hours"] == 48
 
 
+def test_admin_actions_event_filter_drops_sibling_events_of_another_name(inject):
+    item = _admin_item("it@example.edu", "SUSPEND_USER", {"USER_EMAIL": "b@example.edu"})
+    item["events"].append({"name": "CHANGE_PASSWORD", "parameters": [{"name": "USER_EMAIL", "value": "b@example.edu"}]})
+    inject([FakeDomainClient("example.edu", {("admin", "SUSPEND_USER"): ([item], False)})], {"example.edu"})
+    dom = server.admin_actions(event="SUSPEND_USER")["domains"]["example.edu"]
+    assert dom["by_event"] == {"SUSPEND_USER": 1} and dom["sibling_events_skipped"] == 1
+
+
 def test_admin_actions_probe_error_and_auth_error_degrade_differently(inject):
     target = "alice@example.edu"
     c = FakeDomainClient(
