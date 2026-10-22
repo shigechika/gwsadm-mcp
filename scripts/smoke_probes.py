@@ -45,8 +45,9 @@ DOMAINS_NOT_EMPTY = r'"domains": \{"'
 #: run where every domain's credentials were rejected would otherwise return a
 #: full-looking answer and pass. Matched on the quoted key, so the accounting
 #: fields whose names end in "errors" (``event_errors``, ``fetch_errors``) do
-#: not trip it.
-NO_DOMAIN_ERROR = (r'"error":',)
+#: not trip it. A ``null`` value is no error: ``sites`` / ``geo`` status blocks
+#: carry ``"error": null`` when the table loaded.
+NO_DOMAIN_ERROR = (r'"error":(?!\s*null\b)',)
 
 #: Window and page bounds for the log-scanning tools. Small on purpose: one
 #: page over one day proves the fetch, the external/internal classification and
