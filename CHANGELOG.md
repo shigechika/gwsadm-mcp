@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.22.0...v0.22.1) (2026-10-22)
+
+
+### Bug Fixes
+
+* **smoke:** do not flag "error": null as a failed domain ([#102](https://github.com/shigechika/gwsadm-mcp/issues/102)) ([cd9171e](https://github.com/shigechika/gwsadm-mcp/commit/cd9171e232ebb1717bfc7927452c81d272e31ad6))
+
 ## [0.22.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.21.0...v0.22.0) (2026-10-22)
 
 
