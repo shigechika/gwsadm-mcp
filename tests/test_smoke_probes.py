@@ -11,6 +11,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 from gwsadm_mcp.server import mcp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -267,3 +269,18 @@ def test_no_tenant_specific_literals_in_specs():
         f"address-like literals in smoke_probes.py: {hits}. Discover such arguments "
         "at run time (args_factory) rather than hardcoding them."
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "flagged"),
+    [
+        ('{"sites": {"configured": true, "error": null}}', False),
+        ('{"error":null}', False),
+        ('{"domains": {"d": {"error": "boom"}}}', True),
+        ('{"error": {"code": 1}}', True),
+        ('{"error": nullable}', True),
+    ],
+)
+def test_no_domain_error_ignores_a_null_error_value(text, flagged):
+    """A status block's ``"error": null`` (sites / geo loaded fine) is not a failed domain."""
+    assert any(re.search(pattern, text) for pattern in smoke_probes.NO_DOMAIN_ERROR) is flagged
