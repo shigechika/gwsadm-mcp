@@ -14,6 +14,11 @@ API's own UTC-8:00/PST anchor -- requires the separate
 via `users().get`, on the same `admin.directory.user.readonly` scope
 `suspended_accounts` uses; a 404 answers `found: false`, never an error),
 `user_oauth_tokens` (one user's third-party OAuth app grants),
+`admin_actions` (Reports API `applicationName=admin`: what administrators did
+to one user or group via server-side `USER_EMAIL` / `GROUP_EMAIL` filters on the
+target's domain, or tenant-wide; same `admin.reports.audit.readonly` scope),
+`workspace_status` (Google's public Workspace status feed, no credential:
+open incidents and those ended within the window),
 `user_activity` (one account's activity merged across Reports API
 applications via `userKey=<username>`, newest first, with the posture-changing
 events — 2SV enrol/disable, recovery changes, password change, outbound
@@ -52,7 +57,9 @@ only; its `gmail.kind` distinguishes `ok` / `partial` / `api_disabled` (HTTP 403
 `accessNotConfigured`: the Gmail API is off in the key's own Cloud project,
 `GwsApiDisabledError`) / `no_grant` / `error`), and a `daily_brief`
 combining the Reports-based tools, to AI assistants via STDIO transport,
-built on the official `mcp` Python SDK's `MCPServer`. Read-only: the only
+built on the official `mcp` Python SDK's `MCPServer`. Read-only (the one
+request without a credential is `workspace_status`'s GET of
+`https://www.google.com/appsstatus/dashboard/incidents.json`): the only
 Admin SDK / Groups Settings / Gmail API methods called anywhere in this
 package are `activities().list` (Reports API), `customerUsageReports().get()`
 (Reports API, for `gmail_usage_report` -- same discovery document as
@@ -92,7 +99,8 @@ to guard against stdio newline regressions).
 
 - `gwsadm_mcp/server.py` — MCPServer server with `health_check`,
   `login_audit`, `gmail_usage_report`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
-  `user_activity`, `ip_activity`, `compromise_sweep`,
+  `user_activity`, `ip_activity`, `compromise_sweep`, `admin_actions`,
+  `workspace_status`,
   `drive_external_sharing`, `drive_doc_activity`,
   `shared_drive_membership_changes`, `gmail_message_trace`,
   `dmarc_rua_summary`, `group_delivery_policy`, `list_group_members`, `daily_brief`,

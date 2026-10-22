@@ -275,6 +275,19 @@ PROBES: dict[str, Probe] = {
         min_rows=1,
         must_match=(r'"status": "healthy"',),
     ),
+    "workspace_status": Probe(
+        args={"hours": WINDOW_HOURS},
+        require_keys=("source", "window_hours", "open", "recent", "open_count"),
+        # A quiet dashboard is the usual answer; an unreadable one is not.
+        must_not_match=NO_DOMAIN_ERROR,
+        allow_empty=True,
+    ),
+    "admin_actions": Probe(
+        args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES, "max_events": 5},
+        require_keys=("window_hours", "domains", "capped"),
+        must_match=(DOMAINS_NOT_EMPTY,),
+        must_not_match=NO_DOMAIN_ERROR,
+    ),
     # -- login / directory --------------------------------------------------
     "login_audit": Probe(
         args={"hours": WINDOW_HOURS, "include_failures": True, "top": 5},

@@ -29,7 +29,7 @@ degrading — one place, one pass, avoids the trap:
 
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
-| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `admin_actions`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user` | those two tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
 

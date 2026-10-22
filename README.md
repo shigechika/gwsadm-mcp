@@ -29,6 +29,8 @@ anything.
 | `drive_external_sharing` | Reports API `drive` — ACL **grants** to external addresses or domains (revocations reported separately) and visibility **transitions** into link/public exposure |
 | `drive_doc_activity` | Reports API `drive` with a server-side `doc_id` filter — **one document's** owner, ACL changes, and lifecycle events. Triage companion to `drive_external_sharing`: the owner (an individual vs. a shared drive's name) disambiguates the shared-drive false-positive class, where files created inside a shared drive propagate member ACLs and read as bulk external sharing |
 | `shared_drive_membership_changes` | Reports API `drive` (`shared_drive_membership_change`) — who added/removed/re-roled shared-drive members and when, with external classification of the affected member and a client-side drive-name filter |
+| `admin_actions` | Reports API `admin` — what administrators (people, or a sync or API client acting as one) did in the Admin console: to **one user or group** (server-side `USER_EMAIL` / `GROUP_EMAIL` filters on the target's domain) or tenant-wide. Answers "who suspended this account / reset its password / took it out of a group?", which `user_activity` cannot: an admin event's actor is the administrator, not the account acted upon |
+| `workspace_status` | Google Workspace Status Dashboard (public feed, no credential) — open incidents and those that ended within the window, optionally for one product (`Gmail`, `Drive`, ...). Answers "is it Google?" before a tenant-side investigation |
 | `gmail_message_trace` | Gmail API — did a **known** Message-ID reach **specific** mailboxes, and where (inbox/spam/trash/archived)? For each recipient it impersonates that user via DWD and searches their own mailbox. Requires the separate `gmail.readonly` DWD scope (see Auth model below); a domain missing that grant reports a per-recipient error, never a false "not found" |
 | `dmarc_rua_summary` | Gmail API — DMARC aggregate (RUA) report pass/fail summary and top reject-candidate source IPs, per domain. Impersonates the domain's configured `dmarc_rua_mailbox` (a real user; default `postmaster@<domain>`), searches it for mail addressed to `dmarc_rua_recipient` (the published `rua=` address, e.g. `postmaster+rua@`; default: the mailbox) and reads the compressed report attachments those messages carry. Shares `gmail_message_trace`'s `gmail.readonly` DWD scope, but unlike that tool this one DOES read attachment content (the report XML), not just metadata — see Auth model below |
 | `group_delivery_policy` | Groups Settings API — a Google Group's own posting/delivery policy (`who_can_post`, `allow_external_members`, moderation levels). A group's access control sits **in front of** Gmail delivery: a domain-only posting policy silently drops an external sender's mail before it generates any Gmail delivery event at all, indistinguishable from a delivery failure without reading the policy directly. Requires the separate `apps.groups.settings` DWD scope (see Auth model below) |
@@ -37,7 +39,7 @@ anything.
 | `daily_brief_start` / `daily_brief_result` | Same as `daily_brief`, run in the background: `start` returns a `job_id` immediately, then poll `result(job_id)` until `done`. Use on large tenants where the synchronous call risks the client's ~60s tool-call timeout |
 
 Planned: `dlp_events` (Reports `rules`; requires a Workspace edition with DLP),
-`token_events`, `admin_events`.
+`token_events`.
 
 ## Auth model
 
@@ -52,7 +54,7 @@ degrading — one place, one pass, avoids the trap:
 
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
-| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `user_activity`, `ip_activity`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `user_activity`, `ip_activity`, `admin_actions`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user` | those two tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
 
