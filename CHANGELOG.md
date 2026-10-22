@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.21.0...v0.22.0) (2026-10-22)
+
+
+### Features
+
+* admin_actions and workspace_status ([#100](https://github.com/shigechika/gwsadm-mcp/issues/100)) ([29ea19c](https://github.com/shigechika/gwsadm-mcp/commit/29ea19c5fdbe60151516b601e6bda6d56c259c36))
+
 ## [0.21.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.20.0...v0.21.0) (2026-10-17)
 
 
