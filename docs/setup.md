@@ -30,7 +30,7 @@ degrading — one place, one pass, avoids the trap:
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `admin_actions`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
-| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user` | those two tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user`, `sign_out_user` (opt-in; its account check) | those tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens`, `sign_out_user` (opt-in) | those tools degrade to a per-domain error; everything else keeps working |
 
 `health_check` needs no scope at all to respond: it is the tool to call when
@@ -135,9 +135,11 @@ Flagged rows come first, newest first. `health_check` reports both under
 
 Unset, the server has no write tool. With `GWSADM_ENABLE_SIGN_OUT=1` (exactly
 `1`) it also registers `sign_out_user`, which signs one account out of every
-Google session (Directory API `users().signOut`). It uses the
-`admin.directory.user.security` scope `user_oauth_tokens` already needs, and the
-impersonated admin must hold a role that may manage user security. Set the flag
+Google session (Directory API `users().signOut`). It needs two grants: the
+`admin.directory.user.readonly` scope for the account check it makes first
+(the one `get_user` uses) and the `admin.directory.user.security` scope for the
+sign-out itself (the one `user_oauth_tokens` uses); the impersonated admin must
+also hold a role that may manage user security. Set the flag
 only on a deployment that asks a person to approve each call — a chat bot with
 an approval button, say — and leave it unset on anything shared more widely,
 such as an MCP gateway.

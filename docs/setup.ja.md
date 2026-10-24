@@ -30,7 +30,7 @@ uv sync          # または: pip install -e .
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`admin_actions`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
-| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`、`get_user` | その2つのツールだけエラーに縮退（`suspended_accounts` はドメイン単位）。他は動作を続ける |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`、`get_user`、`sign_out_user`（オプトイン。事前のアカウント確認） | それらのツールだけエラーに縮退（`suspended_accounts` はドメイン単位）。他は動作を続ける |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens`・`sign_out_user`（オプトイン） | それらのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
 `health_check` はスコープが一切無くても応答する。グラント漏れが疑われる
@@ -127,8 +127,9 @@ ipv6 = 2001:db8:1::/48
 
 未設定のとき、このサーバーに書き込みツールは無い。`GWSADM_ENABLE_SIGN_OUT=1`（`1` のときだけ）で
 起動すると `sign_out_user` も登録され、1 アカウントを Google の全セッションからサインアウトさせる
-（Directory API `users().signOut`）。スコープは `user_oauth_tokens` が既に使う
-`admin.directory.user.security` で、なりすます管理者にはユーザーのセキュリティを管理できるロールが要る。
+（Directory API `users().signOut`）。付与は 2 つ要る: 先に行うアカウント確認に `admin.directory.user.readonly`
+（`get_user` と同じ）、サインアウト自体に `admin.directory.user.security`（`user_oauth_tokens` と同じ）。
+なりすます管理者にはユーザーのセキュリティを管理できるロールも要る。
 このフラグは、呼び出しごとに人が承認する配備（承認ボタンのあるチャットボットなど）にだけ設定し、
 MCP ゲートウェイのように広く共有するものには設定しないこと。
 

@@ -59,7 +59,14 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 
 from gwsadm_mcp import __version__, geo, sites
-from gwsadm_mcp.client import DomainClient, GwsApiDisabledError, GwsAuthError, GwsError, event_parameters
+from gwsadm_mcp.client import (
+    SCOPE_DIRECTORY,
+    DomainClient,
+    GwsApiDisabledError,
+    GwsAuthError,
+    GwsError,
+    event_parameters,
+)
 from gwsadm_mcp.config import ConfigError, config_path, is_external, load_config
 
 
@@ -3795,10 +3802,12 @@ def sign_out_user(username: str, domain: str | None = None) -> dict:
     call. Refuses anything but one exact address in a configured domain, and an
     address that names no account (checked with ``users().get`` first).
 
-    Requires the ``admin.directory.user.security`` DWD scope — the one
-    ``user_oauth_tokens`` already uses — and an impersonated admin allowed to
-    manage user security; a refusal comes back as ``{"error": ...}`` with
-    ``signed_out: false``.
+    Requires TWO DWD scopes: ``admin.directory.user.readonly`` for the account
+    check made first (``users().get``, as ``get_user``) and
+    ``admin.directory.user.security`` for the sign-out itself (as
+    ``user_oauth_tokens``), plus an impersonated admin allowed to manage user
+    security. A refusal comes back as ``{"error": ...}`` with ``signed_out:
+    false``; the message says which step and which scope failed.
 
     Args:
         username: Exact user email (primary or alias). The sign-out is issued
@@ -3825,7 +3834,10 @@ def sign_out_user(username: str, domain: str | None = None) -> dict:
     try:
         user = c.get_user(username)
     except (GwsAuthError, GwsError) as e:
-        return {"domain": c.domain, "username": username, "signed_out": False, "error": str(e)}
+        msg = f"account check (users.get) failed, nothing was signed out: {e}"
+        if isinstance(e, GwsAuthError) or "HTTP 403" in str(e):
+            msg += f" (this step needs the {SCOPE_DIRECTORY} DWD scope)"
+        return {"domain": c.domain, "username": username, "signed_out": False, "error": msg}
     if user is None:
         return {"domain": c.domain, "username": username, "found": False, "signed_out": False}
     entry = _user_entry(user)

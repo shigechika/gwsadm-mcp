@@ -79,8 +79,9 @@ DMARC report's data lives in its attachment), the Gmail settings reads
 `messages().list` / `messages().get` (`format="metadata"`, To/Cc/Bcc/Date
 headers only) for `compromise_sweep`, and `users().getProfile()` for the
 `health_check` Gmail probe — all read-only. The one exception is
-`users().signOut()` (Directory API, `admin.directory.user.security` scope),
-issued only by `sign_out_user`, a state-changing tool registered only when
+`users().signOut()` (Directory API, `admin.directory.user.security` scope;
+the tool's preflight `users().get` additionally needs
+`admin.directory.user.readonly`), issued only by `sign_out_user`, a state-changing tool registered only when
 `GWSADM_ENABLE_SIGN_OUT` is exactly `1` (the flag is re-checked inside the
 tool). It is never on by default: a deployment that sets the flag owns the
 approval step in front of each call. Keep it the only mutating call.

@@ -4070,3 +4070,21 @@ def test_sign_out_user_reports_a_refused_sign_out(inject, monkeypatch):
     out = server.sign_out_user("user@example.edu")
     assert out["signed_out"] is False and "HTTP 403" in out["error"]
     assert out["before"]["suspended"] is True
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        GwsAuthError("[example.edu] auth failed: unauthorized_client"),
+        GwsError("[example.edu] directory API error (users.get): HTTP 403"),
+    ],
+)
+def test_sign_out_user_preflight_failure_names_the_readonly_scope(inject, monkeypatch, err):
+    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+    c = FakeDomainClient("example.edu", {}, user=err)
+    inject([c], {"example.edu"})
+    out = server.sign_out_user("user@example.edu")
+    assert out["signed_out"] is False
+    assert "users.get" in out["error"] and "admin.directory.user.readonly" in out["error"]
+    assert "admin.directory.user.security" not in out["error"]
+    assert c.sign_out_calls == []
