@@ -31,7 +31,7 @@ degrading — one place, one pass, avoids the trap:
 |-------|-----------|------------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `admin_actions`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user` | those two tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
-| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens`, `sign_out_user` (opt-in) | those tools degrade to a per-domain error; everything else keeps working |
 
 `health_check` needs no scope at all to respond: it is the tool to call when
 a grant might be missing — it probes each domain and reports the failing
@@ -130,6 +130,17 @@ Flagged rows come first, newest first. `health_check` reports both under
 `sites` and `geo`; it reads the dataset's first line, so an unreadable file is an
 `error` there, and a dataset older than 30 days or a missing
 `GWSADM_HOME_COUNTRIES` is a `warning`.
+
+### Opt-in sign-out (`GWSADM_ENABLE_SIGN_OUT`)
+
+Unset, the server has no write tool. With `GWSADM_ENABLE_SIGN_OUT=1` (exactly
+`1`) it also registers `sign_out_user`, which signs one account out of every
+Google session (Directory API `users().signOut`). It uses the
+`admin.directory.user.security` scope `user_oauth_tokens` already needs, and the
+impersonated admin must hold a role that may manage user security. Set the flag
+only on a deployment that asks a person to approve each call — a chat bot with
+an approval button, say — and leave it unset on anything shared more widely,
+such as an MCP gateway.
 
 ## Verify before wiring it into anything
 

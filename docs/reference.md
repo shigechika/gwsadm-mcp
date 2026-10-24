@@ -10,6 +10,7 @@
 | `suspended_accounts` | Directory API — current snapshot of **suspended** accounts (`isSuspended=true`); cross-reference against a downstream IdP (e.g. KeyCloak) to find suspended-but-still-enabled accounts |
 | `get_user` | Directory API `users().get` — **one named account's** current state: `suspended` (with reason and time), `archived`, `last_login`, 2SV enrolled/enforced, org unit, creation time, pending password change. The "why can't this person sign in" lookup: one request, no pagination, for an address you already know — unlike `suspended_accounts`, which lists only accounts that ARE suspended, so it can never confirm that a given address is *not* suspended. Needs no scope beyond the one `suspended_accounts` already uses |
 | `user_oauth_tokens` | Directory API `tokens().list` — third-party OAuth app grants for **one user**; a compromise vector `login_audit` is blind to, since a previously-granted token needs no fresh login. Domain resolved from the username's suffix, with an optional `domain` override for alias/secondary-domain addresses |
+| `sign_out_user` | **State-changing, opt-in.** Directory API `users().signOut` — signs **one** account out of every web and device session and resets its sign-in cookies, after confirming the account exists with `users().get`. Registered only when the server starts with `GWSADM_ENABLE_SIGN_OUT=1`; put an approval step in front of it. Does not revoke OAuth grants or app passwords, remove an enrolled second factor or change the password (listed in its `not_covered`). Same `admin.directory.user.security` scope as `user_oauth_tokens`, and the impersonated admin must be allowed to manage user security |
 | `user_activity` | Reports API `activities().list` with `userKey=<username>` — everything **one account** did in a window, merged across applications (login, token, user_accounts, drive, groups, calendar, chat, meet, saml by default) newest first. `flags` surfaces the events that change the account's security posture regardless of volume — 2SV enrolled/disabled, recovery email/phone changed, password changed, outbound forwarding, Google's `risky_sensitive_action_*` / `suspicious_login` verdicts, every OAuth `authorize` with client and scopes — because a second factor the attacker enrolled survives a password reset; `ips` lists the distinct source addresses with first/last seen. Google's own `account_disabled_*` / `suspicious_login` verdicts are not served under the account's `userKey` (their actor is Google), so they are fetched the way `login_audit` does and reported under the synthetic application `login_verdicts`. The post-compromise question `login_audit` cannot answer: it sees only the events Google itself raised, domain-wide |
 | `ip_activity` | Reports API `activities().list` with `actorIpAddress=<ip>` — every account **one source address** acted as, per domain and application, with the same `flags`. The follow-through after `user_activity` names an attacker's address: did the same source reach other accounts? A spray shows up as `login_failure` counts before it ever succeeds |
 | `compromise_sweep` | The Google-side follow-through after **one account** is confirmed compromised, in one call: `activity` (`user_activity`, flags first), `state` / `grants` (`get_user`; OAuth grants with mail / Drive / contacts / admin scopes called out as `risky`), `ips` (`ip_activity` across every domain for the attacker's addresses — given, or taken from the account's own flags — with the account itself excluded), and `gmail`: the settings an attacker leaves behind to keep reading mail (auto-forwarding, forwarding addresses, filters that forward / delete / archive, delegates, send-as and reply-to) plus what the mailbox sent in the window as counts and recipient domains — never a subject or body. `gmail.kind` says whether it could be read at all: `ok` / `partial` (one settings section or the sent summary failed; the rest stands) / `api_disabled` (the Gmail API is off in the service account's own Cloud project) / `no_grant` / `error` — a failure is reported, never read as "nothing found". `highlights` lists the facts to act on, `checklist` what remains to do by hand. Shares `gmail_message_trace`'s `gmail.readonly` DWD scope (every settings read, `delegates.list` included, is served by it — verified live) |
@@ -37,7 +38,7 @@ front:
 |-------|-----------|------------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `user_activity`, `ip_activity`, `admin_actions`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user` | those two tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
-| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens`, `sign_out_user` (opt-in) | those tools degrade to a per-domain error; everything else keeps working |
 
 Five more scopes, each granted separately — none bundled with each other or
 with the base pass:
@@ -64,8 +65,11 @@ The only Google API calls issued anywhere in this package: `activities().list()`
 (Reports API); `users().list()`, `users().get()`, `tokens().list()`,
 `groups().get()`, `members().list()` (Directory API); `groups().get()`
 (Groups Settings API); `messages().list()`, `messages().get()` (Gmail API,
-metadata only). No insert, update, patch, or delete call exists anywhere in
-the client — `write_tools` is empty by construction, not by convention.
+metadata only). The one state-changing call is `users().signOut()`
+(Directory API), behind `sign_out_user`, which is registered only when the
+server starts with `GWSADM_ENABLE_SIGN_OUT=1`; without that flag the server
+exposes no write tool at all. No insert, update, patch, or delete call exists
+anywhere in the client.
 
 ## CLI
 

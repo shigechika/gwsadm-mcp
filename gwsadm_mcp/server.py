@@ -1,4 +1,4 @@
-"""gwsadm-mcp MCP server — Google Workspace security audit (read-only).
+"""gwsadm-mcp MCP server — Google Workspace security audit (read-only except one opt-in tool).
 
 Phase 1 tools:
 
@@ -28,6 +28,8 @@ Phase 1 tools:
 - ``daily_brief``             — one-call summary of the Reports-based tools
   (``login_audit`` + ``drive_external_sharing``) across all configured domains;
   ``suspended_accounts`` is separate (different API/scope) and not included
+- ``sign_out_user``           — STATE-CHANGING, opt-in: signs one account out of every session
+  (Directory API ``users().signOut``); registered only when ``GWSADM_ENABLE_SIGN_OUT=1``
 
 Coverage contract: every result section carries a ``capped`` boolean when its
 window was not fully scanned, so partial coverage is never mistaken for
@@ -821,8 +823,8 @@ def get_user(username: str, domain: str | None = None) -> dict:
     ``found: false`` as "the lookup did not work", and never read an ``error``
     as evidence about whether the account exists.
 
-    Read-only (Directory API ``users().get``; no mutating method exists in
-    this package). Requires the ``admin.directory.user.readonly`` DWD scope —
+    Read-only (Directory API ``users().get``; this tool never changes the
+    account). Requires the ``admin.directory.user.readonly`` DWD scope —
     the same one ``suspended_accounts`` uses, so a tenant already running that
     tool needs no additional grant.
 
@@ -3753,3 +3755,94 @@ async def timeout_probe(seconds: int = 90, emit_progress: bool = True, ctx: Cont
 
 if os.environ.get("GWSADM_ENABLE_TIMEOUT_PROBE"):
     mcp.tool()(timeout_probe)
+
+
+# --- the one state-changing tool: opt-in session sign-out -------------------
+# Registered only when GWSADM_ENABLE_SIGN_OUT is exactly "1", so a deployment
+# that does not set it (an MCP gateway shared by many people, say) never lists
+# it. A deployment that does set it is expected to put its own approval step in
+# front of every call; the tool itself only checks the flag and the input.
+_SIGN_OUT_ENV = "GWSADM_ENABLE_SIGN_OUT"
+# One exact mailbox address: no wildcard, list or query syntax can reach
+# userKey. The final label allows digits and hyphens for punycode TLDs.
+_EXACT_ADDRESS_RE = re.compile(r"^[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z0-9-]{2,}$")
+SIGN_OUT_NOT_COVERED = (
+    "OAuth grants stay valid: revoke them separately (see user_oauth_tokens)",
+    "app passwords stay valid",
+    "a second factor or passkey an attacker enrolled stays enrolled",
+    "the password is unchanged: reset it at the identity provider or in the Admin console",
+)
+
+
+def _sign_out_enabled() -> bool:
+    return os.environ.get(_SIGN_OUT_ENV) == "1"
+
+
+def sign_out_user(username: str, domain: str | None = None) -> dict:
+    """Sign ONE account out of every Google web and device session (STATE-CHANGING).
+
+    The response to a confirmed account takeover: ends the attacker's existing
+    Google sessions and resets the account's sign-in cookies (Directory API
+    ``users().signOut``), so a session opened before the password reset or
+    suspension cannot keep going. The owner must sign in again too.
+
+    Not a full remediation — the answer's ``not_covered`` lists what stays in
+    place (OAuth grants, app passwords, an enrolled second factor, the
+    password). Run ``compromise_sweep`` before and after to see what is left.
+
+    Exists only when the server was started with ``GWSADM_ENABLE_SIGN_OUT=1``;
+    whoever enables it is expected to put an approval step in front of each
+    call. Refuses anything but one exact address in a configured domain, and an
+    address that names no account (checked with ``users().get`` first).
+
+    Requires the ``admin.directory.user.security`` DWD scope — the one
+    ``user_oauth_tokens`` already uses — and an impersonated admin allowed to
+    manage user security; a refusal comes back as ``{"error": ...}`` with
+    ``signed_out: false``.
+
+    Args:
+        username: Exact user email (primary or alias). The sign-out is issued
+            for the account's canonical primary address, returned as ``user``.
+        domain: Configured ``[domain.*]`` section to route the call through.
+            Default: resolved from the username's suffix.
+    """
+    username = (username or "").strip()
+    if not _sign_out_enabled():
+        return {
+            "username": username,
+            "signed_out": False,
+            "error": f"sign_out_user is disabled on this server ({_SIGN_OUT_ENV} is not 1)",
+        }
+    if not _EXACT_ADDRESS_RE.match(username):
+        return {"username": username, "signed_out": False, "error": f"'{username}' is not one exact email address"}
+    try:
+        suffix = _domain_of(username)
+        clients, _ = _clients()
+        picked = _select(clients, domain if domain is not None else suffix)
+    except (ConfigError, GwsError) as e:
+        return {"username": username, "signed_out": False, "error": str(e)}
+    c = picked[0]
+    try:
+        user = c.get_user(username)
+    except (GwsAuthError, GwsError) as e:
+        return {"domain": c.domain, "username": username, "signed_out": False, "error": str(e)}
+    if user is None:
+        return {"domain": c.domain, "username": username, "found": False, "signed_out": False}
+    entry = _user_entry(user)
+    primary = entry.get("email") or username
+    before = {k: entry.get(k) for k in ("suspended", "is_enrolled_in_2sv", "last_login")}
+    base = {"domain": c.domain, "username": username, "user": primary, "found": True, "before": before}
+    try:
+        c.sign_out_user(primary)
+    except (GwsAuthError, GwsError) as e:
+        return {**base, "signed_out": False, "error": str(e)}
+    return {
+        **base,
+        "signed_out": True,
+        "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "not_covered": list(SIGN_OUT_NOT_COVERED),
+    }
+
+
+if _sign_out_enabled():
+    mcp.tool()(sign_out_user)

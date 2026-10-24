@@ -1,4 +1,4 @@
-"""Read-only Google Workspace Admin API client (service account + DWD).
+"""Google Workspace Admin API client (service account + DWD), read-only except one opt-in call.
 
 One ``DomainClient`` per audited domain. Auth is a service account with
 domain-wide delegation impersonating an audit-capable admin (``subject``) —
@@ -13,7 +13,10 @@ account's state), ``tokens().list`` (Directory API, for per-user OAuth app
 grants), ``messages().list`` / ``messages().get`` (Gmail API, for
 message-trace), ``groups().get`` (Groups Settings API, for a group's own
 posting policy), and ``groups().get`` / ``members().list`` (Directory API,
-for a group's roster) are issued; no mutating call exists in this package.
+for a group's roster) are issued. The one exception is ``users().signOut``
+(:meth:`DomainClient.sign_out_user`), reached only through the opt-in
+``sign_out_user`` tool, which is not registered unless
+``GWSADM_ENABLE_SIGN_OUT=1``.
 
 Gmail access is architecturally different from the other services: it
 impersonates whichever RECIPIENT is being investigated -- a different
@@ -992,6 +995,44 @@ class DomainClient:
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (tokens.list): {type(e).__name__}") from e
         return resp.get("items", [])
+
+    def sign_out_user(self, user_key: str) -> None:
+        """Sign one user out of every web and device session (Directory API ``users().signOut``).
+
+        The ONLY state-changing call in this package, reached only through the
+        opt-in ``sign_out_user`` tool. Google ends the account's sessions and
+        resets its sign-in cookies; it does not revoke OAuth tokens or app
+        passwords, remove a second factor, or change the password.
+
+        Same ``admin.directory.user.security`` DWD scope (and the same
+        lazily-built ``_directory_security_service()``) as
+        ``list_user_oauth_tokens`` -- no new grant. The impersonated
+        ``cfg.subject`` additionally needs an admin role that may manage user
+        security; without it Google answers HTTP 403, reported as a
+        ``GwsAuthError`` naming both requirements rather than a bare status.
+        ``_execute`` retries 429/5xx: signing out twice is harmless.
+        """
+        try:
+            svc = self._directory_security_service()
+            http = self._new_http(self._directory_security_creds)
+            self._execute(lambda: svc.users().signOut(userKey=user_key), http)
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
+            if str(status) == "403":
+                raise GwsAuthError(
+                    f"[{self.domain}] users.signOut refused (HTTP 403): needs the {SCOPE_DIRECTORY_SECURITY} "
+                    "DWD scope and an impersonated admin allowed to manage user security"
+                ) from e
+            raise GwsError(f"[{self.domain}] directory API error (users.signOut): HTTP {status}") from e
+        except GoogleAuthError as e:
+            # Same deliberate keep-the-message call as get_user: the token
+            # endpoint's text names the missing grant, and a key-file failure was
+            # already reduced to its exception type in the service builder.
+            raise GwsAuthError(
+                f"[{self.domain}] auth failed: {e} (users.signOut needs the {SCOPE_DIRECTORY_SECURITY} DWD scope)"
+            ) from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (users.signOut): {type(e).__name__}") from e
 
     def find_message_by_id(self, user_email: str, message_id: str) -> dict | None:
         """Search one user's Gmail mailbox for an RFC 822 Message-ID.

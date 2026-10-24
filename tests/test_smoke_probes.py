@@ -57,10 +57,15 @@ IDENTIFIER_ARGS = {"username", "domain", "doc_id", "drive_name", "ip", "ips"}
 BOUNDING_ARGS = {"hours", "days", "max_pages", "max_events", "max_sent", "samples", "top"}
 
 #: Tools that change anything in the tenant. The smoke test must never call
-#: these. Empty today: every tool in this server reads. ``daily_brief_start``
-#: creates a job inside this process, which expires on its own and touches
-#: nothing in Workspace, so it is exercised rather than skipped.
-STATE_CHANGING: set[str] = set()
+#: these. ``daily_brief_start`` creates a job inside this process, which
+#: expires on its own and touches nothing in Workspace, so it is exercised
+#: rather than skipped.
+STATE_CHANGING: set[str] = {"sign_out_user"}
+
+#: Tools registered only when an environment flag is set. Their probe specs
+#: exist for the deployments that set the flag, so they are not "stale" when
+#: the registry read here (flag unset) lacks them.
+OPT_IN_TOOLS: set[str] = {"sign_out_user"}
 
 
 def _registered_tool_names() -> set[str]:
@@ -94,13 +99,13 @@ def test_every_registered_tool_has_a_probe():
 
 def test_no_probe_targets_a_removed_tool():
     registered = _registered_tool_names()
-    stale = sorted(set(smoke_probes.PROBES) - registered)
+    stale = sorted(set(smoke_probes.PROBES) - registered - OPT_IN_TOOLS)
     assert not stale, f"Probe spec(s) for tools that are no longer registered: {stale}"
 
 
 def test_state_changing_tools_are_skipped():
     """A smoke test that changes what it is measuring is worse than none."""
-    registered = _registered_tool_names()
+    registered = _registered_tool_names() | OPT_IN_TOOLS
     for name in sorted(STATE_CHANGING & registered):
         probe = smoke_probes.PROBES[name]
         assert probe.skip, f"{name} changes state and must be skipped, not exercised"

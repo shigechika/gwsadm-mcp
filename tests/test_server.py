@@ -80,6 +80,8 @@ class FakeDomainClient:
         self.scoped_calls = []
         self.user_calls = []
         self.token_calls = []
+        self.sign_out_calls = []
+        self.sign_out_error = None
         self.gmail_calls = []
         self.group_settings_calls = []
         self.group_meta_calls = []
@@ -132,6 +134,11 @@ class FakeDomainClient:
         if isinstance(self._user, Exception):
             raise self._user
         return self._user  # a dict (found) or None (no such account)
+
+    def sign_out_user(self, user_key):
+        self.sign_out_calls.append(user_key)
+        if self.sign_out_error is not None:
+            raise self.sign_out_error
 
     def list_user_oauth_tokens(self, user_key):
         self.token_calls.append(user_key)
@@ -3966,3 +3973,100 @@ def test_workspace_status_reports_a_broken_http_response(monkeypatch):
 
     monkeypatch.setattr(server, "_fetch_workspace_incidents", boom)
     assert "could not read the status dashboard" in server.workspace_status()["error"]
+
+
+# --- sign_out_user (opt-in, state-changing) ----------------------------------
+
+
+def _tool_names_with_env(env_value):
+    """Tool names of a fresh interpreter importing the server under ``env_value``.
+
+    A subprocess, not importlib.reload: the flag is read at import time, and a
+    reload would swap the module every other test in this file holds.
+    """
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "GWSADM_ENABLE_SIGN_OUT"}
+    if env_value is not None:
+        env["GWSADM_ENABLE_SIGN_OUT"] = env_value
+    code = (
+        "import asyncio\n"
+        "from gwsadm_mcp.server import mcp\n"
+        "print(' '.join(sorted(t.name for t in asyncio.run(mcp.list_tools()))))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+    return set(out.stdout.split())
+
+
+def test_sign_out_user_is_not_registered_without_the_flag():
+    assert "sign_out_user" not in _tool_names_with_env(None)
+    # Only the exact value "1" enables it.
+    assert "sign_out_user" not in _tool_names_with_env("true")
+
+
+def test_sign_out_user_is_registered_with_the_flag():
+    names = _tool_names_with_env("1")
+    assert "sign_out_user" in names
+    assert "get_user" in names
+
+
+def test_sign_out_user_rechecks_the_flag_inside(inject, monkeypatch):
+    monkeypatch.delenv("GWSADM_ENABLE_SIGN_OUT", raising=False)
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    out = server.sign_out_user("user@example.edu")
+    assert out["signed_out"] is False and "disabled" in out["error"]
+    assert c.sign_out_calls == [] and c.user_calls == []
+
+
+def test_sign_out_user_signs_out_the_primary_address(inject, monkeypatch):
+    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    out = server.sign_out_user(" user@example.edu ")
+    assert out["signed_out"] is True and out["found"] is True
+    assert out["user"] == "user@example.edu" and out["domain"] == "example.edu"
+    assert out["before"] == {"suspended": True, "is_enrolled_in_2sv": False, "last_login": "2026-05-30T01:02:03.000Z"}
+    assert out["at"].endswith("Z")
+    assert any("OAuth" in x for x in out["not_covered"])
+    assert c.user_calls == ["user@example.edu"] and c.sign_out_calls == ["user@example.edu"]
+
+
+@pytest.mark.parametrize("bad", ["*@example.edu", "user@example.edu,other@example.edu", "user", "a b@example.edu", ""])
+def test_sign_out_user_refuses_anything_but_one_exact_address(inject, monkeypatch, bad):
+    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    out = server.sign_out_user(bad)
+    assert out["signed_out"] is False and "error" in out
+    assert c.sign_out_calls == []
+
+
+def test_sign_out_user_refuses_an_unconfigured_domain(inject, monkeypatch):
+    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    out = server.sign_out_user("user@elsewhere.example")
+    assert out["signed_out"] is False and "unknown domain" in out["error"]
+    assert c.sign_out_calls == []
+
+
+def test_sign_out_user_refuses_an_account_that_does_not_exist(inject, monkeypatch):
+    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+    c = FakeDomainClient("example.edu", {}, user=None)
+    inject([c], {"example.edu"})
+    out = server.sign_out_user("ghost@example.edu")
+    assert out == {"domain": "example.edu", "username": "ghost@example.edu", "found": False, "signed_out": False}
+    assert c.sign_out_calls == []
+
+
+def test_sign_out_user_reports_a_refused_sign_out(inject, monkeypatch):
+    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    c.sign_out_error = GwsAuthError("[example.edu] users.signOut refused (HTTP 403): needs the scope")
+    inject([c], {"example.edu"})
+    out = server.sign_out_user("user@example.edu")
+    assert out["signed_out"] is False and "HTTP 403" in out["error"]
+    assert out["before"]["suspended"] is True

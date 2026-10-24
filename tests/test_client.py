@@ -275,12 +275,27 @@ class FakeTokens:
         return _Req(self.resp)
 
 
+class FakeSecurityUsers:
+    def __init__(self, exc=None):
+        self.exc, self.calls = exc, []
+
+    def signOut(self, **kw):
+        self.calls.append(kw)
+        if self.exc:
+            return _Req(None, self.exc)
+        return _Req(None)
+
+
 class FakeDirectorySecurity:
-    def __init__(self, resp, exc=None):
+    def __init__(self, resp, exc=None, sign_out_exc=None):
         self._t = FakeTokens(resp, exc)
+        self._u = FakeSecurityUsers(sign_out_exc)
 
     def tokens(self):
         return self._t
+
+    def users(self):
+        return self._u
 
 
 def _sec_client(resp, exc=None):
@@ -298,6 +313,42 @@ def test_list_user_oauth_tokens_returns_items_and_passes_user_key():
 def test_list_user_oauth_tokens_empty_items():
     c, _ = _sec_client({})
     assert c.list_user_oauth_tokens("user@example.edu") == []
+
+
+def _sign_out_client(exc=None):
+    svc = FakeDirectorySecurity({}, sign_out_exc=exc)
+    return DomainClient(CFG, directory_security_service=svc), svc._u
+
+
+def test_sign_out_user_calls_sign_out_on_the_security_service():
+    c, u = _sign_out_client()
+    assert c.sign_out_user("user@example.edu") is None
+    assert u.calls == [{"userKey": "user@example.edu"}]
+
+
+def test_sign_out_user_403_names_the_scope_and_the_admin_privilege():
+    err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
+    c, _ = _sign_out_client(err)
+    with pytest.raises(client.GwsAuthError, match="admin.directory.user.security") as e:
+        c.sign_out_user("user@example.edu")
+    assert "manage user security" in str(e.value)
+
+
+def test_sign_out_user_other_http_error_is_gws_error_not_auth():
+    err = HttpError(httplib2.Response({"status": "400", "reason": "bad"}), b"{}")
+    c, _ = _sign_out_client(err)
+    with pytest.raises(GwsError) as e:
+        c.sign_out_user("user@example.edu")
+    assert not isinstance(e.value, client.GwsAuthError)
+    assert "HTTP 400" in str(e.value)
+
+
+def test_sign_out_user_auth_refresh_failure_is_auth_error():
+    from google.auth.exceptions import RefreshError
+
+    c, _ = _sign_out_client(RefreshError("unauthorized_client"))
+    with pytest.raises(client.GwsAuthError, match="admin.directory.user.security"):
+        c.sign_out_user("user@example.edu")
 
 
 def test_list_user_oauth_tokens_http_error_maps_to_gws_error():

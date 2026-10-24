@@ -9,6 +9,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 管理コンソールの視点にちなんで `gwsadm`（= Google Workspace admin）と命名。
 [`boxadm-mcp`](https://github.com/shigechika/boxadm-mcp) の姉妹サーバ。
 汎用的な Workspace MCP では**ない**： リスクを可視化するだけで、何も変更しない。
+例外はオプトインの `sign_out_user` だけで、サーバーを `GWSADM_ENABLE_SIGN_OUT=1` で起動したときにしか存在しない。
 
 ## 機能
 
@@ -20,6 +21,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `suspended_accounts` | Directory API — **停止中**アカウントの現在スナップショット（`isSuspended=true`）。下流 IdP（KeyCloak 等）と突合し、停止済みなのに IdP 側で有効なままのアカウントを洗い出す |
 | `get_user` | Directory API `users().get` — **アドレスを指定した1アカウント**の現在の状態： `suspended`（理由・停止日時付き）、`archived`、`last_login`、2段階認証の登録/強制、組織部門、作成日時、次回ログイン時のパスワード変更要求。「なぜこの人はログインできないのか」に1リクエスト・ページングなしで答える。アドレスが既に分かっているときは `suspended_accounts` ではなくこちらを使う： あちらは停止中のアカウントだけを列挙するので、指定アドレスが停止**されていない**ことは確認できない（さらにその一覧がページ上限を超えると、載っていないこと自体が根拠にならなくなる）。`suspended_accounts` が既に使っているスコープ以外は不要 |
 | `user_oauth_tokens` | Directory API `tokens().list` — **特定ユーザー1名**の第三者OAuthアプリ連携一覧。既存トークンはログイン不要で使えるため `login_audit` では検知できない侵害経路。ドメインはユーザー名のサフィックスから解決（エイリアス/セカンダリドメインのアドレス用に `domain` で明示指定も可） |
+| `sign_out_user` | **状態を変える・オプトイン。** Directory API `users().signOut` — **1アカウント**を全てのウェブ・端末のセッションからサインアウトさせ、ログイン Cookie をリセットする（先に `users().get` でアカウントの存在を確かめる）。サーバーを `GWSADM_ENABLE_SIGN_OUT=1` で起動したときだけ登録される。呼ぶ前に承認の段を置くこと。OAuth 付与・アプリパスワードの取り消し、登録済みの第2要素の削除、パスワードの変更はしない（`not_covered` に列挙）。`user_oauth_tokens` と同じ `admin.directory.user.security` スコープで、なりすます管理者にユーザーのセキュリティ管理の権限が必要 |
 | `user_activity` | Reports API `activities().list` を `userKey=<username>` で — **特定アカウント1名**がウィンドウ内に Workspace 全体で行ったことを、アプリ横断（既定: login・token・user_accounts・drive・groups・calendar・chat・meet・saml）で新しい順にまとめる。`flags` は量に関係なくアカウントのセキュリティ姿勢を変えるイベント（2SV の登録/解除、復旧用メール/電話の変更、パスワード変更、ドメイン外への転送、Google 自身の `risky_sensitive_action_*` / `suspicious_login` 判定、OAuth の `authorize` 全件とそのクライアント・スコープ）を先頭に出す — 攻撃者が登録した第2要素はパスワードリセット後も残るため。`ips` は送信元アドレスごとの初見/最終を列挙。Google 自身の `account_disabled_*` / `suspicious_login` 判定は本人の `userKey` では返らない（actor が Google）ため、`login_audit` と同じ取り方で別に取得し、擬似アプリ `login_verdicts` として返す。`login_audit` では答えられない侵害後の問い（あれは Google 自身が挙げたイベントのドメイン全体ビュー） |
 | `ip_activity` | Reports API `activities().list` を `actorIpAddress=<ip>` で — **特定の送信元アドレス1つ**が操作した全アカウントを、ドメイン別・アプリ別に、同じ `flags` 付きで。`user_activity` で攻撃者のアドレスが分かった後の追跡: 同じ送信元が他のアカウントにも届いたか。スプレーは成功前から `login_failure` の件数として現れる |
 | `compromise_sweep` | **特定アカウント1名**の侵害が確定した後の Google 側の追跡を 1 回で: `activity`（`user_activity`、flags を先頭に）、`state` / `grants`（`get_user`、メール・Drive・連絡先・管理のスコープを持つ OAuth 付与を `risky` として明示）、`ips`（攻撃者のアドレス — 指定するか、本人の flags から取る — で全ドメインに `ip_activity`。本人は除外）、`gmail`: 攻撃者がメールを読み続けるために残す設定（自動転送・転送先アドレス・転送/削除/アーカイブするフィルタ・委任・送信者名とreply-to）と、ウィンドウ内に送った通数・宛先ドメイン — 件名・本文は読まない。`gmail.kind` が読めたかどうかを示す: `ok` / `partial`（設定の一部か送信サマリーが失敗。読めた分はそのまま）/ `api_disabled`（サービスアカウント自身の Cloud プロジェクトで Gmail API が無効）/ `no_grant` / `error` — 失敗は失敗として返し、「何も無かった」とは読まない。`highlights` に対応すべき事実、`checklist` に手作業で残ること。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープ（設定の読み取りは `delegates.list` を含め全てこのスコープで通ることを実機で確認） |
@@ -52,7 +54,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 |------|------|------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`user_activity`、`ip_activity`、`admin_actions`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`、`get_user` | その2つのツールだけエラーに縮退（`suspended_accounts` はドメイン単位）。他は動作を続ける |
-| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
+| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens`・`sign_out_user`（オプトイン） | それらのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
 `health_check` はスコープが一切無くても応答する。グラント漏れが疑われるときこそ呼ぶツールで、
 自身が失敗する代わりにドメインごとの認証失敗を構造化された結果として報告する。

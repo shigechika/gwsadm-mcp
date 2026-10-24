@@ -5,8 +5,11 @@ Workspace security-audit data (login locks, suspicious logins, Drive
 external-sharing exposure) to AI assistants over **stdio transport**. Built
 on the official `mcp` Python SDK's `MCPServer` (`gwsadm_mcp/server.py`), with
 `DomainClient` (`gwsadm_mcp/client.py`) wrapping the Admin SDK Reports API
-via a service account + domain-wide delegation (DWD) credential. Read-only:
-the only Admin SDK Reports API method called anywhere in this package is
+via a service account + domain-wide delegation (DWD) credential. Read-only
+except one opt-in tool: `sign_out_user` (Directory API `users().signOut`) is
+registered only when `GWSADM_ENABLE_SIGN_OUT=1`; any change that registers it
+unconditionally, or adds another mutating call, is blocking. The only Admin SDK
+Reports API method called anywhere in this package is
 `activities().list` (the underlying `googleapiclient.discovery.build()`
 setup call also fetches Google's discovery document over HTTP, separately
 from this read-only guarantee).
