@@ -9,10 +9,12 @@ via a service account + domain-wide delegation (DWD) credential. Read-only
 except one opt-in tool: `sign_out_user` (Directory API `users().signOut`) is
 registered only when `GWSADM_ENABLE_SIGN_OUT=1`; any change that registers it
 unconditionally, or adds another mutating call, is blocking. The only Admin SDK
-Reports API method called anywhere in this package is
-`activities().list` (the underlying `googleapiclient.discovery.build()`
-setup call also fetches Google's discovery document over HTTP, separately
-from this read-only guarantee).
+Reports API methods called anywhere in this package are `activities().list`
+and `customerUsageReports().get()` (the latter for `gmail_usage_report`); the
+full list of Google API calls, across all four APIs, is in `CLAUDE.md`. The
+underlying `googleapiclient.discovery.build()` setup call also fetches
+Google's discovery document over HTTP, separately from this read-only
+guarantee.
 
 See `CLAUDE.md` for the authoritative command list and architecture notes —
 read it before reviewing changes to `client.py` or `server.py`.

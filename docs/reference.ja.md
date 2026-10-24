@@ -60,11 +60,17 @@
 
 ## 読み取り専用の範囲
 
-本パッケージが呼び出す Google API はこれだけである: `activities().list()`
-（Reports API）、`users().list()`・`users().get()`・`tokens().list()`・
-`groups().get()`・`members().list()`（Directory API）、`groups().get()`
-（Groups Settings API）、`messages().list()`・`messages().get()`（Gmail
-API、メタデータのみ）。状態を変える呼び出しは `users().signOut()`
+本パッケージが呼び出す Google API はこれだけである: `activities().list()` と `customerUsageReports().get()`（Reports API）、
+`users().list()`・`users().get()`・`tokens().list()`・`groups().get()`・
+`members().list()`（Directory API）、`groups().get()`（Groups Settings API）、
+そして Gmail API の `messages().list()` / `messages().get(format="metadata")`
+（`gmail_message_trace` と `compromise_sweep`。後者は To/Cc/Bcc/Date ヘッダーのみ）、
+`messages().list()` / `messages().get(format="full")` / `messages().attachments().get()`
+（`dmarc_rua_summary`。メタデータだけでなくレポートの添付を読む）、設定の読み取り
+`users().settings().getAutoForwarding()` / `forwardingAddresses().list()` /
+`filters().list()` / `delegates().list()` / `sendAs().list()`（`compromise_sweep`）、
+`users().getProfile()`（`health_check` の Gmail の確認）。
+ほかに `workspace_status` が Google の公開ステータスフィードを認証情報なしで GET する。状態を変える呼び出しは `users().signOut()`
 （Directory API）だけで、`sign_out_user` からしか呼ばれない。このツールは
 サーバーを `GWSADM_ENABLE_SIGN_OUT=1` で起動したときだけ登録され、未設定なら
 書き込みツールは 1 本も存在しない。クライアントのどこにも insert・update・

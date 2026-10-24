@@ -14,12 +14,12 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | 領域 | ツール |
 |---|---|
 | 朝の点検 | `health_check`、`daily_brief`、`daily_brief_start`、`daily_brief_result` |
-| ログイン・アカウント | `login_audit`、`suspended_accounts`、`get_user` |
+| ログイン・アカウント | `login_audit`、`suspended_accounts`、`get_user`、`user_activity`、`ip_activity`、`compromise_sweep`、`sign_out_user`（オプトイン） |
 | 管理コンソール | `admin_actions` |
 | サービス状態 | `workspace_status` |
 | OAuth | `user_oauth_tokens` |
 | Drive | `drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes` |
-| Gmail | `gmail_message_trace` |
+| Gmail | `gmail_message_trace`、`gmail_usage_report`、`dmarc_rua_summary` |
 | グループ | `group_delivery_policy`、`list_group_members` |
 
 計画中: `dlp_events`（Reports `rules`、DLP 対応の Workspace エディションが
@@ -40,10 +40,16 @@ cron・MCP ゲートウェイ・CI から無人実行できます。
 かを正確に記録します。
 
 **慣習ではなく構造として読み取り専用です。** 本パッケージが呼び出す Google API
-は `activities().list()`（Reports API）、`users().list()` / `users().get()` /
-`tokens().list()` / `groups().get()` / `members().list()`（Directory API）、
-`groups().get()`（Groups Settings API）、`messages().list()` /
-`messages().get()`（Gmail API、メタデータのみ）と、状態を変える唯一の呼び出し
+は `activities().list()` と `customerUsageReports().get()`（Reports API）、
+`users().list()`・`users().get()`・`tokens().list()`・`groups().get()`・
+`members().list()`（Directory API）、`groups().get()`（Groups Settings API）、
+そして Gmail API の `messages().list()` / `messages().get(format="metadata")`
+（`gmail_message_trace` と `compromise_sweep`。後者は To/Cc/Bcc/Date ヘッダーのみ）、
+`messages().list()` / `messages().get(format="full")` / `messages().attachments().get()`
+（`dmarc_rua_summary`。メタデータだけでなくレポートの添付を読む）、設定の読み取り
+`users().settings().getAutoForwarding()` / `forwardingAddresses().list()` /
+`filters().list()` / `delegates().list()` / `sendAs().list()`（`compromise_sweep`）、
+`users().getProfile()`（`health_check` の Gmail の確認）と、状態を変える唯一の呼び出し
 `users().signOut()`（Directory API）です。後者は `sign_out_user` からしか呼ばれず、
 このツールはサーバーを `GWSADM_ENABLE_SIGN_OUT=1` で起動したときにしか登録されません。
 クライアントのどこにも insert・update・patch・delete の呼び出しは存在せず、どんなスコープを
