@@ -78,7 +78,22 @@ DMARC report's data lives in its attachment), the Gmail settings reads
 / `.filters().list()` / `.delegates().list()` / `.sendAs().list()` plus
 `messages().list` / `messages().get` (`format="metadata"`, To/Cc/Bcc/Date
 headers only) for `compromise_sweep`, and `users().getProfile()` for the
-`health_check` Gmail probe — all read-only; no mutating call exists.
+`health_check` Gmail probe — all read-only. The one exception is
+`users().signOut()` (Directory API, `admin.directory.user.security` scope;
+the tool's preflight `users().get` additionally needs
+`admin.directory.user.readonly`), issued only by `sign_out_user`, a state-changing tool registered only when
+`GWSADM_ENABLE_SIGN_OUT` is exactly `1` (the flag is re-checked inside the
+tool). It is never on by default: a deployment that sets the flag owns the
+approval step in front of each call. Keep it the only mutating call.
+Its outcome is tri-state, carried by exception type from the client:
+success (`signed_out: true`), `GwsWriteRefused` / `GwsAuthError` (definite
+refusal, nothing changed: `false`) and `GwsWriteUnknown` (the POST was or may
+have been sent with no definite answer: `null`). The whole tool runs under one
+`GWSADM_SIGN_OUT_DEADLINE_SECONDS` budget (default 45): `get_user` and
+`_execute` accept a `deadline`, and no request starts with less than
+`_MIN_REQUEST_SECONDS` left. Address-to-client routing for the per-account
+tools goes through `_resolve_user_client` (`strict=True` for sign-out: the
+address's own domain must be configured and an explicit `domain` must match).
 The underlying `googleapiclient.discovery.build()` setup call also fetches
 Google's discovery document over HTTP, separately from this guarantee.
 
@@ -105,7 +120,9 @@ to guard against stdio newline regressions).
   `shared_drive_membership_changes`, `gmail_message_trace`,
   `dmarc_rua_summary`, `group_delivery_policy`, `list_group_members`, `daily_brief`,
   and the background pair `daily_brief_start` / `daily_brief_result` (plus
-  an env-gated `timeout_probe` diagnostic). `gmail_message_trace` fans its
+  an env-gated `timeout_probe` diagnostic, and the env-gated, state-changing
+  `sign_out_user`, registered only when `GWSADM_ENABLE_SIGN_OUT=1`).
+  `gmail_message_trace` fans its
   per-recipient `DomainClient.find_message_by_id` calls across a
   `ThreadPoolExecutor` (same `_max_workers()` bound as the Reports tools)
   and resolves each recipient's `[domain.*]` client from its own address

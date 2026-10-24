@@ -1,4 +1,4 @@
-"""gwsadm-mcp MCP server — Google Workspace security audit (read-only).
+"""gwsadm-mcp MCP server — Google Workspace security audit (read-only except one opt-in tool).
 
 Phase 1 tools:
 
@@ -28,6 +28,8 @@ Phase 1 tools:
 - ``daily_brief``             — one-call summary of the Reports-based tools
   (``login_audit`` + ``drive_external_sharing``) across all configured domains;
   ``suspended_accounts`` is separate (different API/scope) and not included
+- ``sign_out_user``           — STATE-CHANGING, opt-in: signs one account out of every session
+  (Directory API ``users().signOut``); registered only when ``GWSADM_ENABLE_SIGN_OUT=1``
 
 Coverage contract: every result section carries a ``capped`` boolean when its
 window was not fully scanned, so partial coverage is never mistaken for
@@ -57,7 +59,17 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 
 from gwsadm_mcp import __version__, geo, sites
-from gwsadm_mcp.client import DomainClient, GwsApiDisabledError, GwsAuthError, GwsError, event_parameters
+from gwsadm_mcp.client import (
+    SCOPE_DIRECTORY,
+    DomainClient,
+    GwsApiDisabledError,
+    GwsAuthError,
+    GwsError,
+    GwsKeyFileError,
+    GwsWriteRefused,
+    GwsWriteUnknown,
+    event_parameters,
+)
 from gwsadm_mcp.config import ConfigError, config_path, is_external, load_config
 
 
@@ -282,19 +294,47 @@ def _select(clients: list[DomainClient], domain: str | None) -> list[DomainClien
     return picked
 
 
-def _domain_of(username: str) -> str:
+# One exact mailbox address, for the tools that act on what they are given: no
+# wildcard, list or query syntax can reach userKey. The final label allows
+# digits and hyphens for punycode TLDs.
+_EXACT_ADDRESS_RE = re.compile(r"^[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z0-9-]{2,}$")
+
+
+def _domain_of(username: str, exact: bool = False) -> str:
     """Return the lowercased domain of an email-shaped username, validating the shape.
 
     Rejects anything that would reach the Directory API as a malformed
     ``userKey`` (missing/empty local or domain part, embedded whitespace) so
     the caller reports a clear input error instead of a misleading
     "directory API error" from Google, or an "unknown domain ''" from
-    ``_select`` for an empty suffix.
+    ``_select`` for an empty suffix. ``exact`` additionally requires one plain
+    address (``_EXACT_ADDRESS_RE``), for a tool that changes the account.
     """
     local, sep, domain = username.rpartition("@")
     if not sep or not local or not domain or any(ch.isspace() for ch in username):
         raise GwsError(f"'{username}' is not an email address")
+    if exact and not _EXACT_ADDRESS_RE.match(username):
+        raise GwsError(f"'{username}' is not one exact email address")
     return domain.lower()
+
+
+def _resolve_user_client(username: str, domain: str | None, strict: bool = False) -> DomainClient:
+    """The configured domain client one per-account tool routes ``username`` through.
+
+    Shared by ``get_user``, ``user_oauth_tokens`` and ``sign_out_user`` so the
+    routing rule lives in one place. The shape is checked before the config is
+    touched, so a typo'd address on a server with a broken config reports the
+    typo, not ``ConfigError``. Without ``strict``, an explicit ``domain`` routes
+    an alias/secondary-domain address through that section. With ``strict`` (the
+    state-changing tool) the address must be one exact address whose own domain
+    is configured, and an explicit ``domain`` must name that same domain.
+    Raises ``GwsError`` / ``ConfigError``.
+    """
+    suffix = _domain_of(username, exact=strict)
+    if strict and domain is not None and domain.strip().lower() != suffix:
+        raise GwsError(f"domain '{domain}' does not match the address's own domain '{suffix}'")
+    clients, _ = _clients()
+    return _select(clients, suffix if strict or domain is None else domain)[0]
 
 
 def _window(hours: int) -> datetime.datetime:
@@ -821,8 +861,8 @@ def get_user(username: str, domain: str | None = None) -> dict:
     ``found: false`` as "the lookup did not work", and never read an ``error``
     as evidence about whether the account exists.
 
-    Read-only (Directory API ``users().get``; no mutating method exists in
-    this package). Requires the ``admin.directory.user.readonly`` DWD scope —
+    Read-only (Directory API ``users().get``; this tool never changes the
+    account). Requires the ``admin.directory.user.readonly`` DWD scope —
     the same one ``suspended_accounts`` uses, so a tenant already running that
     tool needs no additional grant.
 
@@ -838,14 +878,9 @@ def get_user(username: str, domain: str | None = None) -> dict:
     """
     username = username.strip()
     try:
-        # Validate the input shape before touching config: a typo'd email on a
-        # server with a broken config should report the typo, not ConfigError.
-        suffix = _domain_of(username)
-        clients, _ = _clients()
-        picked = _select(clients, domain if domain is not None else suffix)
+        c = _resolve_user_client(username, domain)
     except (ConfigError, GwsError) as e:
         return {"username": username, "error": str(e)}
-    c = picked[0]
     try:
         user = c.get_user(username)  # None means "no such account", not a failure
     except (GwsAuthError, GwsError) as e:
@@ -895,14 +930,9 @@ def user_oauth_tokens(username: str, domain: str | None = None) -> dict:
     """
     username = username.strip()
     try:
-        # Validate the input shape before touching config: a typo'd email on a
-        # server with a broken config should report the typo, not ConfigError.
-        suffix = _domain_of(username)
-        clients, _ = _clients()
-        picked = _select(clients, domain if domain is not None else suffix)
+        c = _resolve_user_client(username, domain)
     except (ConfigError, GwsError) as e:
         return {"username": username, "error": str(e)}
-    c = picked[0]
     try:
         tokens = c.list_user_oauth_tokens(username)
     except (GwsAuthError, GwsError) as e:
@@ -3753,3 +3783,143 @@ async def timeout_probe(seconds: int = 90, emit_progress: bool = True, ctx: Cont
 
 if os.environ.get("GWSADM_ENABLE_TIMEOUT_PROBE"):
     mcp.tool()(timeout_probe)
+
+
+# --- the one state-changing tool: opt-in session sign-out -------------------
+# Registered only when GWSADM_ENABLE_SIGN_OUT is exactly "1", so a deployment
+# that does not set it (an MCP gateway shared by many people, say) never lists
+# it. A deployment that does set it is expected to put its own approval step in
+# front of every call; the tool itself only checks the flag and the input.
+_SIGN_OUT_ENV = "GWSADM_ENABLE_SIGN_OUT"
+# The whole call (account check and sign-out) ends within this budget, kept
+# under a client's ~60 s tool-call timeout so an answer always comes back.
+_SIGN_OUT_DEADLINE_ENV = "GWSADM_SIGN_OUT_DEADLINE_SECONDS"
+_SIGN_OUT_DEADLINE_DEFAULT = 45.0
+_SIGN_OUT_DEADLINE_RANGE = (10.0, 300.0)
+SIGN_OUT_NOT_COVERED = (
+    "OAuth grants stay valid: revoke them separately (see user_oauth_tokens)",
+    "app passwords stay valid",
+    "a second factor or passkey an attacker enrolled stays enrolled",
+    "the password is unchanged: reset it at the identity provider or in the Admin console",
+)
+
+
+def _sign_out_enabled() -> bool:
+    return os.environ.get(_SIGN_OUT_ENV) == "1"
+
+
+def _sign_out_budget() -> float:
+    try:
+        value = float(os.environ.get(_SIGN_OUT_DEADLINE_ENV, _SIGN_OUT_DEADLINE_DEFAULT))
+    except ValueError:
+        value = _SIGN_OUT_DEADLINE_DEFAULT
+    low, high = _SIGN_OUT_DEADLINE_RANGE
+    return max(low, min(high, value))
+
+
+def _preflight_error(e: GwsError) -> str:
+    """Why the account check before the sign-out failed, from the exception's type and status."""
+    if isinstance(e, GwsKeyFileError):
+        hint = "the service account key could not be loaded"
+    elif isinstance(e, GwsAuthError):
+        hint = f"the credential was refused; the impersonated admin needs the {SCOPE_DIRECTORY} DWD grant"
+    elif e.status == 403:
+        hint = f"Google refused users.get; it needs the {SCOPE_DIRECTORY} DWD grant and a role that may read users"
+    else:
+        hint = "the lookup did not complete"
+    return f"account check (users.get) failed, nothing was signed out: {hint}: {e}"
+
+
+def sign_out_user(username: str, domain: str | None = None) -> dict:
+    """Sign ONE account out of every Google web and device session (STATE-CHANGING).
+
+    The response to a confirmed account takeover: ends the attacker's existing
+    Google sessions and resets the account's sign-in cookies (Directory API
+    ``users().signOut``), so a session opened before the password reset or
+    suspension cannot keep going. The owner must sign in again too.
+
+    Not a full remediation — ``not_covered`` lists what stays in place (OAuth
+    grants, app passwords, an enrolled second factor, the password). Run
+    ``compromise_sweep`` before and after to see what is left.
+
+    Exists only when the server was started with ``GWSADM_ENABLE_SIGN_OUT=1``;
+    whoever enables it is expected to put an approval step in front of each
+    call. Takes one exact address whose own domain is configured (an explicit
+    ``domain`` must name that same domain), checks the account exists with
+    ``users().get``, then signs out its canonical primary address. The whole
+    call ends within ``GWSADM_SIGN_OUT_DEADLINE_SECONDS`` (default 45).
+
+    ``signed_out`` is tri-state — read it, not the presence of ``error``:
+
+    - ``true``: Google confirmed the sign-out.
+    - ``false``: definitely nothing changed (tool disabled, bad input, unknown
+      domain or account, the credential refused, or Google refused).
+    - ``null``: unknown — the request was or may have been sent and no answer
+      came back in time (transport failure, server errors or throttling that
+      outlasted the budget). Check the account before retrying.
+
+    Every answer has the same keys: ``domain``, ``username``, ``user`` (the
+    canonical primary address), ``found``, ``signed_out``, ``error`` (``null``
+    only on success), ``before`` (``suspended``, ``is_enrolled_in_2sv``,
+    ``last_login`` read before the call), ``at`` (UTC time of the sign-out
+    request, ``null`` when none was made) and ``not_covered``.
+
+    Requires TWO DWD scopes: ``admin.directory.user.readonly`` for the account
+    check (as ``get_user``) and ``admin.directory.user.security`` for the
+    sign-out (as ``user_oauth_tokens``), plus an impersonated admin with a role
+    that may manage the account's security. The ``error`` says which step
+    failed and why.
+
+    Args:
+        username: Exact user email (primary or alias, in a configured domain).
+        domain: Optional; when given it must equal the address's own domain.
+    """
+    username = (username or "").strip()
+    out: dict = {
+        "domain": None,
+        "username": username,
+        "user": None,
+        "found": None,
+        "signed_out": False,
+        "error": None,
+        "before": None,
+        "at": None,
+        "not_covered": list(SIGN_OUT_NOT_COVERED),
+    }
+    if not _sign_out_enabled():
+        return {**out, "error": f"sign_out_user is disabled on this server ({_SIGN_OUT_ENV} is not 1)"}
+    deadline = time.monotonic() + _sign_out_budget()
+    try:
+        c = _resolve_user_client(username, domain, strict=True)
+    except (ConfigError, GwsError) as e:
+        return {**out, "error": str(e)}
+    out["domain"] = c.domain
+    try:
+        user = c.get_user(username, deadline=deadline)
+    except GwsError as e:
+        return {**out, "error": _preflight_error(e)}
+    if user is None:
+        return {**out, "found": False, "error": "no such account; nothing was signed out"}
+    entry = _user_entry(user)
+    primary = entry.get("email") or username
+    out.update(
+        found=True,
+        user=primary,
+        before={k: entry.get(k) for k in ("suspended", "is_enrolled_in_2sv", "last_login")},
+        at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    try:
+        c.sign_out_user(primary, deadline)
+    except GwsWriteUnknown as e:
+        return {**out, "signed_out": None, "error": str(e)}
+    except GwsWriteRefused as e:
+        # A refusal without a status was never sent (budget, name lookup, connect).
+        return {**out, "at": out["at"] if e.status is not None else None, "error": str(e)}
+    except GwsError as e:
+        # GwsAuthError: the credential was refused before the request was sent.
+        return {**out, "at": None, "error": str(e)}
+    return {**out, "signed_out": True}
+
+
+if _sign_out_enabled():
+    mcp.tool()(sign_out_user)

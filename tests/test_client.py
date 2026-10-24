@@ -275,12 +275,28 @@ class FakeTokens:
         return _Req(self.resp)
 
 
+class FakeSecurityUsers:
+    """signOut answers from ``outcomes`` in order (an exception or None for success)."""
+
+    def __init__(self, outcomes=None):
+        self.outcomes, self.calls = list(outcomes or [None]), []
+
+    def signOut(self, **kw):
+        self.calls.append(kw)
+        exc = self.outcomes[min(len(self.calls) - 1, len(self.outcomes) - 1)]
+        return _Req(None, exc)
+
+
 class FakeDirectorySecurity:
-    def __init__(self, resp, exc=None):
+    def __init__(self, resp, exc=None, sign_out_outcomes=None):
         self._t = FakeTokens(resp, exc)
+        self._u = FakeSecurityUsers(sign_out_outcomes)
 
     def tokens(self):
         return self._t
+
+    def users(self):
+        return self._u
 
 
 def _sec_client(resp, exc=None):
@@ -298,6 +314,122 @@ def test_list_user_oauth_tokens_returns_items_and_passes_user_key():
 def test_list_user_oauth_tokens_empty_items():
     c, _ = _sec_client({})
     assert c.list_user_oauth_tokens("user@example.edu") == []
+
+
+def _sign_out_client(*outcomes):
+    svc = FakeDirectorySecurity({}, sign_out_outcomes=list(outcomes) or None)
+    return DomainClient(CFG, directory_security_service=svc), svc._u
+
+
+def _http_error(status, body=b"{}"):
+    return HttpError(httplib2.Response({"status": str(status), "reason": "x"}), body)
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    slept = []
+    monkeypatch.setattr(client.time, "sleep", slept.append)
+    return slept
+
+
+def _later(seconds=40):
+    import time
+
+    return time.monotonic() + seconds
+
+
+def test_sign_out_user_calls_sign_out_on_the_security_service():
+    c, u = _sign_out_client()
+    assert c.sign_out_user("user@example.edu", _later()) is None
+    assert u.calls == [{"userKey": "user@example.edu"}]
+
+
+def test_sign_out_user_not_started_when_the_budget_is_too_small():
+    c, u = _sign_out_client()
+    with pytest.raises(client.GwsWriteRefused, match="not sent") as e:
+        c.sign_out_user("user@example.edu", _later(1))
+    assert e.value.status is None and u.calls == []
+
+
+def test_sign_out_user_permission_403_is_a_definite_refusal_naming_both_causes():
+    body = b'{"error": {"code": 403, "message": "Not Authorized to access this resource/api"}}'
+    c, u = _sign_out_client(_http_error(403, body))
+    with pytest.raises(client.GwsWriteRefused) as e:
+        c.sign_out_user("user@example.edu", _later())
+    msg = str(e.value)
+    assert e.value.status == 403 and len(u.calls) == 1
+    assert "admin.directory.user.security" in msg and "super admin" in msg
+    assert "Not Authorized" in msg
+
+
+def test_sign_out_user_api_disabled_403_says_so():
+    body = b'{"error": {"code": 403, "errors": [{"reason": "accessNotConfigured"}], "message": "Admin SDK API off"}}'
+    c, _ = _sign_out_client(_http_error(403, body))
+    with pytest.raises(client.GwsWriteRefused, match="not enabled in the service account's own Cloud project"):
+        c.sign_out_user("user@example.edu", _later())
+
+
+def test_sign_out_user_404_and_400_are_definite_refusals():
+    for status, words in ((404, "no such account"), (400, "refused")):
+        c, _ = _sign_out_client(_http_error(status))
+        with pytest.raises(client.GwsWriteRefused, match=words) as e:
+            c.sign_out_user("user@example.edu", _later())
+        assert not isinstance(e.value, client.GwsWriteUnknown)
+
+
+def test_sign_out_user_retries_a_503_then_succeeds(no_sleep):
+    c, u = _sign_out_client(_http_error(503), None)
+    assert c.sign_out_user("user@example.edu", _later()) is None
+    assert len(u.calls) == 2 and len(no_sleep) == 1
+
+
+def test_sign_out_user_server_errors_until_the_budget_ends_are_unknown(no_sleep, monkeypatch):
+    # 503 every time: retries stop once the next backoff (1, 2, 4 s without
+    # jitter) plus the minimum request time would cross the 8 s budget.
+    monkeypatch.setattr(client.random, "uniform", lambda a, b: 0.0)
+    c, u = _sign_out_client(_http_error(503))
+    with pytest.raises(client.GwsWriteUnknown, match="outcome unknown"):
+        c.sign_out_user("user@example.edu", _later(8))
+    assert len(u.calls) == 3 and no_sleep == [1.0, 2.0]
+
+
+def test_sign_out_user_rate_limit_exhaustion_is_unknown(no_sleep):
+    body = b'{"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}'
+    c, u = _sign_out_client(_http_error(403, body))
+    with pytest.raises(client.GwsWriteUnknown, match="throttled"):
+        c.sign_out_user("user@example.edu", _later(300))
+    assert len(u.calls) == client._MAX_RETRIES
+
+
+def test_sign_out_user_plain_500_is_unknown():
+    c, _ = _sign_out_client(_http_error(502))
+    with pytest.raises(client.GwsWriteUnknown, match="HTTP 502"):
+        c.sign_out_user("user@example.edu", _later())
+
+
+def test_sign_out_user_transport_timeout_is_unknown_but_refused_connect_is_not_sent():
+    c, _ = _sign_out_client(TimeoutError("timed out"))
+    with pytest.raises(client.GwsWriteUnknown, match="TimeoutError"):
+        c.sign_out_user("user@example.edu", _later())
+    c, _ = _sign_out_client(ConnectionRefusedError())
+    with pytest.raises(client.GwsWriteRefused, match="not sent") as e:
+        c.sign_out_user("user@example.edu", _later())
+    assert not isinstance(e.value, client.GwsWriteUnknown)
+
+
+def test_sign_out_user_auth_refresh_failure_is_auth_error():
+    from google.auth.exceptions import RefreshError
+
+    c, _ = _sign_out_client(RefreshError("unauthorized_client"))
+    with pytest.raises(client.GwsAuthError, match="admin.directory.user.security"):
+        c.sign_out_user("user@example.edu", _later())
+
+
+def test_get_user_http_error_carries_its_status():
+    c, _ = _user_client(None, exc=_http_error(403))
+    with pytest.raises(GwsError) as e:
+        c.get_user("user@example.edu")
+    assert e.value.status == 403 and not isinstance(e.value, client.GwsAuthError)
 
 
 def test_list_user_oauth_tokens_http_error_maps_to_gws_error():

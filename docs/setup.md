@@ -30,8 +30,8 @@ degrading — one place, one pass, avoids the trap:
 | Scope | Needed by | Missing it |
 |-------|-----------|------------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`, `admin_actions`, `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes`, `daily_brief*` | those tools degrade to a per-domain error |
-| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user` | those two tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
-| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | that tool degrades to a per-domain error; everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`, `get_user`, `sign_out_user` (opt-in; its account check) | those tools degrade to an error (per-domain for `suspended_accounts`); everything else keeps working |
+| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens`, `sign_out_user` (opt-in) | those tools degrade to a per-domain error; everything else keeps working |
 
 `health_check` needs no scope at all to respond: it is the tool to call when
 a grant might be missing — it probes each domain and reports the failing
@@ -130,6 +130,33 @@ Flagged rows come first, newest first. `health_check` reports both under
 `sites` and `geo`; it reads the dataset's first line, so an unreadable file is an
 `error` there, and a dataset older than 30 days or a missing
 `GWSADM_HOME_COUNTRIES` is a `warning`.
+
+### Opt-in sign-out (`GWSADM_ENABLE_SIGN_OUT`)
+
+Unset, the server has no write tool. With `GWSADM_ENABLE_SIGN_OUT=1` (exactly
+`1`) it also registers `sign_out_user`, which signs one account out of every
+Google session (Directory API `users().signOut`). It needs two grants: the
+`admin.directory.user.readonly` scope for the account check it makes first
+(the one `get_user` uses) and the `admin.directory.user.security` scope for the
+sign-out itself (the one `user_oauth_tokens` uses); the impersonated admin must
+also hold a role that may manage user security. Set the flag
+only on a deployment that asks a person to approve each call — a chat bot with
+an approval button, say — and leave it unset on anything shared more widely,
+such as an MCP gateway.
+
+Turning the flag on adds no privilege. `users().signOut` runs on the subject's
+existing user-security admin privilege — the same one `tokens().list` already
+needs for `user_oauth_tokens` — so a key and subject that can list a user's
+tokens can already sign that user out, flag or not; the flag only decides
+whether this server offers the call. If the read-only deployments' key must not
+be able to sign users out, give the write deployment its own config file with a
+dedicated service account and subject, and take the user-security grant and
+role away from the shared one (losing `user_oauth_tokens` there).
+
+The whole call ends within `GWSADM_SIGN_OUT_DEADLINE_SECONDS` (default 45,
+clamped to 10–300) so a client's ~60 s tool-call timeout never cuts it off
+mid-way; a sign-out that may have been sent without an answer in that time is
+reported as `signed_out: null`, never as a failure.
 
 ## Verify before wiring it into anything
 

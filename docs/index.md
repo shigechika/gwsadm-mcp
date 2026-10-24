@@ -6,8 +6,9 @@ sharing, built on the Admin SDK Reports API (audit activities).
 
 Named after the admin-console viewpoint (`gwsadm` = Google Workspace admin),
 sibling of [`boxadm-mcp`](https://github.com/shigechika/boxadm-mcp). This is
-**not** a general-purpose Workspace MCP: it surfaces risk, it never mutates
-anything.
+**not** a general-purpose Workspace MCP: it surfaces risk and changes nothing,
+with one opt-in exception — `sign_out_user`, which exists only when the server
+is started with `GWSADM_ENABLE_SIGN_OUT=1`.
 
 ## Tools by area
 
@@ -43,9 +44,12 @@ were cut short.
 issued anywhere in this package are `activities().list()` (Reports API),
 `users().list()` / `users().get()` / `tokens().list()` / `groups().get()` /
 `members().list()` (Directory API), `groups().get()` (Groups Settings API),
-and `messages().list()` / `messages().get()` (Gmail API, metadata only). No
-insert, update, patch, or delete call exists in the client — there is no
-scope grant that turns this server into a write tool. The one request made
+and `messages().list()` / `messages().get()` (Gmail API, metadata only), plus
+one state-changing call, `users().signOut()` (Directory API), reachable only
+through `sign_out_user` — a tool that is not registered unless the server is
+started with `GWSADM_ENABLE_SIGN_OUT=1`. No insert, update, patch, or delete
+call exists in the client, so no scope grant turns this server into a write
+tool beyond that one opt-in sign-out. The one request made
 without a credential is `workspace_status`'s GET of Google's public status feed.
 
 ## Next steps

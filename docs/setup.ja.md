@@ -30,8 +30,8 @@ uv sync          # または: pip install -e .
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
 | `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`admin_actions`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
-| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`、`get_user` | その2つのツールだけエラーに縮退（`suspended_accounts` はドメイン単位）。他は動作を続ける |
-| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`、`get_user`、`sign_out_user`（オプトイン。事前のアカウント確認） | それらのツールだけエラーに縮退（`suspended_accounts` はドメイン単位）。他は動作を続ける |
+| `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens`・`sign_out_user`（オプトイン） | それらのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 
 `health_check` はスコープが一切無くても応答する。グラント漏れが疑われる
 ときこそ呼ぶツールで、自身が失敗する代わりにドメインごとの認証失敗を
@@ -123,6 +123,27 @@ ipv6 = 2001:db8:1::/48
 
 印の付いた行が先で、それぞれ新しい順に並ぶ。`health_check` は両方を `sites`・`geo` に出す。表の 1 行目を
 読んで確かめるので、読めないファイルは `error`、30 日より古い表と `GWSADM_HOME_COUNTRIES` の未設定は `warning` になる。
+### オプトインのサインアウト（`GWSADM_ENABLE_SIGN_OUT`）
+
+未設定のとき、このサーバーに書き込みツールは無い。`GWSADM_ENABLE_SIGN_OUT=1`（`1` のときだけ）で
+起動すると `sign_out_user` も登録され、1 アカウントを Google の全セッションからサインアウトさせる
+（Directory API `users().signOut`）。付与は 2 つ要る: 先に行うアカウント確認に `admin.directory.user.readonly`
+（`get_user` と同じ）、サインアウト自体に `admin.directory.user.security`（`user_oauth_tokens` と同じ）。
+なりすます管理者にはユーザーのセキュリティを管理できるロールも要る。
+このフラグは、呼び出しごとに人が承認する配備（承認ボタンのあるチャットボットなど）にだけ設定し、
+MCP ゲートウェイのように広く共有するものには設定しないこと。
+
+フラグを有効にしても権限は増えない。`users().signOut` は、なりすます管理者が既に持つユーザーのセキュリティ
+管理の権限（`user_oauth_tokens` の `tokens().list` に要るものと同じ）で動く。つまりユーザーのトークンを一覧できる
+鍵と管理者なら、フラグの有無にかかわらずそのユーザーをサインアウトさせられ、フラグはこのサーバーがその呼び出しを
+提供するかどうかだけを決める。読み取り専用の配備の鍵ではサインアウトできないようにしたいなら、書き込み用の配備に
+専用のサービスアカウントと管理者を使う別の設定ファイルを用意し、共有の鍵からはユーザーのセキュリティの付与と
+ロールを外す（その配備では `user_oauth_tokens` が使えなくなる）。
+
+呼び出し全体は `GWSADM_SIGN_OUT_DEADLINE_SECONDS`（既定 45 秒、10〜300 に丸める）以内に終わるので、
+クライアントの約 60 秒のタイムアウトで途中で切られることはない。送ったかもしれないのに時間内に答えが無かった
+サインアウトは、失敗ではなく `signed_out: null` として返す。
+
 ## 何かに組み込む前に確認する
 
 ```bash

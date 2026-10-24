@@ -7,6 +7,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 管理コンソールの視点にちなんで `gwsadm`（= Google Workspace admin）と命名。
 [`boxadm-mcp`](https://github.com/shigechika/boxadm-mcp) の姉妹サーバ。
 汎用的な Workspace MCP では**ない**： リスクを可視化するだけで、何も変更しない。
+例外はオプトインの `sign_out_user` だけで、サーバーを `GWSADM_ENABLE_SIGN_OUT=1` で起動したときにしか存在しない。
 
 ## 領域別ツール
 
@@ -42,9 +43,11 @@ cron・MCP ゲートウェイ・CI から無人実行できます。
 は `activities().list()`（Reports API）、`users().list()` / `users().get()` /
 `tokens().list()` / `groups().get()` / `members().list()`（Directory API）、
 `groups().get()`（Groups Settings API）、`messages().list()` /
-`messages().get()`（Gmail API、メタデータのみ）だけです。クライアントのどこにも
-insert・update・patch・delete の呼び出しは存在せず、どんなスコープを付与しても
-このサーバーが書き込みツールに変わることはありません。認証情報を付けずに出す要求は、
+`messages().get()`（Gmail API、メタデータのみ）と、状態を変える唯一の呼び出し
+`users().signOut()`（Directory API）です。後者は `sign_out_user` からしか呼ばれず、
+このツールはサーバーを `GWSADM_ENABLE_SIGN_OUT=1` で起動したときにしか登録されません。
+クライアントのどこにも insert・update・patch・delete の呼び出しは存在せず、どんなスコープを
+付与しても、このオプトインのサインアウト以外の書き込みツールに変わることはありません。認証情報を付けずに出す要求は、
 `workspace_status` が Google の公開ステータスフィードを GET するものだけです。
 
 ## 次に読むもの

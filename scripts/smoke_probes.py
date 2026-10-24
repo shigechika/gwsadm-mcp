@@ -315,6 +315,9 @@ PROBES: dict[str, Probe] = {
         allow_empty=True,
         must_not_match=NO_DOMAIN_ERROR,
     ),
+    "sign_out_user": Probe(
+        skip="state-changing (signs a real account out); registered only with GWSADM_ENABLE_SIGN_OUT=1",
+    ),
     "get_user": Probe(
         args_factory=_fake_account,
         require_keys=("domain", "username", "found"),
