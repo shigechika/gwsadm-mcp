@@ -131,6 +131,17 @@ Flagged rows come first, newest first. `health_check` reports both under
 `error` there, and a dataset older than 30 days or a missing
 `GWSADM_HOME_COUNTRIES` is a `warning`.
 
+Environment variables (all optional except where noted):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GWSADM_CONFIG` | `~/.config/gwsadm-mcp/config.ini` | the INI file above |
+| `GWSADM_MAX_WORKERS` | `8` | concurrent Reports API fetches in the fan-out (clamped to 1–32; a non-integer falls back to 8). Lower it if a tenant throttles, raise it if a large tenant's scan is too slow |
+| `GWSADM_SITES_INI` | — | your own address ranges, to name where an account-protection change came from (above) |
+| `GWSADM_IP2ASN` / `GWSADM_HOME_COUNTRIES` | — | iptoasn table and home countries, to flag changes from abroad (above) |
+| `GWSADM_ENABLE_SIGN_OUT` | unset | `1` registers the state-changing `sign_out_user` |
+| `GWSADM_SIGN_OUT_DEADLINE_SECONDS` | `45` | time budget of one `sign_out_user` call (clamped to 10–300) |
+
 ### Opt-in sign-out (`GWSADM_ENABLE_SIGN_OUT`)
 
 Unset, the server has no write tool. With `GWSADM_ENABLE_SIGN_OUT=1` (exactly

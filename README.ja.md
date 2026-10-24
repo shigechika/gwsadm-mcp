@@ -164,6 +164,17 @@ mailbox と同じ。公開している宛先が `postmaster+rua@` のような G
 宛で、そちらの `[domain.*]` セクションが既に読んでいる場合。レポートは各レポートが名乗る
 ポリシードメインごとに集計されるので、そのセクションの結果に含まれる。
 
+環境変数（特記の無いものは省略可）:
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `GWSADM_CONFIG` | `~/.config/gwsadm-mcp/config.ini` | 上の INI ファイル |
+| `GWSADM_MAX_WORKERS` | `8` | Reports API を並行して取得する数（1〜32 に丸める。整数でなければ 8）。テナントに抑制されるなら下げ、大きなテナントの走査が遅いなら上げる |
+| `GWSADM_SITES_INI` | — | 自組織のアドレス範囲。アカウントの保護の変更がどこから来たかを名前で示す（セットアップの文書を参照） |
+| `GWSADM_IP2ASN` / `GWSADM_HOME_COUNTRIES` | — | iptoasn の表と自国。国外からの変更に印を付ける（セットアップの文書を参照） |
+| `GWSADM_ENABLE_SIGN_OUT` | 未設定 | `1` で状態を変える `sign_out_user` を登録する |
+| `GWSADM_SIGN_OUT_DEADLINE_SECONDS` | `45` | `sign_out_user` 1 回の時間予算（10〜300 に丸める） |
+
 ## 使い方
 
 ### Claude Code（プラグイン）
@@ -306,11 +317,19 @@ gwsadm-mcp dmarc-reports --domain example.edu --since 2026-09-20 --until 2026-09
   データを見つけた、という真の混在状態だけが通常のセクション別の形に
   フォールバックする。
 - 設計上 read-only（オプトインの例外が 1 つ）— このパッケージが発行する読み取りの API 呼び出しは
-  `activities().list`（Reports API）、`users().list` / `users().get` / `tokens().list` /
-  `groups().get` / `members().list`（Directory API）、`groups().get`（Groups Settings API）、
-  `messages().list` / `messages().get`（Gmail API、メタデータのみ）に限られ、書き込みは
-  `sign_out_user` だけが発行する `users().signOut`（Directory API）のみ。このツールは
-  サーバーを `GWSADM_ENABLE_SIGN_OUT=1` で起動したときにしか存在しない。
+  `activities().list()` と `customerUsageReports().get()`（Reports API）、
+  `users().list()`・`users().get()`・`tokens().list()`・`groups().get()`・
+  `members().list()`（Directory API）、`groups().get()`（Groups Settings API）、
+  そして Gmail API の `messages().list()` / `messages().get(format="metadata")`
+  （`gmail_message_trace` と `compromise_sweep`。後者は To/Cc/Bcc/Date ヘッダーのみ）、
+  `messages().list()` / `messages().get(format="full")` / `messages().attachments().get()`
+  （`dmarc_rua_summary`。メタデータだけでなくレポートの添付を読む）、設定の読み取り
+  `users().settings().getAutoForwarding()` / `forwardingAddresses().list()` /
+  `filters().list()` / `delegates().list()` / `sendAs().list()`（`compromise_sweep`）、
+  `users().getProfile()`（`health_check` の Gmail の確認）に限られる。
+  書き込みは `sign_out_user` だけが発行する `users().signOut()`（Directory API）のみで、このツールは
+  サーバーを `GWSADM_ENABLE_SIGN_OUT=1` で起動したときにしか存在しない。ほかに `workspace_status` が
+  Google の公開ステータスフィードを認証情報なしで GET する。
 - 出力にはアカウントアドレスが含まれる（監査ツールの目的上当然） —
   権限のあるセキュリティ担当者にアクセスを限定すること。`gmail_message_trace`
   はマッチしたメッセージのスニペットとヘッダー（From/To/Cc/Subject/Date）も返す —

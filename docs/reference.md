@@ -61,11 +61,20 @@ narrative, including why the narrower `gmail.metadata` scope was rejected.
 
 ## Read-only surface
 
-The only Google API calls issued anywhere in this package: `activities().list()`
-(Reports API); `users().list()`, `users().get()`, `tokens().list()`,
-`groups().get()`, `members().list()` (Directory API); `groups().get()`
-(Groups Settings API); `messages().list()`, `messages().get()` (Gmail API,
-metadata only). The one state-changing call is `users().signOut()`
+The only Google API calls issued anywhere in this package: `activities().list()` and `customerUsageReports().get()` (Reports API);
+`users().list()`, `users().get()`, `tokens().list()`, `groups().get()`,
+`members().list()` (Directory API); `groups().get()` (Groups Settings API); and
+in the Gmail API `messages().list()` / `messages().get(format="metadata")` for
+`gmail_message_trace` and `compromise_sweep` (the latter with the
+To/Cc/Bcc/Date headers only), `messages().list()` /
+`messages().get(format="full")` / `messages().attachments().get()` for
+`dmarc_rua_summary` (which does read the report attachments, not just
+metadata), the settings reads `users().settings().getAutoForwarding()` /
+`forwardingAddresses().list()` / `filters().list()` / `delegates().list()` /
+`sendAs().list()` for `compromise_sweep`, and `users().getProfile()` for the
+`health_check` Gmail probe.
+`workspace_status` also GETs Google's public status feed without a credential.
+The one state-changing call is `users().signOut()`
 (Directory API), behind `sign_out_user`, which is registered only when the
 server starts with `GWSADM_ENABLE_SIGN_OUT=1`; without that flag the server
 exposes no write tool at all. No insert, update, patch, or delete call exists

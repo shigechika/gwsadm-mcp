@@ -176,6 +176,17 @@ impersonated inbox. `dmarc_rua_mailbox = none` opts a domain out of DMARC readin
 `[domain.*]` section already reads; reports are grouped by the policy domain each
 report names, so they still appear under that other section.
 
+Environment variables (all optional except where noted):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GWSADM_CONFIG` | `~/.config/gwsadm-mcp/config.ini` | the INI file above |
+| `GWSADM_MAX_WORKERS` | `8` | concurrent Reports API fetches in the fan-out (clamped to 1–32; a non-integer falls back to 8). Lower it if a tenant throttles, raise it if a large tenant's scan is too slow |
+| `GWSADM_SITES_INI` | — | your own address ranges, to name where an account-protection change came from (see the setup docs) |
+| `GWSADM_IP2ASN` / `GWSADM_HOME_COUNTRIES` | — | iptoasn table and home countries, to flag changes from abroad (see the setup docs) |
+| `GWSADM_ENABLE_SIGN_OUT` | unset | `1` registers the state-changing `sign_out_user` |
+| `GWSADM_SIGN_OUT_DEADLINE_SECONDS` | `45` | time budget of one `sign_out_user` call (clamped to 10–300) |
+
 ## Usage
 
 ### Claude Code (plugin)
@@ -319,13 +330,23 @@ gwsadm-mcp dmarc-reports --domain example.edu --since 2026-09-20 --until 2026-09
   confirmed non-existence outweighs an unrelated error on the other scope.
   Only a genuine mixed state (one side not-found, the other actually
   finding data) falls through to the normal per-section shape instead.
-- Read-only by design, with one opt-in exception: `activities().list` (Reports API),
-  `users().list` / `users().get` / `tokens().list` / `groups().get` / `members().list`
-  (Directory API), `groups().get` (Groups Settings API), and `messages().list` /
-  `messages().get` (Gmail API, metadata only) are the only read calls issued, and
-  the only write is `users().signOut` (Directory API), issued solely by
+- Read-only by design, with one opt-in exception. The only read calls issued are
+  `activities().list()` and `customerUsageReports().get()` (Reports API);
+  `users().list()`, `users().get()`, `tokens().list()`, `groups().get()`,
+  `members().list()` (Directory API); `groups().get()` (Groups Settings API); and
+  in the Gmail API `messages().list()` / `messages().get(format="metadata")` for
+  `gmail_message_trace` and `compromise_sweep` (the latter with the
+  To/Cc/Bcc/Date headers only), `messages().list()` /
+  `messages().get(format="full")` / `messages().attachments().get()` for
+  `dmarc_rua_summary` (which does read the report attachments, not just
+  metadata), the settings reads `users().settings().getAutoForwarding()` /
+  `forwardingAddresses().list()` / `filters().list()` / `delegates().list()` /
+  `sendAs().list()` for `compromise_sweep`, and `users().getProfile()` for the
+  `health_check` Gmail probe.
+  The only write is `users().signOut()` (Directory API), issued solely by
   `sign_out_user` — which exists only when the server starts with
-  `GWSADM_ENABLE_SIGN_OUT=1`.
+  `GWSADM_ENABLE_SIGN_OUT=1`. `workspace_status` also GETs Google's public
+  status feed without a credential.
 - Output contains account addresses (that is the point of an audit tool):
   restrict access to authorized security staff. `gmail_message_trace` also
   returns a message snippet and headers (From/To/Cc/Subject/Date) for a

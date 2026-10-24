@@ -15,12 +15,12 @@ is started with `GWSADM_ENABLE_SIGN_OUT=1`.
 | Area | Tools |
 |---|---|
 | Morning patrol | `health_check`, `daily_brief`, `daily_brief_start`, `daily_brief_result` |
-| Logins & accounts | `login_audit`, `suspended_accounts`, `get_user` |
+| Logins & accounts | `login_audit`, `suspended_accounts`, `get_user`, `user_activity`, `ip_activity`, `compromise_sweep`, `sign_out_user` (opt-in) |
 | Admin console | `admin_actions` |
 | Service status | `workspace_status` |
 | OAuth | `user_oauth_tokens` |
 | Drive | `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes` |
-| Gmail | `gmail_message_trace` |
+| Gmail | `gmail_message_trace`, `gmail_usage_report`, `dmarc_rua_summary` |
 | Groups | `group_delivery_policy`, `list_group_members` |
 
 Planned: `dlp_events` (Reports `rules`; requires a Workspace edition with
@@ -41,10 +41,18 @@ findings". The Drive tools go further and record exactly which event types
 were cut short.
 
 **Read-only by construction, not by convention.** The only Google API calls
-issued anywhere in this package are `activities().list()` (Reports API),
-`users().list()` / `users().get()` / `tokens().list()` / `groups().get()` /
-`members().list()` (Directory API), `groups().get()` (Groups Settings API),
-and `messages().list()` / `messages().get()` (Gmail API, metadata only), plus
+issued anywhere in this package are `activities().list()` and `customerUsageReports().get()` (Reports API);
+`users().list()`, `users().get()`, `tokens().list()`, `groups().get()`,
+`members().list()` (Directory API); `groups().get()` (Groups Settings API); and
+in the Gmail API `messages().list()` / `messages().get(format="metadata")` for
+`gmail_message_trace` and `compromise_sweep` (the latter with the
+To/Cc/Bcc/Date headers only), `messages().list()` /
+`messages().get(format="full")` / `messages().attachments().get()` for
+`dmarc_rua_summary` (which does read the report attachments, not just
+metadata), the settings reads `users().settings().getAutoForwarding()` /
+`forwardingAddresses().list()` / `filters().list()` / `delegates().list()` /
+`sendAs().list()` for `compromise_sweep`, and `users().getProfile()` for the
+`health_check` Gmail probe, plus
 one state-changing call, `users().signOut()` (Directory API), reachable only
 through `sign_out_user` — a tool that is not registered unless the server is
 started with `GWSADM_ENABLE_SIGN_OUT=1`. No insert, update, patch, or delete

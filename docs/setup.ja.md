@@ -123,6 +123,17 @@ ipv6 = 2001:db8:1::/48
 
 印の付いた行が先で、それぞれ新しい順に並ぶ。`health_check` は両方を `sites`・`geo` に出す。表の 1 行目を
 読んで確かめるので、読めないファイルは `error`、30 日より古い表と `GWSADM_HOME_COUNTRIES` の未設定は `warning` になる。
+環境変数（特記の無いものは省略可）:
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `GWSADM_CONFIG` | `~/.config/gwsadm-mcp/config.ini` | 上の INI ファイル |
+| `GWSADM_MAX_WORKERS` | `8` | Reports API を並行して取得する数（1〜32 に丸める。整数でなければ 8）。テナントに抑制されるなら下げ、大きなテナントの走査が遅いなら上げる |
+| `GWSADM_SITES_INI` | — | 自組織のアドレス範囲。アカウントの保護の変更がどこから来たかを名前で示す（上記） |
+| `GWSADM_IP2ASN` / `GWSADM_HOME_COUNTRIES` | — | iptoasn の表と自国。国外からの変更に印を付ける（上記） |
+| `GWSADM_ENABLE_SIGN_OUT` | 未設定 | `1` で状態を変える `sign_out_user` を登録する |
+| `GWSADM_SIGN_OUT_DEADLINE_SECONDS` | `45` | `sign_out_user` 1 回の時間予算（10〜300 に丸める） |
+
 ### オプトインのサインアウト（`GWSADM_ENABLE_SIGN_OUT`）
 
 未設定のとき、このサーバーに書き込みツールは無い。`GWSADM_ENABLE_SIGN_OUT=1`（`1` のときだけ）で
