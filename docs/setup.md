@@ -144,6 +144,20 @@ only on a deployment that asks a person to approve each call — a chat bot with
 an approval button, say — and leave it unset on anything shared more widely,
 such as an MCP gateway.
 
+Turning the flag on adds no privilege. `users().signOut` runs on the subject's
+existing user-security admin privilege — the same one `tokens().list` already
+needs for `user_oauth_tokens` — so a key and subject that can list a user's
+tokens can already sign that user out, flag or not; the flag only decides
+whether this server offers the call. If the read-only deployments' key must not
+be able to sign users out, give the write deployment its own config file with a
+dedicated service account and subject, and take the user-security grant and
+role away from the shared one (losing `user_oauth_tokens` there).
+
+The whole call ends within `GWSADM_SIGN_OUT_DEADLINE_SECONDS` (default 45,
+clamped to 10–300) so a client's ~60 s tool-call timeout never cuts it off
+mid-way; a sign-out that may have been sent without an answer in that time is
+reported as `signed_out: null`, never as a failure.
+
 ## Verify before wiring it into anything
 
 ```bash

@@ -98,6 +98,9 @@ GROUP_MEMBER_PAGE_SIZE = 200
 
 # Per-request HTTP timeout (seconds).
 _HTTP_TIMEOUT = 30
+# A request is not started (or retried) with less than this left of a caller's
+# deadline: it could not finish, and for a write it would leave the outcome unknown.
+_MIN_REQUEST_SECONDS = 5.0
 # Backoff-retry budget for rate-limit / transient server errors.
 _MAX_RETRIES = 5
 _MAX_BACKOFF = 8.0
@@ -429,7 +432,16 @@ def _is_retryable(e: HttpError) -> bool:
 
 
 class GwsError(Exception):
-    """Base error for Workspace Admin API failures."""
+    """Base error for Workspace Admin API failures.
+
+    ``status`` carries the HTTP status when the failure was an answer from
+    Google (set where a caller needs to branch on it; ``None`` otherwise), so
+    callers never have to match on the message text.
+    """
+
+    def __init__(self, *args, status: int | None = None):
+        super().__init__(*args)
+        self.status = status
 
 
 class GwsApiDisabledError(GwsError):
@@ -470,8 +482,62 @@ class GwsAuthError(GwsError):
     """Auth failure (bad key file, missing DWD scope, wrong subject)."""
 
 
+class GwsKeyFileError(GwsAuthError):
+    """The service account key file could not be read or parsed.
+
+    Raised by the lazy service builders; the message carries only the exception
+    type, never the key path.
+    """
+
+
+class GwsWriteRefused(GwsError):
+    """Google answered a state-changing request with a definite refusal: nothing changed."""
+
+
+class GwsWriteUnknown(GwsError):
+    """A state-changing request may have been applied: the outcome is unknown.
+
+    The request was (or may have been) sent and no definite answer came back
+    within the time budget -- a transport failure after sending, server errors
+    or throttling that outlasted the retries, or the budget running out.
+    """
+
+
 def _rfc3339(dt: datetime.datetime) -> str:
     return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _http_status(e: HttpError) -> int | None:
+    """The HTTP status of a googleapiclient error, or None when it carries none."""
+    raw = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _google_message(e: HttpError) -> str:
+    """Google's own ``error.message`` from an error body, trimmed; "" when absent.
+
+    The body is Google's JSON answer (no local path or credential can be in it),
+    so this is safe to hand to a caller; anything unparseable yields "".
+    """
+    blob = getattr(e, "content", b"") or b""
+    if isinstance(blob, bytes):
+        blob = blob.decode("utf-8", "replace")
+    try:
+        err = json.loads(blob).get("error")
+    except (ValueError, AttributeError):
+        return ""
+    msg = err.get("message") if isinstance(err, dict) else None
+    return msg.strip()[:200] if isinstance(msg, str) else ""
+
+
+def _request_timeout(deadline: float | None) -> float | None:
+    """Socket timeout for one request that must end by ``deadline`` (None: the default)."""
+    if deadline is None:
+        return None
+    return max(1.0, min(float(_HTTP_TIMEOUT), deadline - time.monotonic()))
 
 
 def _is_not_found(e: HttpError) -> bool:
@@ -564,7 +630,7 @@ class DomainClient:
                     except (OSError, ValueError) as e:
                         # Exception text deliberately omitted: it may embed the key path,
                         # which must not leak into tool output visible to MCP clients.
-                        raise GwsAuthError(
+                        raise GwsKeyFileError(
                             f"[{self.domain}] cannot load service account key ({type(e).__name__})"
                         ) from e
                     self._creds = creds
@@ -589,7 +655,7 @@ class DomainClient:
                             self.cfg.service_account_file, scopes=[SCOPE_REPORTS_USAGE], subject=self.cfg.subject
                         )
                     except (OSError, ValueError) as e:
-                        raise GwsAuthError(
+                        raise GwsKeyFileError(
                             f"[{self.domain}] cannot load service account key ({type(e).__name__})"
                         ) from e
                     self._reports_usage_creds = creds
@@ -606,7 +672,7 @@ class DomainClient:
                         )
                     except (OSError, ValueError) as e:
                         # See _reports_service: key path must not leak into tool output.
-                        raise GwsAuthError(
+                        raise GwsKeyFileError(
                             f"[{self.domain}] cannot load service account key ({type(e).__name__})"
                         ) from e
                     self._directory_creds = creds
@@ -623,7 +689,7 @@ class DomainClient:
                         )
                     except (OSError, ValueError) as e:
                         # See _reports_service: key path must not leak into tool output.
-                        raise GwsAuthError(
+                        raise GwsKeyFileError(
                             f"[{self.domain}] cannot load service account key ({type(e).__name__})"
                         ) from e
                     self._directory_security_creds = creds
@@ -640,7 +706,7 @@ class DomainClient:
                         )
                     except (OSError, ValueError) as e:
                         # See _reports_service: key path must not leak into tool output.
-                        raise GwsAuthError(
+                        raise GwsKeyFileError(
                             f"[{self.domain}] cannot load service account key ({type(e).__name__})"
                         ) from e
                     self._groups_settings_creds = creds
@@ -657,7 +723,7 @@ class DomainClient:
                         )
                     except (OSError, ValueError) as e:
                         # See _reports_service: key path must not leak into tool output.
-                        raise GwsAuthError(
+                        raise GwsKeyFileError(
                             f"[{self.domain}] cannot load service account key ({type(e).__name__})"
                         ) from e
                     self._directory_group_creds = creds
@@ -676,7 +742,7 @@ class DomainClient:
                         )
                     except (OSError, ValueError) as e:
                         # See _reports_service: key path must not leak into tool output.
-                        raise GwsAuthError(
+                        raise GwsKeyFileError(
                             f"[{self.domain}] cannot load service account key ({type(e).__name__})"
                         ) from e
                     self._directory_group_member_creds = creds
@@ -706,7 +772,7 @@ class DomainClient:
             )
         except (OSError, ValueError) as e:
             # See _reports_service: key path must not leak into tool output.
-            raise GwsAuthError(f"[{self.domain}] cannot load service account key ({type(e).__name__})") from e
+            raise GwsKeyFileError(f"[{self.domain}] cannot load service account key ({type(e).__name__})") from e
         svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
         with self._gmail_cache_lock:
             # Another thread may have built the same user's client while this
@@ -721,7 +787,7 @@ class DomainClient:
                 del self._gmail_cache[next(iter(self._gmail_cache))]
             return self._gmail_cache[user_email]
 
-    def _new_http(self, creds=None):
+    def _new_http(self, creds=None, timeout: float | None = None):
         """A fresh AuthorizedHttp per call so concurrent execute()s are thread-safe.
 
         googleapiclient's service object may be shared across threads, but its
@@ -734,10 +800,14 @@ class DomainClient:
         creds = creds or self._creds
         if creds is None:
             return None
-        return google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=_HTTP_TIMEOUT))
+        return google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=timeout or _HTTP_TIMEOUT))
 
-    def _execute(self, make_request, http):
-        """Execute a freshly-built request with backoff on rate-limit/transient errors."""
+    def _execute(self, make_request, http, deadline: float | None = None):
+        """Execute a freshly-built request with backoff on rate-limit/transient errors.
+
+        ``deadline`` (``time.monotonic()``) stops the retrying: a retry whose
+        backoff would end past it is not attempted and the last error is raised.
+        """
         for attempt in range(_MAX_RETRIES):
             try:
                 return make_request().execute(http=http)
@@ -747,7 +817,10 @@ class DomainClient:
                     # fetches are throttled at the same instant, deterministic
                     # backoff would retry them in lockstep and re-collide.
                     base = min(2.0**attempt, _MAX_BACKOFF)
-                    time.sleep(base + random.uniform(0, base))
+                    pause = base + random.uniform(0, base)
+                    if deadline is not None and time.monotonic() + pause + _MIN_REQUEST_SECONDS > deadline:
+                        raise
+                    time.sleep(pause)
                     continue
                 raise
         # Unreachable: the final attempt either returns or raises.
@@ -915,7 +988,7 @@ class DomainClient:
             raise GwsError(f"[{self.domain}] transport error (users.list): {type(e).__name__}") from e
         return users, bool(token)
 
-    def get_user(self, user_key: str) -> dict | None:
+    def get_user(self, user_key: str, deadline: float | None = None) -> dict | None:
         """Fetch ONE user's account record (Directory API ``users().get``).
 
         The per-account counterpart to ``list_suspended_users``. That method
@@ -949,13 +1022,13 @@ class DomainClient:
         """
         try:
             svc = self._directory_service()
-            http = self._new_http(self._directory_creds)
-            resp = self._execute(lambda: svc.users().get(userKey=user_key, projection="basic"), http)
+            http = self._new_http(self._directory_creds, timeout=_request_timeout(deadline))
+            resp = self._execute(lambda: svc.users().get(userKey=user_key, projection="basic"), http, deadline)
         except HttpError as e:
             if _is_not_found(e):
                 return None
-            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
-            raise GwsError(f"[{self.domain}] directory API error (users.get): HTTP {status}") from e
+            status = _http_status(e)
+            raise GwsError(f"[{self.domain}] directory API error (users.get): HTTP {status}", status=status) from e
         except GoogleAuthError as e:
             # Typical: DWD scope not granted for this client, or wrong subject.
             #
@@ -996,7 +1069,7 @@ class DomainClient:
             raise GwsError(f"[{self.domain}] transport error (tokens.list): {type(e).__name__}") from e
         return resp.get("items", [])
 
-    def sign_out_user(self, user_key: str) -> None:
+    def sign_out_user(self, user_key: str, deadline: float) -> None:
         """Sign one user out of every web and device session (Directory API ``users().signOut``).
 
         The ONLY state-changing call in this package, reached only through the
@@ -1004,35 +1077,95 @@ class DomainClient:
         resets its sign-in cookies; it does not revoke OAuth tokens or app
         passwords, remove a second factor, or change the password.
 
-        Same ``admin.directory.user.security`` DWD scope (and the same
-        lazily-built ``_directory_security_service()``) as
-        ``list_user_oauth_tokens`` -- no new grant. The impersonated
-        ``cfg.subject`` additionally needs an admin role that may manage user
-        security; without it Google answers HTTP 403, reported as a
-        ``GwsAuthError`` naming both requirements rather than a bare status.
-        ``_execute`` retries 429/5xx: signing out twice is harmless.
+        Uses the ``admin.directory.user.security`` credentials already built for
+        ``list_user_oauth_tokens``. The impersonated ``cfg.subject`` must also
+        hold an admin role that may manage the target's security.
+
+        Everything happens before ``deadline`` (``time.monotonic()``): no request
+        is started with less than ``_MIN_REQUEST_SECONDS`` left, each one's socket
+        timeout ends at the deadline, and retries (throttling, 500/503) stop when
+        the next backoff would cross it. Returns ``None`` on success. Raises:
+
+        - ``GwsAuthError`` (``GwsKeyFileError`` for an unreadable key): the
+          credential was refused before anything was sent -- nothing changed.
+        - ``GwsWriteRefused``: Google answered with a definite refusal (API
+          disabled in the key's project, not permitted for this subject or this
+          account, unknown account, bad request) or no request was started
+          because the budget was already too small -- nothing changed.
+        - ``GwsWriteUnknown``: the request was or may have been sent and no
+          definite answer came back (transport failure, server errors or
+          throttling that outlasted the budget) -- the sessions may or may not
+          have been ended.
         """
-        try:
-            svc = self._directory_security_service()
-            http = self._new_http(self._directory_security_creds)
-            self._execute(lambda: svc.users().signOut(userKey=user_key), http)
-        except HttpError as e:
-            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
-            if str(status) == "403":
-                raise GwsAuthError(
-                    f"[{self.domain}] users.signOut refused (HTTP 403): needs the {SCOPE_DIRECTORY_SECURITY} "
-                    "DWD scope and an impersonated admin allowed to manage user security"
+        svc = self._directory_security_service()
+        sent = False
+        attempt = 0
+        while True:
+            if deadline - time.monotonic() < _MIN_REQUEST_SECONDS:
+                if not sent:
+                    raise GwsWriteRefused(f"[{self.domain}] users.signOut not sent: the time budget was used up first")
+                raise GwsWriteUnknown(
+                    f"[{self.domain}] users.signOut outcome unknown: the time budget ran out after a request was sent"
+                )
+            try:
+                http = self._new_http(self._directory_security_creds, timeout=_request_timeout(deadline))
+                req = svc.users().signOut(userKey=user_key)
+                sent = True
+                req.execute(http=http)
+                return None
+            except HttpError as e:
+                status = _http_status(e)
+                if _is_retryable(e):
+                    attempt += 1
+                    base = min(2.0 ** (attempt - 1), _MAX_BACKOFF)
+                    pause = base + random.uniform(0, base)
+                    if attempt < _MAX_RETRIES and time.monotonic() + pause + _MIN_REQUEST_SECONDS <= deadline:
+                        time.sleep(pause)
+                        continue
+                    kind = "throttled" if status in (403, 429) else f"server error HTTP {status}"
+                    raise GwsWriteUnknown(
+                        f"[{self.domain}] users.signOut outcome unknown: Google kept answering {kind} "
+                        "until the retries or the time budget ran out",
+                        status=status,
+                    ) from e
+                if status is not None and status >= 500:
+                    raise GwsWriteUnknown(
+                        f"[{self.domain}] users.signOut outcome unknown: HTTP {status}", status=status
+                    ) from e
+                google = _google_message(e)
+                detail = f" (Google: {google})" if google else ""
+                if _is_api_disabled(e):
+                    reason = "the Admin SDK API is not enabled in the service account's own Cloud project"
+                elif status == 403:
+                    reason = (
+                        f"not permitted -- either the impersonated admin lacks the {SCOPE_DIRECTORY_SECURITY} "
+                        "grant or a role that may manage user security, or this account is one that admin "
+                        "may not manage (e.g. a super admin)"
+                    )
+                elif status == 404:
+                    reason = "no such account"
+                else:
+                    reason = "refused"
+                raise GwsWriteRefused(
+                    f"[{self.domain}] users.signOut HTTP {status}: {reason}{detail}", status=status
                 ) from e
-            raise GwsError(f"[{self.domain}] directory API error (users.signOut): HTTP {status}") from e
-        except GoogleAuthError as e:
-            # Same deliberate keep-the-message call as get_user: the token
-            # endpoint's text names the missing grant, and a key-file failure was
-            # already reduced to its exception type in the service builder.
-            raise GwsAuthError(
-                f"[{self.domain}] auth failed: {e} (users.signOut needs the {SCOPE_DIRECTORY_SECURITY} DWD scope)"
-            ) from e
-        except (httplib2.HttpLib2Error, OSError) as e:
-            raise GwsError(f"[{self.domain}] transport error (users.signOut): {type(e).__name__}") from e
+            except GoogleAuthError as e:
+                # The token is fetched before the POST is written, so nothing was
+                # sent. Same deliberate keep-the-message call as get_user.
+                raise GwsAuthError(
+                    f"[{self.domain}] auth failed before users.signOut was sent: {e} "
+                    f"(needs the {SCOPE_DIRECTORY_SECURITY} DWD scope)"
+                ) from e
+            except (httplib2.ServerNotFoundError, ConnectionRefusedError) as e:
+                # Name resolution or the TCP connect failed: the request never left.
+                raise GwsWriteRefused(
+                    f"[{self.domain}] users.signOut not sent: transport error ({type(e).__name__})"
+                ) from e
+            except (httplib2.HttpLib2Error, OSError) as e:
+                raise GwsWriteUnknown(
+                    f"[{self.domain}] users.signOut outcome unknown: transport error ({type(e).__name__}) "
+                    "after the request may have been sent"
+                ) from e
 
     def find_message_by_id(self, user_email: str, message_id: str) -> dict | None:
         """Search one user's Gmail mailbox for an RFC 822 Message-ID.

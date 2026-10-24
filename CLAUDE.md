@@ -85,6 +85,15 @@ the tool's preflight `users().get` additionally needs
 `GWSADM_ENABLE_SIGN_OUT` is exactly `1` (the flag is re-checked inside the
 tool). It is never on by default: a deployment that sets the flag owns the
 approval step in front of each call. Keep it the only mutating call.
+Its outcome is tri-state, carried by exception type from the client:
+success (`signed_out: true`), `GwsWriteRefused` / `GwsAuthError` (definite
+refusal, nothing changed: `false`) and `GwsWriteUnknown` (the POST was or may
+have been sent with no definite answer: `null`). The whole tool runs under one
+`GWSADM_SIGN_OUT_DEADLINE_SECONDS` budget (default 45): `get_user` and
+`_execute` accept a `deadline`, and no request starts with less than
+`_MIN_REQUEST_SECONDS` left. Address-to-client routing for the per-account
+tools goes through `_resolve_user_client` (`strict=True` for sign-out: the
+address's own domain must be configured and an explicit `domain` must match).
 The underlying `googleapiclient.discovery.build()` setup call also fetches
 Google's discovery document over HTTP, separately from this guarantee.
 

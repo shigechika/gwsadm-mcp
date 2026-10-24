@@ -129,14 +129,15 @@ class FakeDomainClient:
             raise self._suspended
         return self._suspended
 
-    def get_user(self, user_key):
+    def get_user(self, user_key, deadline=None):
         self.user_calls.append(user_key)
         if isinstance(self._user, Exception):
             raise self._user
         return self._user  # a dict (found) or None (no such account)
 
-    def sign_out_user(self, user_key):
+    def sign_out_user(self, user_key, deadline):
         self.sign_out_calls.append(user_key)
+        assert deadline is not None
         if self.sign_out_error is not None:
             raise self.sign_out_error
 
@@ -3977,6 +3978,8 @@ def test_workspace_status_reports_a_broken_http_response(monkeypatch):
 
 # --- sign_out_user (opt-in, state-changing) ----------------------------------
 
+SIGN_OUT_KEYS = {"domain", "username", "user", "found", "signed_out", "error", "before", "at", "not_covered"}
+
 
 def _tool_names_with_env(env_value):
     """Tool names of a fresh interpreter importing the server under ``env_value``.
@@ -4012,21 +4015,27 @@ def test_sign_out_user_is_registered_with_the_flag():
     assert "get_user" in names
 
 
+@pytest.fixture
+def sign_out_on(monkeypatch):
+    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+
+
 def test_sign_out_user_rechecks_the_flag_inside(inject, monkeypatch):
     monkeypatch.delenv("GWSADM_ENABLE_SIGN_OUT", raising=False)
     c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
     inject([c], {"example.edu"})
     out = server.sign_out_user("user@example.edu")
+    assert set(out) == SIGN_OUT_KEYS
     assert out["signed_out"] is False and "disabled" in out["error"]
     assert c.sign_out_calls == [] and c.user_calls == []
 
 
-def test_sign_out_user_signs_out_the_primary_address(inject, monkeypatch):
-    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+def test_sign_out_user_signs_out_the_primary_address(inject, sign_out_on):
     c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
     inject([c], {"example.edu"})
     out = server.sign_out_user(" user@example.edu ")
-    assert out["signed_out"] is True and out["found"] is True
+    assert set(out) == SIGN_OUT_KEYS
+    assert out["signed_out"] is True and out["error"] is None and out["found"] is True
     assert out["user"] == "user@example.edu" and out["domain"] == "example.edu"
     assert out["before"] == {"suspended": True, "is_enrolled_in_2sv": False, "last_login": "2026-05-30T01:02:03.000Z"}
     assert out["at"].endswith("Z")
@@ -4035,17 +4044,16 @@ def test_sign_out_user_signs_out_the_primary_address(inject, monkeypatch):
 
 
 @pytest.mark.parametrize("bad", ["*@example.edu", "user@example.edu,other@example.edu", "user", "a b@example.edu", ""])
-def test_sign_out_user_refuses_anything_but_one_exact_address(inject, monkeypatch, bad):
-    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+def test_sign_out_user_refuses_anything_but_one_exact_address(inject, sign_out_on, bad):
     c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
     inject([c], {"example.edu"})
     out = server.sign_out_user(bad)
-    assert out["signed_out"] is False and "error" in out
-    assert c.sign_out_calls == []
+    assert set(out) == SIGN_OUT_KEYS
+    assert out["signed_out"] is False and out["error"]
+    assert c.sign_out_calls == [] and c.user_calls == []
 
 
-def test_sign_out_user_refuses_an_unconfigured_domain(inject, monkeypatch):
-    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+def test_sign_out_user_refuses_an_unconfigured_domain(inject, sign_out_on):
     c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
     inject([c], {"example.edu"})
     out = server.sign_out_user("user@elsewhere.example")
@@ -4053,38 +4061,104 @@ def test_sign_out_user_refuses_an_unconfigured_domain(inject, monkeypatch):
     assert c.sign_out_calls == []
 
 
-def test_sign_out_user_refuses_an_account_that_does_not_exist(inject, monkeypatch):
-    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+def test_sign_out_user_explicit_domain_does_not_bypass_the_address_check(inject, sign_out_on):
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    inject([c], {"example.edu"})
+    # An unconfigured address routed through a configured section is refused.
+    out = server.sign_out_user("someone@alias.example", domain="example.edu")
+    assert out["signed_out"] is False and "does not match" in out["error"]
+    # So is a configured address paired with another domain.
+    other = FakeDomainClient("students.example.edu", {}, user=_USER_RECORD)
+    inject([c, other], {"example.edu", "students.example.edu"})
+    out = server.sign_out_user("user@example.edu", domain="students.example.edu")
+    assert out["signed_out"] is False and "does not match" in out["error"]
+    assert c.user_calls == [] and other.user_calls == [] and c.sign_out_calls == []
+    # The matching domain is accepted.
+    out = server.sign_out_user("user@example.edu", domain="EXAMPLE.edu")
+    assert out["signed_out"] is True
+
+
+def test_sign_out_user_refuses_an_account_that_does_not_exist(inject, sign_out_on):
     c = FakeDomainClient("example.edu", {}, user=None)
     inject([c], {"example.edu"})
     out = server.sign_out_user("ghost@example.edu")
-    assert out == {"domain": "example.edu", "username": "ghost@example.edu", "found": False, "signed_out": False}
-    assert c.sign_out_calls == []
+    assert set(out) == SIGN_OUT_KEYS
+    assert out["found"] is False and out["signed_out"] is False and "no such account" in out["error"]
+    assert out["at"] is None and c.sign_out_calls == []
 
 
-def test_sign_out_user_reports_a_refused_sign_out(inject, monkeypatch):
-    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
+def test_sign_out_user_definite_refusal_is_false(inject, sign_out_on):
+    from gwsadm_mcp.client import GwsWriteRefused
+
     c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
-    c.sign_out_error = GwsAuthError("[example.edu] users.signOut refused (HTTP 403): needs the scope")
+    c.sign_out_error = GwsWriteRefused("[example.edu] users.signOut HTTP 403: not permitted", status=403)
     inject([c], {"example.edu"})
     out = server.sign_out_user("user@example.edu")
     assert out["signed_out"] is False and "HTTP 403" in out["error"]
-    assert out["before"]["suspended"] is True
+    assert out["at"] is not None and out["before"]["suspended"] is True
+
+
+def test_sign_out_user_refusal_before_sending_has_no_time(inject, sign_out_on):
+    from gwsadm_mcp.client import GwsWriteRefused
+
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    c.sign_out_error = GwsWriteRefused("[example.edu] users.signOut not sent: the time budget was used up first")
+    inject([c], {"example.edu"})
+    out = server.sign_out_user("user@example.edu")
+    assert out["signed_out"] is False and out["at"] is None
+
+
+def test_sign_out_user_unknown_outcome_is_null(inject, sign_out_on):
+    from gwsadm_mcp.client import GwsWriteUnknown
+
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    c.sign_out_error = GwsWriteUnknown("[example.edu] users.signOut outcome unknown: transport error (TimeoutError)")
+    inject([c], {"example.edu"})
+    out = server.sign_out_user("user@example.edu")
+    assert set(out) == SIGN_OUT_KEYS
+    assert out["signed_out"] is None and "unknown" in out["error"] and out["at"] is not None
+
+
+def test_sign_out_user_credential_refused_before_send_is_false(inject, sign_out_on):
+    c = FakeDomainClient("example.edu", {}, user=_USER_RECORD)
+    c.sign_out_error = GwsAuthError("[example.edu] auth failed before users.signOut was sent: unauthorized_client")
+    inject([c], {"example.edu"})
+    out = server.sign_out_user("user@example.edu")
+    assert out["signed_out"] is False and out["at"] is None
 
 
 @pytest.mark.parametrize(
-    "err",
+    "err, expect",
     [
-        GwsAuthError("[example.edu] auth failed: unauthorized_client"),
-        GwsError("[example.edu] directory API error (users.get): HTTP 403"),
+        ("key", "key could not be loaded"),
+        ("auth", "admin.directory.user.readonly"),
+        ("403", "admin.directory.user.readonly"),
+        ("500", "did not complete"),
     ],
 )
-def test_sign_out_user_preflight_failure_names_the_readonly_scope(inject, monkeypatch, err):
-    monkeypatch.setenv("GWSADM_ENABLE_SIGN_OUT", "1")
-    c = FakeDomainClient("example.edu", {}, user=err)
+def test_sign_out_user_preflight_failure_hint_comes_from_the_exception(inject, sign_out_on, err, expect):
+    from gwsadm_mcp.client import GwsKeyFileError
+
+    exc = {
+        "key": GwsKeyFileError("[example.edu] cannot load service account key (FileNotFoundError)"),
+        "auth": GwsAuthError("[example.edu] auth failed: unauthorized_client"),
+        "403": GwsError("[example.edu] directory API error (users.get): HTTP 403", status=403),
+        "500": GwsError("[example.edu] directory API error (users.get): HTTP 500", status=500),
+    }[err]
+    c = FakeDomainClient("example.edu", {}, user=exc)
     inject([c], {"example.edu"})
     out = server.sign_out_user("user@example.edu")
-    assert out["signed_out"] is False
-    assert "users.get" in out["error"] and "admin.directory.user.readonly" in out["error"]
-    assert "admin.directory.user.security" not in out["error"]
+    assert set(out) == SIGN_OUT_KEYS
+    assert out["signed_out"] is False and "users.get" in out["error"] and expect in out["error"]
+    if err == "key":
+        assert "readonly" not in out["error"]
     assert c.sign_out_calls == []
+
+
+def test_sign_out_budget_is_clamped(monkeypatch):
+    monkeypatch.setenv("GWSADM_SIGN_OUT_DEADLINE_SECONDS", "1")
+    assert server._sign_out_budget() == 10.0
+    monkeypatch.setenv("GWSADM_SIGN_OUT_DEADLINE_SECONDS", "junk")
+    assert server._sign_out_budget() == 45.0
+    monkeypatch.delenv("GWSADM_SIGN_OUT_DEADLINE_SECONDS")
+    assert server._sign_out_budget() == 45.0
