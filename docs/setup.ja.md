@@ -208,6 +208,16 @@ gwsadm-mcp --check
 `claude_desktop_config.json` も同じエントリを `mcpServers` の下に置く。
 完全な例はリポジトリの README を参照。
 
+### Codex
+
+```bash
+codex mcp add gwsadm-mcp -- gwsadm-mcp
+```
+
+設定 INI が既定のパス（`~/.config/gwsadm-mcp/config.ini`）に無い場合のみ、`--` の前に `--env GWSADM_CONFIG=...` を追加する。
+
+stdio サーバーを起動できる MCP クライアントなら、どれでも同じ形で使える。コマンドに `gwsadm-mcp` を指定すればよい。
+
 ### 直接実行
 
 ```bash

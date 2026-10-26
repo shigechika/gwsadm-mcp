@@ -222,6 +222,18 @@ shell usually has it, but a GUI-launched app may not; install
 `claude_desktop_config.json` takes the same entry under `mcpServers`. See the
 repository README for the full example.
 
+### Codex
+
+```bash
+codex mcp add gwsadm-mcp -- gwsadm-mcp
+```
+
+Add `--env GWSADM_CONFIG=...` (before `--`) only if the config INI is not at
+the default path (`~/.config/gwsadm-mcp/config.ini`).
+
+Any other MCP client that launches stdio servers works the same way: give it
+`gwsadm-mcp` as the command.
+
 ### Direct execution
 
 ```bash
