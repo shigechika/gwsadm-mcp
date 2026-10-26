@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.23.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.23.0...v0.23.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **deps:** bump certifi and opentelemetry-api (security) ([#109](https://github.com/shigechika/gwsadm-mcp/issues/109)) ([c0402b7](https://github.com/shigechika/gwsadm-mcp/commit/c0402b7faa0ef0ebe874913c70481e5041934d51))
+* **deps:** bump urllib3 from 2.7.0 to 2.8.0 (security) ([#107](https://github.com/shigechika/gwsadm-mcp/issues/107)) ([c37dc0d](https://github.com/shigechika/gwsadm-mcp/commit/c37dc0d08a561633a6383b22b2c62f1d73ce3250))
+
 ## [0.23.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.22.1...v0.23.0) (2026-10-24)
 
 
