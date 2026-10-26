@@ -230,6 +230,18 @@ add `"env": { "GWSADM_CONFIG": "..." }` only for a non-default location):
 
 Add the same entry to `claude_desktop_config.json`.
 
+### Codex
+
+```bash
+codex mcp add gwsadm-mcp -- gwsadm-mcp
+```
+
+Add `--env GWSADM_CONFIG=...` (before `--`) only if the config INI is not at
+the default path (`~/.config/gwsadm-mcp/config.ini`).
+
+Any other MCP client that launches stdio servers works the same way: give it
+`gwsadm-mcp` as the command.
+
 ### Direct Execution
 
 ```bash
