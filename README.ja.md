@@ -226,6 +226,22 @@ codex mcp add gwsadm-mcp -- gwsadm-mcp
 
 設定 INI が既定のパス（`~/.config/gwsadm-mcp/config.ini`）に無い場合のみ、`--` の前に `--env GWSADM_CONFIG=...` を追加する。
 
+### Gemini CLI
+
+`~/.gemini/settings.json`（プロジェクト単位なら `.gemini/settings.json`）に追加する:
+
+```json
+{
+  "mcpServers": {
+    "gwsadm-mcp": {
+      "command": "gwsadm-mcp"
+    }
+  }
+}
+```
+
+Codex と同じく、設定 INI が既定のパスに無い場合のみ `"env": { "GWSADM_CONFIG": "..." }` を追加する。使うツールを絞りたいときは `includeTools` に列挙する。
+
 stdio サーバーを起動できる MCP クライアントなら、どれでも同じ形で使える。コマンドに `gwsadm-mcp` を指定すればよい。
 
 ### 直接実行
