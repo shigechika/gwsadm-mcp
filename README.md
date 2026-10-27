@@ -239,6 +239,23 @@ codex mcp add gwsadm-mcp -- gwsadm-mcp
 Add `--env GWSADM_CONFIG=...` (before `--`) only if the config INI is not at
 the default path (`~/.config/gwsadm-mcp/config.ini`).
 
+### Gemini CLI
+
+Add to `~/.gemini/settings.json` (or a project's `.gemini/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "gwsadm-mcp": {
+      "command": "gwsadm-mcp"
+    }
+  }
+}
+```
+
+As with Codex, add `"env": { "GWSADM_CONFIG": "..." }` only for a non-default
+config location. To expose only some tools, list them in `includeTools`.
+
 Any other MCP client that launches stdio servers works the same way: give it
 `gwsadm-mcp` as the command.
 
