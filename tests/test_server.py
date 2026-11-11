@@ -124,6 +124,8 @@ class FakeDomainClient:
     ):
         self.calls.append((application_name, event_name, max_pages, filters))
         self.starts.append((application_name, event_name, start))
+        self.ends = getattr(self, "ends", [])
+        self.ends.append((application_name, end))
         # The per-account / per-IP narrowing is recorded separately so the
         # existing call-shape assertions above stay untouched.
         self.scoped_calls.append((application_name, event_name, user_key, actor_ip, max_pages))
@@ -659,6 +661,134 @@ def test_gmail_user_usage_rejects_bad_input_before_any_call(inject):
     ):
         assert "error" in server.gmail_user_usage("s1@example.edu", **kwargs), kwargs
     assert getattr(c, "user_usage_calls", []) == []
+
+
+def test_gmail_user_usage_total_is_unknown_when_a_reporting_day_lacks_the_counter(inject):
+    c = FakeDomainClient("example.edu", {})
+    partial = _user_usage("2026-10-24", 3, 1)
+    partial["parameters"] = [p for p in partial["parameters"] if p["name"] != "gmail:num_emails_received"]
+    c.user_usage_by_date = {"2026-10-25": [_user_usage("2026-10-25", 1, 2)], "2026-10-24": [partial]}
+    inject([c], {"example.edu"})
+    out = server.gmail_user_usage("s1@example.edu", days=2, end_date="2026-10-25")
+    assert out["totals"]["num_emails_received"] is None
+    assert out["totals"]["num_emails_sent"] == 4
+
+
+# -- gmail_log_search ---------------------------------------------------------
+
+
+def _gmail_event(mid, subject, *, dest="gmail-ui::s1@example.edu", desc="", spam=False, att=0, links=(), action=3):
+    info = [
+        {"name": "action_type", "intValue": str(action)},
+        {"name": "subject", "value": subject},
+        {"name": "flattened_destinations", "value": dest},
+        {"name": "description", "value": desc},
+        {"name": "is_spam", "boolValue": spam},
+        {"name": "num_message_attachments", "intValue": str(att)},
+        {"name": "source"},
+    ]
+    if mid is not None:
+        info.append({"name": "rfc2822_message_id", "value": mid})
+    if links:
+        info.append({"name": "link_domain", "multiValue": list(links)})
+    return {
+        "type": "delivery_type",
+        "name": "delivery",
+        "parameters": [{"name": "message_info", "messageValue": {"parameter": info}}],
+    }
+
+
+def _gmail_item(time, *events, uq="1"):
+    return {"id": {"time": time, "uniqueQualifier": uq}, "events": list(events)}
+
+
+def test_gmail_log_search_groups_events_per_message(inject):
+    items = [
+        _gmail_item("2026-10-25T15:45:00Z", _gmail_event("<a@notifications.google.com>", "Security alert", action=68)),
+        _gmail_item(
+            "2026-10-25T15:28:00Z",
+            _gmail_event("<a@notifications.google.com>", "Security alert", links=("Google.com",), action=2),
+        ),
+        _gmail_item(
+            "2026-10-25T10:00:00Z",
+            _gmail_event(
+                "<b@example.org>",
+                "hello",
+                desc="The user you are trying to contact is receiving mail at a rate ...",
+                spam=True,
+                att=2,
+            ),
+            _gmail_event("<b@example.org>", "hello", desc="250 2.0.0 OK"),
+        ),
+    ]
+    c = FakeDomainClient("example.edu", {("gmail", None): (items, False)})
+    inject([c], {"example.edu"})
+    out = server.gmail_log_search("s1@example.edu", hours=48, end="2026-10-26T09:00:00+09:00")
+    assert out["window"] == {"hours": 48, "start": "2026-10-24T00:00:00+00:00", "end": "2026-10-26T00:00:00+00:00"}
+    assert out["events_scanned"] == 4 and out["messages_matched"] == 2
+    assert out["truncated"] is False and out["capped"] is False
+    a, b = out["messages"]  # newest last first
+    assert a["message_id"] == "<a@notifications.google.com>"
+    assert (a["first"], a["last"], a["events"]) == ("2026-10-25T15:28:00Z", "2026-10-25T15:45:00Z", 2)
+    assert a["action_types"] == ["2", "68"] and a["link_domains"] == ["google.com"]
+    assert b["spam"] is True and b["attachments"] == 2
+    # the 250 accept reply is noise; the throttle reply is kept
+    assert b["responses"] == ["The user you are trying to contact is receiving mail at a rate ..."]
+    assert b["destinations"] == ["gmail-ui::s1@example.edu"]
+    # one gmail fetch for the account, with an explicit end (the API requires both)
+    assert c.scoped_calls == [("gmail", None, "s1@example.edu", None, 5)]
+    assert c.ends == [("gmail", datetime.datetime(2026, 10, 26, tzinfo=datetime.timezone.utc))]
+
+
+def test_gmail_log_search_filters(inject):
+    items = [
+        _gmail_item("2026-10-25T15:00:00Z", _gmail_event("<a@x.example>", "Account Restricted")),
+        _gmail_item("2026-10-25T14:00:00Z", _gmail_event("<b@y.example>", "lunch", dest="smtp::bob@other.example")),
+    ]
+    c = FakeDomainClient("example.edu", {("gmail", None): (items, True)})
+    inject([c], {"example.edu"})
+    out = server.gmail_log_search("s1@example.edu", subject="restricted")
+    assert [m["message_id"] for m in out["messages"]] == ["<a@x.example>"]
+    assert out["events_scanned"] == 2 and out["capped"] is True
+    out = server.gmail_log_search("s1@example.edu", message_id="b@y.example")
+    assert [m["message_id"] for m in out["messages"]] == ["<b@y.example>"]
+    out = server.gmail_log_search("s1@example.edu", recipient="OTHER.example")
+    assert [m["message_id"] for m in out["messages"]] == ["<b@y.example>"]
+
+
+def test_gmail_log_search_events_without_message_id_stay_separate_and_truncate(inject):
+    items = [_gmail_item("2026-10-25T15:00:00Z", _gmail_event(None, "x"), _gmail_event(None, "y"))]
+    c = FakeDomainClient("example.edu", {("gmail", None): (items, False)})
+    inject([c], {"example.edu"})
+    out = server.gmail_log_search("s1@example.edu", max_messages=1)
+    assert out["messages_matched"] == 2 and len(out["messages"]) == 1 and out["truncated"] is True
+    assert out["messages"][0]["message_id"] is None
+
+
+def test_gmail_log_search_auth_error_is_whole_call_error(inject):
+    c = FakeDomainClient("example.edu", {("gmail", None): GwsAuthError("no audit scope")})
+    inject([c], {"example.edu"})
+    out = server.gmail_log_search("s1@example.edu")
+    assert out["error"] == "no audit scope" and "messages" not in out
+
+
+def test_gmail_log_search_rejects_bad_input_before_any_call(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    for kwargs in (
+        {"hours": 0},
+        {"hours": server.GMAIL_LOG_MAX_HOURS + 1},
+        {"max_pages": 0},
+        {"max_pages": server.GMAIL_LOG_MAX_PAGES + 1},
+        {"max_messages": 0},
+        {"end": "2026-10-26"},  # no time, no offset
+        {"end": "2026-10-26T00:00:00"},  # naive
+        {"end": "2999-01-01T00:00:00+00:00"},  # future
+        {"message_id": "not an id"},
+        {"subject": "x" * (server.GMAIL_LOG_MAX_FILTER_LEN + 1)},
+    ):
+        assert "error" in server.gmail_log_search("s1@example.edu", **kwargs), kwargs
+    assert c.calls == []
 
 
 def test_suspended_accounts_projects_and_counts(inject):

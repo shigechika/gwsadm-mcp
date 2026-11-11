@@ -88,6 +88,17 @@ def test_fetch_activities_paginates_and_passes_params():
     assert a.calls[1]["pageToken"] == "tok"
 
 
+def test_fetch_activities_gmail_always_sends_an_end_time():
+    import datetime
+
+    c, a = _client([{"items": []}])
+    start = datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
+    c.fetch_activities("gmail", start=start)
+    assert "endTime" in a.calls[0]  # the gmail application 400s without it
+    c.fetch_activities("login", start=start)
+    assert "endTime" not in a.calls[1]
+
+
 def test_fetch_activities_caps_pages():
     import datetime
 

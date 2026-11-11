@@ -864,7 +864,14 @@ class DomainClient:
         ``actorIpAddress`` parameter) — both server-side, so the page budget
         is spent on the matching events only. Callers own validating those
         values too: ``user_key`` becomes part of the request URL.
+
+        The ``gmail`` application rejects an open-ended window (HTTP 400:
+        "Start time and end time should both be provided, and the scan
+        duration should not be greater than 30 days"), so for it a missing
+        ``end`` becomes now.
         """
+        if end is None and application_name == "gmail":
+            end = datetime.datetime.now(datetime.timezone.utc)
         params = {
             "userKey": user_key,
             "applicationName": application_name,

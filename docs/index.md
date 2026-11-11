@@ -20,7 +20,7 @@ is started with `GWSADM_ENABLE_SIGN_OUT=1`.
 | Service status | `workspace_status` |
 | OAuth | `user_oauth_tokens` |
 | Drive | `drive_external_sharing`, `drive_doc_activity`, `shared_drive_membership_changes` |
-| Gmail | `gmail_message_trace`, `gmail_usage_report`, `gmail_user_usage`, `dmarc_rua_summary` |
+| Gmail | `gmail_message_trace`, `gmail_usage_report`, `gmail_user_usage`, `gmail_log_search`, `dmarc_rua_summary` |
 | Groups | `group_delivery_policy`, `list_group_members` |
 
 Planned: `dlp_events` (Reports `rules`; requires a Workspace edition with

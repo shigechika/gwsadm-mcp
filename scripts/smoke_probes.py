@@ -315,6 +315,13 @@ PROBES: dict[str, Probe] = {
         rows_key="daily",
         allow_empty=True,
     ),
+    "gmail_log_search": Probe(
+        args={"hours": 1, "max_pages": 1, "max_messages": 5},
+        args_factory=_some_account,
+        require_keys=("domain", "username", "window", "events_scanned", "messages", "capped"),
+        rows_key="messages",
+        allow_empty=True,
+    ),
     "suspended_accounts": Probe(
         args={"max_pages": 1},
         require_keys=("domains",),

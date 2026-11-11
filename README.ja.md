@@ -19,6 +19,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | `login_audit` | Reports API `login` — **Google により自動無効化されたアカウント**（`account_disabled_*`： 漏洩パスワード・乗っ取り・スパム送信）、不審なログイン、失敗の多い順トップN |
 | `gmail_usage_report` | Reports API `customerUsageReports` — ドメイン別・日次のGmail送受信通数。1日1回のAPI呼び出しで、対象は昨日まで（APIの日付基準はUTC-8:00／PST）。別付与の `admin.reports.usage.readonly` DWD スコープが必要（下記「認証方式」参照）— `admin.reports.audit.readonly` とは同じReports APIでも別のグラント |
 | `gmail_user_usage` | Reports API `userUsageReport` — 1 アカウントの日次のGmail送受信・迷惑メール通数（期間指定、APIの日付基準はUTC-8:00／PST）。迷惑メール判定による制限や乗っ取りの後に「大量送信があったか」を確かめる。`gmail_usage_report` と同じ `admin.reports.usage.readonly` スコープ |
+| `gmail_log_search` | Reports API `activities().list` を `gmail` アプリ・`userKey=<username>` で — **1 アカウント**の Gmail ログを Message-ID ごとに 1 行（件名・宛先・250 以外の Google の配送応答（受信レート制限など）・迷惑メール判定・添付数・リンク先ドメイン）にまとめ、件名・Message-ID・宛先で絞り込む。期間は最大 30 日（API の上限）で、終わりを ISO 8601 の `end` で指定できる。メタデータだけで本文は読まない。ログに差出人アドレスは入らない。`user_activity` と同じ `admin.reports.audit.readonly` スコープ |
 | `suspended_accounts` | Directory API — **停止中**アカウントの現在スナップショット（`isSuspended=true`）。下流 IdP（KeyCloak 等）と突合し、停止済みなのに IdP 側で有効なままのアカウントを洗い出す |
 | `get_user` | Directory API `users().get` — **アドレスを指定した1アカウント**の現在の状態： `suspended`（理由・停止日時付き）、`archived`、`last_login`、2段階認証の登録/強制、組織部門、作成日時、次回ログイン時のパスワード変更要求。「なぜこの人はログインできないのか」に1リクエスト・ページングなしで答える。アドレスが既に分かっているときは `suspended_accounts` ではなくこちらを使う： あちらは停止中のアカウントだけを列挙するので、指定アドレスが停止**されていない**ことは確認できない（さらにその一覧がページ上限を超えると、載っていないこと自体が根拠にならなくなる）。`suspended_accounts` が既に使っているスコープ以外は不要 |
 | `user_oauth_tokens` | Directory API `tokens().list` — **特定ユーザー1名**の第三者OAuthアプリ連携一覧。既存トークンはログイン不要で使えるため `login_audit` では検知できない侵害経路。ドメインはユーザー名のサフィックスから解決（エイリアス/セカンダリドメインのアドレス用に `domain` で明示指定も可） |
@@ -53,7 +54,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
-| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`user_activity`、`ip_activity`、`admin_actions`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | `login_audit`、`user_activity`、`gmail_log_search`、`ip_activity`、`admin_actions`、`drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes`、`daily_brief*` | それらのツールがドメイン単位のエラーに縮退 |
 | `https://www.googleapis.com/auth/admin.directory.user.readonly` | `suspended_accounts`、`get_user`、`sign_out_user`（オプトイン。事前のアカウント確認） | それらのツールだけエラーに縮退（`suspended_accounts` はドメイン単位）。他は動作を続ける |
 | `https://www.googleapis.com/auth/admin.directory.user.security` | `user_oauth_tokens`・`sign_out_user`（オプトイン） | それらのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 

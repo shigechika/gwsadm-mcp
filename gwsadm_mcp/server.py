@@ -9,6 +9,8 @@ Phase 1 tools:
   see its docstring)
 - ``gmail_user_usage``        — daily Gmail send/receive counts for one account (Reports API
   ``userUsageReport``; same ``admin.reports.usage.readonly`` scope as ``gmail_usage_report``)
+- ``gmail_log_search``        — one account's Gmail log, one row per Message-ID (Reports API
+  ``activities().list`` for ``gmail``; metadata only, ``admin.reports.audit.readonly``)
 - ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
 - ``get_user``                — one named account's state: suspended/archived/2SV/last login
   (Directory API; same ``admin.directory.user.readonly`` scope as ``suspended_accounts``)
@@ -771,10 +773,12 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
 
     Per day (newest first): ``num_emails_sent``, ``num_emails_received``,
     ``num_emails_exchanged`` and ``num_spam_emails_received``. ``totals``
-    sums the days that returned a report. A day Google has no report for
-    (not processed yet -- these counters lag by days -- or before the
-    account existed) is listed in ``missing_dates``, never counted as zero. A single day's fetch failing lands in
-    ``date_errors``; the other days still answer. A missing DWD scope or a
+    sums the days that returned a report; a counter that one of those days
+    lacks has a ``None`` total (unknown), never a partial sum. A day Google
+    has no report for (not processed yet -- these counters lag by days -- or
+    before the account existed) is listed in ``missing_dates``, never counted
+    as zero. A single day's fetch failing lands in ``date_errors``; the other
+    days still answer. A missing DWD scope or a
     rejected credential is a whole-call ``{"error": ...}``.
 
     Dates are the Reports API's own UTC-08:00 days (Pacific Standard Time,
@@ -818,7 +822,7 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
     daily: list[dict] = []
     missing: list[str] = []
     date_errors: list[dict] = []
-    totals = dict.fromkeys(GMAIL_USER_USAGE_COUNTERS, 0)
+    totals: dict[str, int | None] = dict.fromkeys(GMAIL_USER_USAGE_COUNTERS, 0)
     for date in dates:
         r = results[date]
         if isinstance(r, GwsAuthError):
@@ -838,7 +842,11 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
         for name in GMAIL_USER_USAGE_COUNTERS:
             v = _int_or_none(p.get(f"gmail:{name}"))
             row[name] = v
-            if v is not None:
+            # A day that reported but lacks this counter makes its total
+            # unknown, not smaller: a partial sum would read as complete.
+            if v is None:
+                totals[name] = None
+            elif totals[name] is not None:
                 totals[name] += v
         daily.append(row)
     return {
@@ -849,6 +857,249 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
         "totals": totals,
         "missing_dates": missing,
         "date_errors": date_errors,
+    }
+
+
+# The Reports API refuses a gmail scan longer than 30 days.
+GMAIL_LOG_MAX_HOURS = 720
+GMAIL_LOG_MAX_PAGES = 20
+GMAIL_LOG_MAX_MESSAGES = 1000
+GMAIL_LOG_MAX_FILTER_LEN = 256
+# Gmail log ``description`` values that only say the next hop accepted the
+# message; kept out of ``responses`` so a bounce or throttle reply stands out.
+_GMAIL_ACCEPTED_PREFIX = "250 "
+
+
+def _flat_message_value(param: dict) -> dict:
+    """Flatten one ``messageValue`` parameter of a Gmail log event to a dict."""
+    out: dict = {}
+    for q in (param.get("messageValue") or {}).get("parameter") or []:
+        name = q.get("name")
+        if not name:
+            continue
+        for key in ("value", "intValue", "boolValue", "multiValue"):
+            if key in q:
+                out[name] = q[key]
+                break
+    return out
+
+
+def _gmail_message_info(event: dict) -> dict:
+    for p in event.get("parameters") or []:
+        if p.get("name") == "message_info":
+            return _flat_message_value(p)
+    return {}
+
+
+def _log_window_end(end: str | None) -> datetime.datetime:
+    """``end`` as an aware UTC datetime (default now); raises ``GwsError``.
+
+    Only a full timestamp with an explicit offset is accepted: a bare date or
+    a naive time would be read in some guessed zone and shift the window by
+    hours. A future ``end`` is refused rather than clamped, so the window
+    the answer reports is the one that was asked for.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if end is None:
+        return now
+    parsed = _feed_time(end)
+    if parsed is None or "T" not in end:
+        raise GwsError(
+            f"end must be an ISO 8601 timestamp with an offset (e.g. 2026-10-26T00:00:00+09:00), got {end!r}"
+        )
+    parsed = parsed.astimezone(datetime.timezone.utc)
+    if parsed > now:
+        raise GwsError(f"end must not be in the future, got {end}")
+    return parsed
+
+
+def _split_destinations(raw) -> list[str]:
+    if not isinstance(raw, str):
+        return []
+    return [d.strip() for d in raw.split(",") if d.strip()]
+
+
+@mcp.tool()
+def gmail_log_search(
+    username: str,
+    hours: int = 24,
+    end: str | None = None,
+    subject: str | None = None,
+    message_id: str | None = None,
+    recipient: str | None = None,
+    max_pages: int = 5,
+    max_messages: int = 100,
+    domain: str | None = None,
+) -> dict:
+    """Search ONE account's Gmail log (metadata only), one row per message.
+
+    The Admin console's "Email log search" for one account: which messages
+    reached or left the mailbox in a window, with their subject, Message-ID,
+    destinations and Google's delivery reply. Use it to find a notice Google
+    sent the account (filter by ``subject``), to confirm one message's
+    delivery (``message_id``), or to see what Google answered when mail to or
+    from the account bounced or was throttled (``responses``). It never reads
+    a message body: it issues only Reports API ``activities().list`` for the
+    ``gmail`` application under ``userKey=<username>``, on the same
+    ``admin.reports.audit.readonly`` DWD scope as ``user_activity``. The
+    tenant must have Gmail log events in the Reports API.
+
+    The log does not carry the sender's address (its ``source`` is empty in
+    the API), so a sender is recognisable only by the domain on the right of
+    the Message-ID and by ``link_domains``. Events are grouped by
+    ``rfc2822_message_id``; per message: ``first`` / ``last`` event time,
+    ``events`` (deliveries etc. counted raw), ``event_names``,
+    ``action_types`` (Google's numeric codes, undocumented, passed through),
+    ``destinations`` (as Google flattens them, ``channel::address``),
+    ``spam`` (any event marked it), ``attachments``, ``link_domains``, and
+    ``responses`` -- the distinct non-empty ``description`` replies other
+    than the ``250`` accepted ones. Rows are newest ``last`` first, cut at
+    ``max_messages`` with ``truncated`` saying so.
+
+    Filters are applied to each fetched event before grouping, so a row
+    aggregates only its matching events: ``subject`` and ``recipient``
+    are case-insensitive substrings (of the subject / of the flattened
+    destinations), ``message_id`` is exact (angle brackets optional).
+    ``events_scanned`` counts events before filtering. ``capped`` means more
+    pages existed beyond ``max_pages`` (1000 events per page) -- the older
+    part of the window was not read, so "not found" does not hold. Today's
+    log can lag by hours.
+
+    Args:
+        username: Exact user email, passed through as the Reports API
+            ``userKey``.
+        hours: Window length ending at ``end``, ``1..``:data:`GMAIL_LOG_MAX_HOURS`
+            (the API refuses a gmail scan longer than 30 days).
+        end: End of the window, ISO 8601 with an offset
+            (``2026-10-26T00:00:00+09:00``). Default: now. Must not be in
+            the future.
+        subject: Keep messages whose subject contains this text.
+        message_id: Keep the message with this RFC 822 Message-ID.
+        recipient: Keep messages whose destinations contain this text
+            (an address or a domain).
+        max_pages: Page budget, ``1..``:data:`GMAIL_LOG_MAX_PAGES`.
+        max_messages: Rows returned, ``1..``:data:`GMAIL_LOG_MAX_MESSAGES`.
+        domain: Configured ``[domain.*]`` section to route the lookup
+            through. Default: resolved from the username's suffix.
+    """
+    username = username.strip()
+    if not (1 <= hours <= GMAIL_LOG_MAX_HOURS):
+        return {"username": username, "error": f"hours must be between 1 and {GMAIL_LOG_MAX_HOURS}, got {hours}"}
+    if not (1 <= max_pages <= GMAIL_LOG_MAX_PAGES):
+        return {
+            "username": username,
+            "error": f"max_pages must be between 1 and {GMAIL_LOG_MAX_PAGES}, got {max_pages}",
+        }
+    if not (1 <= max_messages <= GMAIL_LOG_MAX_MESSAGES):
+        return {
+            "username": username,
+            "error": f"max_messages must be between 1 and {GMAIL_LOG_MAX_MESSAGES}, got {max_messages}",
+        }
+    want_subject = subject.strip().lower() if subject and subject.strip() else None
+    want_recipient = recipient.strip().lower() if recipient and recipient.strip() else None
+    want_id = message_id.strip().strip("<>") if message_id and message_id.strip() else None
+    for label, value in (("subject", want_subject), ("recipient", want_recipient), ("message_id", want_id)):
+        if value is not None and len(value) > GMAIL_LOG_MAX_FILTER_LEN:
+            return {"username": username, "error": f"{label} is longer than {GMAIL_LOG_MAX_FILTER_LEN} characters"}
+    if want_id is not None and not _MESSAGE_ID_RE.match(want_id):
+        return {"username": username, "error": "message_id is not a valid RFC 822 Message-ID (local@domain expected)"}
+    try:
+        stop = _log_window_end(end)
+        c = _resolve_user_client(username, domain)
+    except (ConfigError, GwsError) as e:
+        return {"username": username, "error": str(e)}
+    start = stop - datetime.timedelta(hours=hours)
+    try:
+        items, capped = c.fetch_activities("gmail", start=start, end=stop, max_pages=max_pages, user_key=username)
+    except (GwsAuthError, GwsError) as e:
+        return {"domain": c.domain, "username": username, "error": str(e)}
+
+    scanned = 0
+    messages: dict = {}
+    for item in items:
+        t = (item.get("id") or {}).get("time")
+        for n, event in enumerate(item.get("events") or []):
+            scanned += 1
+            mi = _gmail_message_info(event)
+            subj = mi.get("subject") if isinstance(mi.get("subject"), str) else None
+            mid = mi.get("rfc2822_message_id") if isinstance(mi.get("rfc2822_message_id"), str) else None
+            dests = _split_destinations(mi.get("flattened_destinations"))
+            if want_subject is not None and want_subject not in (subj or "").lower():
+                continue
+            if want_id is not None and (mid or "").strip().strip("<>") != want_id:
+                continue
+            if want_recipient is not None and not any(want_recipient in d.lower() for d in dests):
+                continue
+            # An event without a Message-ID stays its own row rather than
+            # merging every such event into one.
+            key = mid or f"(no id) {t} {(item.get('id') or {}).get('uniqueQualifier')} {n}"
+            row = messages.setdefault(
+                key,
+                {
+                    "message_id": mid,
+                    "subject": subj,
+                    "first": t,
+                    "last": t,
+                    "events": 0,
+                    "event_names": set(),
+                    "action_types": set(),
+                    "destinations": set(),
+                    "spam": False,
+                    "attachments": None,
+                    "link_domains": set(),
+                    "responses": set(),
+                },
+            )
+            row["events"] += 1
+            if subj and not row["subject"]:
+                row["subject"] = subj
+            if t and (row["first"] is None or t < row["first"]):
+                row["first"] = t
+            if t and (row["last"] is None or t > row["last"]):
+                row["last"] = t
+            if event.get("name"):
+                row["event_names"].add(event["name"])
+            if mi.get("action_type") is not None:
+                row["action_types"].add(str(mi["action_type"]))
+            row["destinations"].update(dests)
+            if str(mi.get("is_spam")).lower() == "true":
+                row["spam"] = True
+            att = _int_or_none(mi.get("num_message_attachments"))
+            if att is not None:
+                row["attachments"] = max(att, row["attachments"] or 0)
+            links = mi.get("link_domain")
+            if isinstance(links, list):
+                row["link_domains"].update(str(x).lower() for x in links if x)
+            desc = mi.get("description")
+            if isinstance(desc, str) and desc.strip() and not desc.startswith(_GMAIL_ACCEPTED_PREFIX):
+                row["responses"].add(desc.strip())
+
+    rows = [
+        {
+            **r,
+            "event_names": sorted(r["event_names"]),
+            "action_types": sorted(r["action_types"], key=lambda x: (len(x), x)),
+            "destinations": sorted(r["destinations"]),
+            "link_domains": sorted(r["link_domains"]),
+            "responses": sorted(r["responses"]),
+        }
+        for r in messages.values()
+    ]
+    rows.sort(key=lambda r: r["last"] or "", reverse=True)
+    return {
+        "domain": c.domain,
+        "username": username,
+        "window": {
+            "hours": hours,
+            "start": start.isoformat(timespec="seconds"),
+            "end": stop.isoformat(timespec="seconds"),
+        },
+        "filters": {"subject": want_subject, "message_id": want_id, "recipient": want_recipient},
+        "events_scanned": scanned,
+        "messages_matched": len(rows),
+        "messages": rows[:max_messages],
+        "truncated": len(rows) > max_messages,
+        "capped": capped,
     }
 
 
