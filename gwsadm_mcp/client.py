@@ -79,6 +79,8 @@ SCOPE_DIRECTORY_SECURITY = "https://www.googleapis.com/auth/admin.directory.user
 # READ stays narrow even though the DWD GRANT is broader than the other
 # three scopes in this file.
 SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.readonly"
+# The Reports API refuses a gmail activity window longer than this.
+GMAIL_MAX_SCAN = datetime.timedelta(days=30)
 # Groups Settings is a distinct API/product from the Directory API scopes
 # below -- it answers "what is this group's own access-control policy"
 # (who_can_post, allow_external_members, moderation), not "who is in it".
@@ -533,6 +535,19 @@ def _google_message(e: HttpError) -> str:
     return msg.strip()[:200] if isinstance(msg, str) else ""
 
 
+def _http_error_text(e: HttpError) -> str:
+    """``HTTP <status>`` plus Google's own reason when the body carries one.
+
+    A bare status hides the cause a caller needs to correct the request, e.g.
+    a ``gmail`` activities query answers HTTP 400 with "Start time and end
+    time should both be provided ...".
+    """
+    status = _http_status(e)
+    msg = _google_message(e)
+    head = f"HTTP {status if status is not None else '?'}"
+    return f"{head}: {msg}" if msg else head
+
+
 def _request_timeout(deadline: float | None) -> float | None:
     """Socket timeout for one request that must end by ``deadline`` (None: the default)."""
     if deadline is None:
@@ -851,7 +866,21 @@ class DomainClient:
         ``actorIpAddress`` parameter) — both server-side, so the page budget
         is spent on the matching events only. Callers own validating those
         values too: ``user_key`` becomes part of the request URL.
+
+        The ``gmail`` application rejects an open-ended window (HTTP 400:
+        "Start time and end time should both be provided, and the scan
+        duration should not be greater than 30 days"), so for it a missing
+        ``end`` becomes now, and a window longer than :data:`GMAIL_MAX_SCAN`
+        is refused here with that reason instead of a bare 400.
         """
+        if application_name == "gmail":
+            if end is None:
+                end = datetime.datetime.now(datetime.timezone.utc)
+            if end - start > GMAIL_MAX_SCAN:
+                raise GwsError(
+                    f"[{self.domain}] reports API error (gmail): the gmail log can be scanned "
+                    f"at most {GMAIL_MAX_SCAN.days} days at a time, asked for {(end - start).days} days"
+                )
         params = {
             "userKey": user_key,
             "applicationName": application_name,
@@ -881,8 +910,7 @@ class DomainClient:
                 if not token or pages >= max_pages:
                     break
         except HttpError as e:
-            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
-            raise GwsError(f"[{self.domain}] reports API error ({application_name}): HTTP {status}") from e
+            raise GwsError(f"[{self.domain}] reports API error ({application_name}): {_http_error_text(e)}") from e
         except GoogleAuthError as e:
             # Typical: DWD scope not granted for this client, or wrong subject.
             raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
@@ -940,14 +968,50 @@ class DomainClient:
                 if not token or pages >= max_pages:
                     break
         except HttpError as e:
-            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", "?")
-            raise GwsError(f"[{self.domain}] reports API error (customerUsageReports, {date}): HTTP {status}") from e
+            raise GwsError(
+                f"[{self.domain}] reports API error (customerUsageReports, {date}): {_http_error_text(e)}"
+            ) from e
         except GoogleAuthError as e:
             # Typical: DWD scope not granted for this client, or wrong subject.
             raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (customerUsageReports, {date}): {type(e).__name__}") from e
         return reports, bool(token)
+
+    def fetch_user_usage(
+        self, user_key: str, *, date: str, parameters: str | None = None
+    ) -> tuple[list[dict], list[str]]:
+        """Fetch ONE account's usage report for ONE day (Reports API ``userUsageReport``).
+
+        The per-user counterpart of :meth:`fetch_customer_usage`: same
+        ``yyyy-mm-dd`` day in the API's UTC-8:00 anchor, same
+        ``admin.reports.usage.readonly`` DWD scope and service, same
+        ``app_name:param_name`` ``parameters`` filter. ``user_key`` is the
+        account's email or profile id and becomes part of the request URL, so
+        callers own validating it. One account and one day is a single
+        record, so no pagination is followed.
+
+        Returns ``(usage_reports, warning_codes)``: the ``usageReports`` list
+        as Google returns it -- empty when Google has no report for that
+        account and day -- and the ``code`` of each ``warnings`` entry (e.g.
+        ``DATA_NOT_AVAILABLE``, or ``PARTIAL_DATA_AVAILABLE`` beside a report
+        whose counters are not complete yet).
+        """
+        params: dict = {"userKey": user_key, "date": date, "customerId": self.cfg.customer_id}
+        if parameters:
+            params["parameters"] = parameters
+        try:
+            svc = self._reports_usage_service()
+            http = self._new_http(self._reports_usage_creds)
+            resp = self._execute(lambda: svc.userUsageReport().get(**params), http)
+        except HttpError as e:
+            raise GwsError(f"[{self.domain}] reports API error (userUsageReport, {date}): {_http_error_text(e)}") from e
+        except GoogleAuthError as e:
+            raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
+        except (httplib2.HttpLib2Error, OSError) as e:
+            raise GwsError(f"[{self.domain}] transport error (userUsageReport, {date}): {type(e).__name__}") from e
+        warnings = [str(w.get("code")) for w in resp.get("warnings") or [] if isinstance(w, dict) and w.get("code")]
+        return resp.get("usageReports", []) or [], warnings
 
     def list_suspended_users(self, *, max_pages: int = 20) -> tuple[list[dict], bool]:
         """List currently suspended users in this domain (Directory API).

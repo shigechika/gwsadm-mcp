@@ -88,6 +88,29 @@ def test_fetch_activities_paginates_and_passes_params():
     assert a.calls[1]["pageToken"] == "tok"
 
 
+def test_fetch_activities_gmail_always_sends_an_end_time():
+    import datetime
+
+    c, a = _client([{"items": []}])
+    start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    c.fetch_activities("gmail", start=start)
+    assert "endTime" in a.calls[0]  # the gmail application 400s without it
+    c.fetch_activities("login", start=start)
+    assert "endTime" not in a.calls[1]
+
+
+def test_fetch_activities_gmail_refuses_a_window_over_30_days_without_a_call():
+    import datetime
+
+    c, a = _client([{"items": []}])
+    end = datetime.datetime(2026, 10, 26, tzinfo=datetime.timezone.utc)
+    with pytest.raises(GwsError, match="at most 30 days"):
+        c.fetch_activities("gmail", start=end - datetime.timedelta(days=31), end=end)
+    assert a.calls == []
+    c.fetch_activities("gmail", start=end - datetime.timedelta(days=30), end=end)  # exactly 30 is fine
+    assert len(a.calls) == 1
+
+
 def test_fetch_activities_caps_pages():
     import datetime
 
@@ -159,6 +182,79 @@ def test_fetch_customer_usage_http_error_maps_to_gws_error():
     c, _ = _usage_client([], exc=err)
     with pytest.raises(GwsError):
         c.fetch_customer_usage(date="2026-08-30")
+
+
+def test_reports_http_errors_carry_googles_reason():
+    import datetime
+
+    body = b'{"error": {"code": 400, "message": "Start time and end time should both be provided."}}'
+    err = HttpError(httplib2.Response({"status": "400"}), body)
+    c, _ = _client([], exc=err)
+    with pytest.raises(GwsError, match=r"HTTP 400: Start time and end time should both be provided\."):
+        c.fetch_activities("gmail", start=datetime.datetime.now(datetime.timezone.utc))
+    c, _ = _usage_client([], exc=err)
+    with pytest.raises(GwsError, match=r"HTTP 400: Start time"):
+        c.fetch_customer_usage(date="2026-08-30")
+
+
+def test_reports_http_error_without_body_message_is_bare_status():
+    err = HttpError(httplib2.Response({"status": "403"}), b"not json")
+    c, _ = _usage_client([], exc=err)
+    with pytest.raises(GwsError, match=r"HTTP 403$"):
+        c.fetch_customer_usage(date="2026-08-30")
+
+
+class FakeUserUsageReport:
+    def __init__(self, resp, exc=None):
+        self.resp, self.exc, self.calls = resp, exc, []
+
+    def get(self, **kw):
+        self.calls.append(kw)
+        return _Req(self.resp, self.exc)
+
+
+class FakeReportsUserUsage:
+    def __init__(self, resp, exc=None):
+        self._u = FakeUserUsageReport(resp, exc)
+
+    def userUsageReport(self):
+        return self._u
+
+
+def test_fetch_user_usage_passes_params_and_returns_reports():
+    svc = FakeReportsUserUsage({"usageReports": [{"date": "2026-10-24", "parameters": []}]})
+    c = DomainClient(CFG, reports_usage_service=svc)
+    reports, warnings = c.fetch_user_usage("s1@example.edu", date="2026-10-24", parameters="gmail:num_emails_sent")
+    assert reports == [{"date": "2026-10-24", "parameters": []}] and warnings == []
+    assert svc._u.calls == [
+        {
+            "userKey": "s1@example.edu",
+            "date": "2026-10-24",
+            "customerId": "C0abc",
+            "parameters": "gmail:num_emails_sent",
+        }
+    ]
+
+
+def test_fetch_user_usage_no_report_is_empty_list_with_warning_codes():
+    svc = FakeReportsUserUsage({"warnings": [{"code": "DATA_NOT_AVAILABLE", "message": "x"}, "junk"]})
+    c = DomainClient(CFG, reports_usage_service=svc)
+    assert c.fetch_user_usage("s1@example.edu", date="2026-10-24") == ([], ["DATA_NOT_AVAILABLE"])
+    assert "parameters" not in svc._u.calls[0]
+
+
+def test_fetch_user_usage_errors_map():
+    from google.auth.exceptions import RefreshError
+
+    from gwsadm_mcp.client import GwsAuthError
+
+    err = HttpError(httplib2.Response({"status": "400"}), b'{"error": {"message": "Invalid date"}}')
+    c = DomainClient(CFG, reports_usage_service=FakeReportsUserUsage(None, err))
+    with pytest.raises(GwsError, match=r"userUsageReport, 2026-10-24\): HTTP 400: Invalid date"):
+        c.fetch_user_usage("s1@example.edu", date="2026-10-24")
+    c = DomainClient(CFG, reports_usage_service=FakeReportsUserUsage(None, RefreshError("unauthorized_client")))
+    with pytest.raises(GwsAuthError):
+        c.fetch_user_usage("s1@example.edu", date="2026-10-24")
 
 
 def test_fetch_customer_usage_auth_error_maps_to_gws_auth_error():
