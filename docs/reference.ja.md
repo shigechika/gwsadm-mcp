@@ -20,6 +20,7 @@
 | `workspace_status` | Google Workspace ステータスダッシュボード（公開フィード、認証不要）— 未解決の障害と、期間内に終わった障害。製品（`Gmail`、`Drive` など）で絞れる。テナント側を調べる前に「Google 側か」に答える |
 | `gmail_message_trace` | Gmail API — **既知の** Message-ID が**特定の**メールボックスに届いたか、届いたならどこに入っているか（受信トレイ/迷惑メール/ゴミ箱/アーカイブ）を確認する。宛先ごとに DWD でそのユーザーになりすまし、本人のメールボックスを検索する。別付与の `gmail.readonly` DWD スコープが必要。未付与のドメインは宛先ごとのエラーとして報告され、誤って「届いていない」扱いにはならない |
 | `gmail_usage_report` | Reports API `customerUsageReports` — ドメイン別・日次のGmail送受信通数、昨日まで（APIの日付基準はUTC-8:00／PST）。別付与の `admin.reports.usage.readonly` DWD スコープが必要 — `admin.reports.audit.readonly` とは同じReports APIでも別のグラント |
+| `gmail_user_usage` | Reports API `userUsageReport` — 1 アカウントの日次のGmail送受信・迷惑メール通数（期間指定、APIの日付基準はUTC-8:00／PST）。迷惑メール判定による制限や乗っ取りの後に「大量送信があったか」を確かめる。`gmail_usage_report` と同じ `admin.reports.usage.readonly` スコープ |
 | `dmarc_rua_summary` | Gmail API — DMARC 集約（RUA）レポートのドメイン別 PASS/FAIL 集計と reject 候補送信元IPの上位一覧。ドメインの設定値 `dmarc_rua_mailbox`（実ユーザー。既定 `postmaster@<domain>`）になりすまし、`dmarc_rua_recipient`（既定は mailbox と同じ）宛のメールを検索して圧縮された添付レポートを読む。`dmarc_rua_mailbox = none` のドメインは `skipped` として返る。`gmail_message_trace` と同じ `gmail.readonly` DWD スコープを使うが、メタデータだけでなく添付内容を読む |
 | `group_delivery_policy` | Groups Settings API — Google グループ自体の投稿/配送ポリシー（`who_can_post`、`allow_external_members`、モデレーションレベル）。別付与の `apps.groups.settings` DWD スコープが必要 |
 | `list_group_members` | Directory API — Google グループの基本情報とメンバー一覧を直接取得する。別付与の `admin.directory.group.readonly` と `admin.directory.group.member.readonly` DWD スコープが必要 |
@@ -44,7 +45,7 @@
 
 | スコープ | 必要とするツール | 未付与の場合 |
 |------|------|------|
-| `https://www.googleapis.com/auth/admin.reports.usage.readonly` | `gmail_usage_report` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
+| `https://www.googleapis.com/auth/admin.reports.usage.readonly` | `gmail_usage_report`, `gmail_user_usage` | そのツールだけドメイン単位のエラーに縮退。他は動作を続ける |
 | `https://www.googleapis.com/auth/gmail.readonly` | `gmail_message_trace`、`dmarc_rua_summary`、`compromise_sweep`（`gmail` 節） | それらのツールだけ宛先/ドメイン単位のエラーに縮退。他は動作を続ける |
 | `https://www.googleapis.com/auth/apps.groups.settings` | `group_delivery_policy` | そのツールだけエラーに縮退。他は動作を続ける |
 | `https://www.googleapis.com/auth/admin.directory.group.readonly` | `list_group_members`（グループ情報側） | この側だけが自分のエラーを返す。下のメンバー用スコープが付与されていればメンバー一覧側は独立して動作する |

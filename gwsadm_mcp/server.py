@@ -7,6 +7,8 @@ Phase 1 tools:
 - ``gmail_usage_report``      — daily Gmail send/receive counts per domain (Reports API
   ``customerUsageReports``; requires the separate ``admin.reports.usage.readonly`` DWD scope —
   see its docstring)
+- ``gmail_user_usage``        — daily Gmail send/receive counts for one account (Reports API
+  ``userUsageReport``; same ``admin.reports.usage.readonly`` scope as ``gmail_usage_report``)
 - ``suspended_accounts``      — current snapshot of suspended accounts (Directory API)
 - ``get_user``                — one named account's state: suspended/archived/2SV/last login
   (Directory API; same ``admin.directory.user.readonly`` scope as ``suspended_accounts``)
@@ -719,6 +721,135 @@ def gmail_usage_report(days: int = 7, domain: str | None = None) -> dict:
     except (ConfigError, GwsError) as e:
         return {"error": str(e)}
     return {"days": days, "domains": _gmail_usage_report(picked, days)}
+
+
+# Per-account Gmail counters userUsageReport.get serves (names verified against
+# a live tenant); the same filter style as GMAIL_USAGE_PARAMETERS.
+GMAIL_USER_USAGE_COUNTERS = (
+    "num_emails_sent",
+    "num_emails_received",
+    "num_emails_exchanged",
+    "num_spam_emails_received",
+)
+GMAIL_USER_USAGE_PARAMETERS = ",".join(f"gmail:{n}" for n in GMAIL_USER_USAGE_COUNTERS)
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _usage_dates(days: int, end_date: str | None) -> list[str]:
+    """``days`` consecutive ``yyyy-mm-dd`` dates, newest first, ending at
+    ``end_date`` (default: yesterday) in the Reports API's UTC-8:00 anchor.
+
+    Raises ``GwsError`` for a malformed ``end_date`` or one later than
+    yesterday there -- today's counters are not final, so a window reaching
+    it would mix a partial day in with complete ones.
+    """
+    yesterday = datetime.datetime.now(_REPORTS_USAGE_DATE_TZ).date() - datetime.timedelta(days=1)
+    if end_date is None:
+        end = yesterday
+    else:
+        end_date = end_date.strip()
+        try:
+            if not _ISO_DATE_RE.match(end_date):
+                raise ValueError
+            end = datetime.date.fromisoformat(end_date)
+        except ValueError:
+            raise GwsError(f"end_date must be yyyy-mm-dd, got {end_date!r}") from None
+        if end > yesterday:
+            raise GwsError(f"end_date must be {yesterday.isoformat()} or earlier (UTC-08:00), got {end_date}")
+    return [(end - datetime.timedelta(days=d)).isoformat() for d in range(days)]
+
+
+@mcp.tool()
+def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, domain: str | None = None) -> dict:
+    """Daily Gmail send/receive counts for ONE account (Admin SDK userUsageReport).
+
+    Answers "did this account send a burst of mail on day X" -- the question
+    after Google restricts an account for suspected spamming, or after a
+    compromise. ``gmail_usage_report`` is the domain-wide total and cannot
+    single one account out; this is the per-account counter.
+
+    Per day (newest first): ``num_emails_sent``, ``num_emails_received``,
+    ``num_emails_exchanged`` and ``num_spam_emails_received``. ``totals``
+    sums the days that returned a report. A day Google has no report for
+    (not processed yet -- these counters lag by days -- or before the
+    account existed) is listed in ``missing_dates``, never counted as zero. A single day's fetch failing lands in
+    ``date_errors``; the other days still answer. A missing DWD scope or a
+    rejected credential is a whole-call ``{"error": ...}``.
+
+    Dates are the Reports API's own UTC-08:00 days (Pacific Standard Time,
+    no DST): one such day runs 17:00 to 17:00 the next day in JST (UTC+09:00).
+
+    Read-only: only ``userUsageReport().get()`` is issued, on the same
+    ``admin.reports.usage.readonly`` DWD scope ``gmail_usage_report`` uses, so
+    a tenant already running that tool needs no additional grant.
+
+    Args:
+        username: Exact user email, passed through as the Reports API
+            ``userKey``.
+        days: How many days to report, ending at ``end_date``.
+            ``1..``:data:`MAX_USAGE_REPORT_DAYS`.
+        end_date: Last day of the window, ``yyyy-mm-dd`` in UTC-08:00.
+            Default: yesterday there. Must not be later than that.
+        domain: Configured ``[domain.*]`` section to route the lookup
+            through. Default: resolved from the username's suffix.
+    """
+    username = username.strip()
+    if not (1 <= days <= MAX_USAGE_REPORT_DAYS):
+        return {"username": username, "error": f"days must be between 1 and {MAX_USAGE_REPORT_DAYS}, got {days}"}
+    try:
+        dates = _usage_dates(days, end_date)
+        c = _resolve_user_client(username, domain)
+    except (ConfigError, GwsError) as e:
+        return {"username": username, "error": str(e)}
+
+    results: dict[str, list[dict] | GwsError] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(dates))) as ex:
+        futs = {
+            ex.submit(c.fetch_user_usage, username, date=date, parameters=GMAIL_USER_USAGE_PARAMETERS): date
+            for date in dates
+        }
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                results[futs[fut]] = fut.result()
+            except (GwsAuthError, GwsError) as e:
+                results[futs[fut]] = e
+
+    daily: list[dict] = []
+    missing: list[str] = []
+    date_errors: list[dict] = []
+    totals = dict.fromkeys(GMAIL_USER_USAGE_COUNTERS, 0)
+    for date in dates:
+        r = results[date]
+        if isinstance(r, GwsAuthError):
+            return {"domain": c.domain, "username": username, "error": str(r)}
+        if isinstance(r, GwsError):
+            date_errors.append({"date": date, "error": str(r)})
+            continue
+        if not r:
+            missing.append(date)
+            continue
+        try:
+            p = event_parameters(r[0])
+        except (AttributeError, TypeError) as e:
+            date_errors.append({"date": date, "error": f"malformed usage report entry: {e}"})
+            continue
+        row: dict = {"date": r[0].get("date") or date}
+        for name in GMAIL_USER_USAGE_COUNTERS:
+            v = _int_or_none(p.get(f"gmail:{name}"))
+            row[name] = v
+            if v is not None:
+                totals[name] += v
+        daily.append(row)
+    return {
+        "domain": c.domain,
+        "username": username,
+        "window": {"start": dates[-1], "end": dates[0], "timezone": "UTC-08:00"},
+        "daily": daily,
+        "totals": totals,
+        "missing_dates": missing,
+        "date_errors": date_errors,
+    }
 
 
 def _suspended_entry(u: dict) -> dict:

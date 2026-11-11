@@ -9,6 +9,8 @@ API `customerUsageReports`, one date at a time ending yesterday in the
 API's own UTC-8:00/PST anchor -- requires the separate
 `admin.reports.usage.readonly` DWD scope, a DIFFERENT grant from
 `admin.reports.audit.readonly` despite both being Reports API),
+`gmail_user_usage` (the same daily Gmail counters for ONE account via
+`userUsageReport`, on the same `admin.reports.usage.readonly` scope),
 `suspended_accounts` (current suspended-account snapshot),
 `get_user` (one named account's state — suspended/archived/2SV/last login —
 via `users().get`, on the same `admin.directory.user.readonly` scope
@@ -63,7 +65,9 @@ request without a credential is `workspace_status`'s GET of
 Admin SDK / Groups Settings / Gmail API methods called anywhere in this
 package are `activities().list` (Reports API), `customerUsageReports().get()`
 (Reports API, for `gmail_usage_report` -- same discovery document as
-`activities().list` but a DIFFERENT DWD scope), `users().list` (Directory
+`activities().list` but a DIFFERENT DWD scope), `userUsageReport().get()`
+(Reports API, for `gmail_user_usage`, same scope as `customerUsageReports`),
+`users().list` (Directory
 API, for `suspended_accounts`), `users().get` (Directory API, for
 `get_user`), `tokens().list` (Directory API, for
 `user_oauth_tokens`), `groups().get` / `members().list` (Directory API, for
@@ -113,7 +117,7 @@ to guard against stdio newline regressions).
 ## Architecture
 
 - `gwsadm_mcp/server.py` — MCPServer server with `health_check`,
-  `login_audit`, `gmail_usage_report`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
+  `login_audit`, `gmail_usage_report`, `gmail_user_usage`, `suspended_accounts`, `get_user`, `user_oauth_tokens`,
   `user_activity`, `ip_activity`, `compromise_sweep`, `admin_actions`,
   `workspace_status`,
   `drive_external_sharing`, `drive_doc_activity`,

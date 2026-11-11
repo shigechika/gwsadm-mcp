@@ -19,7 +19,7 @@ Google Workspace の**セキュリティ監査**用 MCP（Model Context Protocol
 | サービス状態 | `workspace_status` |
 | OAuth | `user_oauth_tokens` |
 | Drive | `drive_external_sharing`、`drive_doc_activity`、`shared_drive_membership_changes` |
-| Gmail | `gmail_message_trace`、`gmail_usage_report`、`dmarc_rua_summary` |
+| Gmail | `gmail_message_trace`、`gmail_usage_report`、`gmail_user_usage`、`dmarc_rua_summary` |
 | グループ | `group_delivery_policy`、`list_group_members` |
 
 計画中: `dlp_events`（Reports `rules`、DLP 対応の Workspace エディションが

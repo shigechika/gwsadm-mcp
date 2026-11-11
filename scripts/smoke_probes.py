@@ -308,6 +308,13 @@ PROBES: dict[str, Probe] = {
         # tenant -- that surfaces as a per-domain {"error": ...}, which is this
         # tool WORKING correctly (see its docstring), not a broken probe.
     ),
+    "gmail_user_usage": Probe(
+        args={"days": 3},
+        args_factory=_some_account,
+        require_keys=("domain", "username", "window", "daily", "totals", "missing_dates"),
+        rows_key="daily",
+        allow_empty=True,
+    ),
     "suspended_accounts": Probe(
         args={"max_pages": 1},
         require_keys=("domains",),

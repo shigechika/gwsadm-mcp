@@ -99,6 +99,17 @@ class FakeDomainClient:
             raise got
         return got
 
+    # user_usage_by_date: dict[date_str, usage_reports | Exception], set by the test.
+    user_usage_by_date: dict = {}
+
+    def fetch_user_usage(self, user_key, *, date, parameters=None):
+        self.user_usage_calls = getattr(self, "user_usage_calls", [])
+        self.user_usage_calls.append((user_key, date, parameters))
+        got = self.user_usage_by_date.get(date, [])
+        if isinstance(got, Exception):
+            raise got
+        return got
+
     def fetch_activities(
         self,
         application_name,
@@ -556,6 +567,98 @@ def test_gmail_usage_report_unknown_domain_is_error(inject):
     inject([FakeDomainClient("example.edu", {})], {"example.edu"})
     out = server.gmail_usage_report(domain="nope.example")
     assert "error" in out
+
+
+# -- gmail_user_usage ---------------------------------------------------------
+
+
+def _user_usage(date, sent, received, spam=0):
+    params = [
+        {"name": "gmail:num_emails_sent", "intValue": str(sent)},
+        {"name": "gmail:num_emails_received", "intValue": str(received)},
+        {"name": "gmail:num_emails_exchanged", "intValue": str(sent + received)},
+        {"name": "gmail:num_spam_emails_received", "intValue": str(spam)},
+    ]
+    return {"date": date, "entity": {"userEmail": "s1@example.edu"}, "parameters": params}
+
+
+def test_gmail_user_usage_window_daily_totals_and_missing(inject):
+    c = FakeDomainClient("example.edu", {})
+    c.user_usage_by_date = {
+        "2026-10-25": [_user_usage("2026-10-25", 0, 2)],
+        "2026-10-24": [_user_usage("2026-10-24", 3, 1, spam=1)],
+        # 2026-10-23: no report -> missing, not zero
+    }
+    inject([c], {"example.edu"})
+    out = server.gmail_user_usage("s1@example.edu", days=3, end_date="2026-10-25")
+    assert out["window"] == {"start": "2026-10-23", "end": "2026-10-25", "timezone": "UTC-08:00"}
+    assert [r["date"] for r in out["daily"]] == ["2026-10-25", "2026-10-24"]
+    assert out["daily"][1] == {
+        "date": "2026-10-24",
+        "num_emails_sent": 3,
+        "num_emails_received": 1,
+        "num_emails_exchanged": 4,
+        "num_spam_emails_received": 1,
+    }
+    assert out["totals"] == {
+        "num_emails_sent": 3,
+        "num_emails_received": 3,
+        "num_emails_exchanged": 6,
+        "num_spam_emails_received": 1,
+    }
+    assert out["missing_dates"] == ["2026-10-23"]
+    assert out["date_errors"] == []
+    # one call per day, filtered to the Gmail counters, for the asked account
+    assert sorted(d for _, d, _ in c.user_usage_calls) == ["2026-10-23", "2026-10-24", "2026-10-25"]
+    assert {u for u, _, _ in c.user_usage_calls} == {"s1@example.edu"}
+    assert {p for _, _, p in c.user_usage_calls} == {server.GMAIL_USER_USAGE_PARAMETERS}
+
+
+def test_gmail_user_usage_per_date_error_is_recorded(inject):
+    c = FakeDomainClient("example.edu", {})
+    c.user_usage_by_date = {
+        "2026-10-25": server.GwsError("HTTP 400: bad date"),
+        "2026-10-24": [_user_usage("2026-10-24", 1, 1)],
+    }
+    inject([c], {"example.edu"})
+    out = server.gmail_user_usage("s1@example.edu", days=2, end_date="2026-10-25")
+    assert out["date_errors"] == [{"date": "2026-10-25", "error": "HTTP 400: bad date"}]
+    assert out["totals"]["num_emails_sent"] == 1
+
+
+def test_gmail_user_usage_auth_error_is_whole_call_error(inject):
+    from gwsadm_mcp.client import GwsAuthError
+
+    c = FakeDomainClient("example.edu", {})
+    c.user_usage_by_date = {"2026-10-25": GwsAuthError("no usage scope")}
+    inject([c], {"example.edu"})
+    out = server.gmail_user_usage("s1@example.edu", days=2, end_date="2026-10-25")
+    assert out["error"] == "no usage scope"
+    assert "daily" not in out
+
+
+def test_gmail_user_usage_defaults_to_window_ending_yesterday(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.gmail_user_usage("s1@example.edu", days=2)
+    assert out["window"]["end"] == server._recent_dates(1)[0]
+
+
+def test_gmail_user_usage_rejects_bad_input_before_any_call(inject):
+    import datetime
+
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    today = datetime.datetime.now(server._REPORTS_USAGE_DATE_TZ).date().isoformat()
+    for kwargs in (
+        {"days": 0},
+        {"days": server.MAX_USAGE_REPORT_DAYS + 1},
+        {"end_date": "2026/10/25"},
+        {"end_date": "2026-13-01"},
+        {"end_date": today},  # today is not final yet
+    ):
+        assert "error" in server.gmail_user_usage("s1@example.edu", **kwargs), kwargs
+    assert getattr(c, "user_usage_calls", []) == []
 
 
 def test_suspended_accounts_projects_and_counts(inject):
