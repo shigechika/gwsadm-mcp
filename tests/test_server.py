@@ -99,7 +99,7 @@ class FakeDomainClient:
             raise got
         return got
 
-    # user_usage_by_date: dict[date_str, usage_reports | Exception], set by the test.
+    # user_usage_by_date: dict[date_str, usage_reports | (usage_reports, warning_codes) | Exception].
     user_usage_by_date: dict = {}
 
     def fetch_user_usage(self, user_key, *, date, parameters=None):
@@ -108,7 +108,8 @@ class FakeDomainClient:
         got = self.user_usage_by_date.get(date, [])
         if isinstance(got, Exception):
             raise got
-        return got
+        # A bare list is the reports with no warnings; a tuple carries both.
+        return got if isinstance(got, tuple) else (got, [])
 
     def fetch_activities(
         self,
@@ -628,6 +629,20 @@ def test_gmail_user_usage_per_date_error_is_recorded(inject):
     assert out["totals"]["num_emails_sent"] == 1
 
 
+def test_gmail_user_usage_not_yet_available_day_is_missing_not_an_error(inject):
+    c = FakeDomainClient("example.edu", {})
+    c.user_usage_by_date = {
+        "2026-10-25": server.GwsError(
+            "[example.edu] reports API error (userUsageReport, 2026-10-25): HTTP 400: "
+            "Data for dates later than 2026-10-24 is not yet available. Please check back later"
+        ),
+        "2026-10-24": [_user_usage("2026-10-24", 1, 1)],
+    }
+    inject([c], {"example.edu"})
+    out = server.gmail_user_usage("s1@example.edu", days=2, end_date="2026-10-25")
+    assert out["missing_dates"] == ["2026-10-25"] and out["date_errors"] == []
+
+
 def test_gmail_user_usage_auth_error_is_whole_call_error(inject):
     from gwsadm_mcp.client import GwsAuthError
 
@@ -672,6 +687,28 @@ def test_gmail_user_usage_total_is_unknown_when_a_reporting_day_lacks_the_counte
     out = server.gmail_user_usage("s1@example.edu", days=2, end_date="2026-10-25")
     assert out["totals"]["num_emails_received"] is None
     assert out["totals"]["num_emails_sent"] == 4
+
+
+def test_gmail_user_usage_totals_unknown_when_no_day_reported(inject):
+    c = FakeDomainClient("example.edu", {})
+    c.user_usage_by_date = {}
+    inject([c], {"example.edu"})
+    out = server.gmail_user_usage("s1@example.edu", days=2, end_date="2026-10-25")
+    assert out["daily"] == [] and out["missing_dates"] == ["2026-10-25", "2026-10-24"]
+    assert set(out["totals"].values()) == {None}
+
+
+def test_gmail_user_usage_flags_partial_data_days(inject):
+    c = FakeDomainClient("example.edu", {})
+    c.user_usage_by_date = {
+        "2026-10-25": ([_user_usage("2026-10-25", 1, 1)], [server.GMAIL_USAGE_PARTIAL_WARNING]),
+        "2026-10-24": [_user_usage("2026-10-24", 2, 2)],
+    }
+    inject([c], {"example.edu"})
+    out = server.gmail_user_usage("s1@example.edu", days=2, end_date="2026-10-25")
+    assert out["partial_dates"] == ["2026-10-25"]
+    assert out["daily"][0]["partial"] is True and "partial" not in out["daily"][1]
+    assert out["totals"]["num_emails_sent"] == 3
 
 
 # -- gmail_log_search ---------------------------------------------------------
@@ -754,6 +791,44 @@ def test_gmail_log_search_filters(inject):
     assert [m["message_id"] for m in out["messages"]] == ["<b@y.example>"]
     out = server.gmail_log_search("s1@example.edu", recipient="OTHER.example")
     assert [m["message_id"] for m in out["messages"]] == ["<b@y.example>"]
+
+
+def test_gmail_log_search_filter_keeps_every_event_of_a_matching_message(inject):
+    throttle = _gmail_event("<a@x.example>", "", dest="", desc="451 4.2.1 receiving at a rate ...")
+    items = [
+        _gmail_item("2026-10-25T16:00:00Z", throttle),
+        _gmail_item("2026-10-25T15:00:00Z", _gmail_event("<a@x.example>", "Account Restricted")),
+    ]
+    c = FakeDomainClient("example.edu", {("gmail", None): (items, False)})
+    inject([c], {"example.edu"})
+    (row,) = server.gmail_log_search("s1@example.edu", subject="restricted")["messages"]
+    assert row["events"] == 2 and row["last"] == "2026-10-25T16:00:00Z"
+    assert row["responses"] == ["451 4.2.1 receiving at a rate ..."]
+
+
+def test_gmail_log_search_reads_list_values_and_ignores_250_variants(inject):
+    ev = _gmail_event("<a@x.example>", "s", desc=" 250 2.0.0 OK ")
+    info = ev["parameters"][0]["messageValue"]["parameter"]
+    for q in info:
+        if q["name"] == "flattened_destinations":
+            q.pop("value")
+            q["multiValue"] = ["smtp::a@one.example,smtp::b@two.example"]
+    info.append({"name": "link_domain", "value": "Example.COM"})
+    ev2 = _gmail_event("<a@x.example>", "s", desc="250-2.0.0 OK")
+    c = FakeDomainClient("example.edu", {("gmail", None): ([_gmail_item("2026-10-25T15:00:00Z", ev, ev2)], False)})
+    inject([c], {"example.edu"})
+    out = server.gmail_log_search("s1@example.edu", recipient="two.example")
+    (row,) = out["messages"]
+    assert "smtp::b@two.example" in row["destinations"] and "smtp::a@one.example" in row["destinations"]
+    assert row["link_domains"] == ["example.com"]
+    assert row["responses"] == []
+
+
+def test_gmail_log_search_accepts_a_space_separated_end(inject):
+    c = FakeDomainClient("example.edu", {})
+    inject([c], {"example.edu"})
+    out = server.gmail_log_search("s1@example.edu", hours=1, end="2026-10-26 09:00:00+09:00")
+    assert out["window"]["end"] == "2026-10-26T00:00:00+00:00"
 
 
 def test_gmail_log_search_events_without_message_id_stay_separate_and_truncate(inject):

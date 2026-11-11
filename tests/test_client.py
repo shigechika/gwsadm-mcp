@@ -92,11 +92,23 @@ def test_fetch_activities_gmail_always_sends_an_end_time():
     import datetime
 
     c, a = _client([{"items": []}])
-    start = datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
+    start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
     c.fetch_activities("gmail", start=start)
     assert "endTime" in a.calls[0]  # the gmail application 400s without it
     c.fetch_activities("login", start=start)
     assert "endTime" not in a.calls[1]
+
+
+def test_fetch_activities_gmail_refuses_a_window_over_30_days_without_a_call():
+    import datetime
+
+    c, a = _client([{"items": []}])
+    end = datetime.datetime(2026, 10, 26, tzinfo=datetime.timezone.utc)
+    with pytest.raises(GwsError, match="at most 30 days"):
+        c.fetch_activities("gmail", start=end - datetime.timedelta(days=31), end=end)
+    assert a.calls == []
+    c.fetch_activities("gmail", start=end - datetime.timedelta(days=30), end=end)  # exactly 30 is fine
+    assert len(a.calls) == 1
 
 
 def test_fetch_activities_caps_pages():
@@ -212,8 +224,8 @@ class FakeReportsUserUsage:
 def test_fetch_user_usage_passes_params_and_returns_reports():
     svc = FakeReportsUserUsage({"usageReports": [{"date": "2026-10-24", "parameters": []}]})
     c = DomainClient(CFG, reports_usage_service=svc)
-    reports = c.fetch_user_usage("s1@example.edu", date="2026-10-24", parameters="gmail:num_emails_sent")
-    assert reports == [{"date": "2026-10-24", "parameters": []}]
+    reports, warnings = c.fetch_user_usage("s1@example.edu", date="2026-10-24", parameters="gmail:num_emails_sent")
+    assert reports == [{"date": "2026-10-24", "parameters": []}] and warnings == []
     assert svc._u.calls == [
         {
             "userKey": "s1@example.edu",
@@ -224,10 +236,10 @@ def test_fetch_user_usage_passes_params_and_returns_reports():
     ]
 
 
-def test_fetch_user_usage_no_report_is_empty_list():
-    svc = FakeReportsUserUsage({"warnings": [{"code": "PARTIAL_DATA_AVAILABLE"}]})
+def test_fetch_user_usage_no_report_is_empty_list_with_warning_codes():
+    svc = FakeReportsUserUsage({"warnings": [{"code": "DATA_NOT_AVAILABLE", "message": "x"}, "junk"]})
     c = DomainClient(CFG, reports_usage_service=svc)
-    assert c.fetch_user_usage("s1@example.edu", date="2026-10-24") == []
+    assert c.fetch_user_usage("s1@example.edu", date="2026-10-24") == ([], ["DATA_NOT_AVAILABLE"])
     assert "parameters" not in svc._u.calls[0]
 
 

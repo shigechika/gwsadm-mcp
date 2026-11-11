@@ -64,6 +64,7 @@ from mcp.shared.exceptions import MCPError
 
 from gwsadm_mcp import __version__, geo, sites
 from gwsadm_mcp.client import (
+    GMAIL_MAX_SCAN,
     SCOPE_DIRECTORY,
     DomainClient,
     GwsApiDisabledError,
@@ -592,8 +593,7 @@ def _recent_dates(days: int) -> list[str]:
     -- not today, since the current day's usage data is not final until the
     day itself has ended in that timezone.
     """
-    today = datetime.datetime.now(_REPORTS_USAGE_DATE_TZ).date()
-    return [(today - datetime.timedelta(days=d)).isoformat() for d in range(1, days + 1)]
+    return _usage_dates(days, None)
 
 
 def _fetch_one_date_usage(c: DomainClient, date: str):
@@ -734,6 +734,10 @@ GMAIL_USER_USAGE_COUNTERS = (
     "num_spam_emails_received",
 )
 GMAIL_USER_USAGE_PARAMETERS = ",".join(f"gmail:{n}" for n in GMAIL_USER_USAGE_COUNTERS)
+# Google's 400 text for a day whose usage data is not processed yet.
+_USAGE_NOT_YET_RE = re.compile(r"Data for dates later than \S+ is not yet available")
+# The usage-report warning code for a day whose counters are not complete yet.
+GMAIL_USAGE_PARTIAL_WARNING = "PARTIAL_DATA_AVAILABLE"
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -774,10 +778,14 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
     Per day (newest first): ``num_emails_sent``, ``num_emails_received``,
     ``num_emails_exchanged`` and ``num_spam_emails_received``. ``totals``
     sums the days that returned a report; a counter that one of those days
-    lacks has a ``None`` total (unknown), never a partial sum. A day Google
-    has no report for (not processed yet -- these counters lag by days -- or
-    before the account existed) is listed in ``missing_dates``, never counted
-    as zero. A single day's fetch failing lands in ``date_errors``; the other
+    lacks has a ``None`` total (unknown), never a partial sum, and when no
+    day reported at all every total is ``None``. A day Google has no report
+    for (not processed yet -- these counters lag by days, and Google answers
+    such a day with a "not yet available" 400 -- or before the account
+    existed) is listed in ``missing_dates``, never counted as zero.
+    A day Google answered with ``PARTIAL_DATA_AVAILABLE`` carries
+    ``partial: true`` and is listed in ``partial_dates``; while that list is
+    non-empty the totals are lower bounds. A single day's fetch failing lands in ``date_errors``; the other
     days still answer. A missing DWD scope or a
     rejected credential is a whole-call ``{"error": ...}``.
 
@@ -807,7 +815,7 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
     except (ConfigError, GwsError) as e:
         return {"username": username, "error": str(e)}
 
-    results: dict[str, list[dict] | GwsError] = {}
+    results: dict[str, tuple[list[dict], list[str]] | GwsError] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(_max_workers(), len(dates))) as ex:
         futs = {
             ex.submit(c.fetch_user_usage, username, date=date, parameters=GMAIL_USER_USAGE_PARAMETERS): date
@@ -822,23 +830,33 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
     daily: list[dict] = []
     missing: list[str] = []
     date_errors: list[dict] = []
+    partial: list[str] = []
     totals: dict[str, int | None] = dict.fromkeys(GMAIL_USER_USAGE_COUNTERS, 0)
     for date in dates:
         r = results[date]
         if isinstance(r, GwsAuthError):
             return {"domain": c.domain, "username": username, "error": str(r)}
         if isinstance(r, GwsError):
-            date_errors.append({"date": date, "error": str(r)})
+            # Google answers a day it has not processed yet with a 400 rather
+            # than a warning; that day is missing, not failed.
+            if _USAGE_NOT_YET_RE.search(str(r)):
+                missing.append(date)
+            else:
+                date_errors.append({"date": date, "error": str(r)})
             continue
-        if not r:
+        reports, warnings = r
+        if not reports:
             missing.append(date)
             continue
         try:
-            p = event_parameters(r[0])
+            p = event_parameters(reports[0])
         except (AttributeError, TypeError) as e:
             date_errors.append({"date": date, "error": f"malformed usage report entry: {e}"})
             continue
-        row: dict = {"date": r[0].get("date") or date}
+        row: dict = {"date": reports[0].get("date") or date}
+        if GMAIL_USAGE_PARTIAL_WARNING in warnings:
+            row["partial"] = True
+            partial.append(date)
         for name in GMAIL_USER_USAGE_COUNTERS:
             v = _int_or_none(p.get(f"gmail:{name}"))
             row[name] = v
@@ -849,6 +867,9 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
             elif totals[name] is not None:
                 totals[name] += v
         daily.append(row)
+    if not daily:
+        # Nothing reported: zero would claim a quiet window that was never seen.
+        totals = dict.fromkeys(GMAIL_USER_USAGE_COUNTERS, None)
     return {
         "domain": c.domain,
         "username": username,
@@ -856,38 +877,23 @@ def gmail_user_usage(username: str, days: int = 7, end_date: str | None = None, 
         "daily": daily,
         "totals": totals,
         "missing_dates": missing,
+        "partial_dates": partial,
         "date_errors": date_errors,
     }
 
 
 # The Reports API refuses a gmail scan longer than 30 days.
-GMAIL_LOG_MAX_HOURS = 720
+GMAIL_LOG_MAX_HOURS = int(GMAIL_MAX_SCAN.total_seconds()) // 3600
 GMAIL_LOG_MAX_PAGES = 20
 GMAIL_LOG_MAX_MESSAGES = 1000
 GMAIL_LOG_MAX_FILTER_LEN = 256
-# Gmail log ``description`` values that only say the next hop accepted the
-# message; kept out of ``responses`` so a bounce or throttle reply stands out.
-_GMAIL_ACCEPTED_PREFIX = "250 "
-
-
-def _flat_message_value(param: dict) -> dict:
-    """Flatten one ``messageValue`` parameter of a Gmail log event to a dict."""
-    out: dict = {}
-    for q in (param.get("messageValue") or {}).get("parameter") or []:
-        name = q.get("name")
-        if not name:
-            continue
-        for key in ("value", "intValue", "boolValue", "multiValue"):
-            if key in q:
-                out[name] = q[key]
-                break
-    return out
 
 
 def _gmail_message_info(event: dict) -> dict:
+    """The ``message_info`` sub-record of a Gmail log event, flattened."""
     for p in event.get("parameters") or []:
         if p.get("name") == "message_info":
-            return _flat_message_value(p)
+            return event_parameters({"parameters": (p.get("messageValue") or {}).get("parameter")})
     return {}
 
 
@@ -903,7 +909,7 @@ def _log_window_end(end: str | None) -> datetime.datetime:
     if end is None:
         return now
     parsed = _feed_time(end)
-    if parsed is None or "T" not in end:
+    if parsed is None:
         raise GwsError(
             f"end must be an ISO 8601 timestamp with an offset (e.g. 2026-10-26T00:00:00+09:00), got {end!r}"
         )
@@ -913,10 +919,21 @@ def _log_window_end(end: str | None) -> datetime.datetime:
     return parsed
 
 
-def _split_destinations(raw) -> list[str]:
-    if not isinstance(raw, str):
+def _string_list(raw, *, split_commas: bool = False) -> list[str]:
+    """A Gmail log value that may come as one string or as a ``multiValue`` list."""
+    if isinstance(raw, str):
+        parts = raw.split(",") if split_commas else [raw]
+    elif isinstance(raw, list):
+        parts = [str(x) for x in raw if x is not None]
+        if split_commas:
+            parts = [q for x in parts for q in x.split(",")]
+    else:
         return []
-    return [d.strip() for d in raw.split(",") if d.strip()]
+    return [x.strip() for x in parts if x.strip()]
+
+
+# A 250 reply (single line ``250 `` or multi-line ``250-``) is an accept.
+_SMTP_ACCEPTED_RE = re.compile(r"^250[ -]")
 
 
 @mcp.tool()
@@ -956,8 +973,9 @@ def gmail_log_search(
     than the ``250`` accepted ones. Rows are newest ``last`` first, cut at
     ``max_messages`` with ``truncated`` saying so.
 
-    Filters are applied to each fetched event before grouping, so a row
-    aggregates only its matching events: ``subject`` and ``recipient``
+    Filters select messages, not events: a message is kept when any of its
+    events matches, and its row then aggregates all of its events (a
+    throttle reply that carries no subject stays on the row). ``subject`` and ``recipient``
     are case-insensitive substrings (of the subject / of the flattened
     destinations), ``message_id`` is exact (angle brackets optional).
     ``events_scanned`` counts events before filtering. ``capped`` means more
@@ -1023,13 +1041,15 @@ def gmail_log_search(
             mi = _gmail_message_info(event)
             subj = mi.get("subject") if isinstance(mi.get("subject"), str) else None
             mid = mi.get("rfc2822_message_id") if isinstance(mi.get("rfc2822_message_id"), str) else None
-            dests = _split_destinations(mi.get("flattened_destinations"))
-            if want_subject is not None and want_subject not in (subj or "").lower():
-                continue
-            if want_id is not None and (mid or "").strip().strip("<>") != want_id:
-                continue
-            if want_recipient is not None and not any(want_recipient in d.lower() for d in dests):
-                continue
+            dests = _string_list(mi.get("flattened_destinations"), split_commas=True)
+            # A message matches when any of its events does; the events that
+            # do not (a throttle reply without a subject, say) still belong
+            # to the row.
+            hit = (
+                (want_subject is None or want_subject in (subj or "").lower())
+                and (want_id is None or (mid or "").strip().strip("<>") == want_id)
+                and (want_recipient is None or any(want_recipient in d.lower() for d in dests))
+            )
             # An event without a Message-ID stays its own row rather than
             # merging every such event into one.
             key = mid or f"(no id) {t} {(item.get('id') or {}).get('uniqueQualifier')} {n}"
@@ -1048,8 +1068,10 @@ def gmail_log_search(
                     "attachments": None,
                     "link_domains": set(),
                     "responses": set(),
+                    "_matched": False,
                 },
             )
+            row["_matched"] = row["_matched"] or hit
             row["events"] += 1
             if subj and not row["subject"]:
                 row["subject"] = subj
@@ -1067,16 +1089,15 @@ def gmail_log_search(
             att = _int_or_none(mi.get("num_message_attachments"))
             if att is not None:
                 row["attachments"] = max(att, row["attachments"] or 0)
-            links = mi.get("link_domain")
-            if isinstance(links, list):
-                row["link_domains"].update(str(x).lower() for x in links if x)
+            row["link_domains"].update(x.lower() for x in _string_list(mi.get("link_domain")))
             desc = mi.get("description")
-            if isinstance(desc, str) and desc.strip() and not desc.startswith(_GMAIL_ACCEPTED_PREFIX):
-                row["responses"].add(desc.strip())
+            desc = desc.strip() if isinstance(desc, str) else ""
+            if desc and not _SMTP_ACCEPTED_RE.match(desc):
+                row["responses"].add(desc)
 
     rows = [
         {
-            **r,
+            **{k: v for k, v in r.items() if k != "_matched"},
             "event_names": sorted(r["event_names"]),
             "action_types": sorted(r["action_types"], key=lambda x: (len(x), x)),
             "destinations": sorted(r["destinations"]),
@@ -1084,6 +1105,7 @@ def gmail_log_search(
             "responses": sorted(r["responses"]),
         }
         for r in messages.values()
+        if r["_matched"]
     ]
     rows.sort(key=lambda r: r["last"] or "", reverse=True)
     return {
@@ -1329,11 +1351,12 @@ def user_oauth_tokens(username: str, domain: str | None = None) -> dict:
 
 # user_activity / ip_activity: the Reports API applications walked by default
 # for one account's, or one source address's, timeline. ``gmail`` is absent on
-# purpose: message-level Gmail activity is not served by the Reports API on
-# every tenant (verified live: ``applicationName=gmail`` answers HTTP 400 on a
-# tenant whose every other application works), and a caller whose tenant has
-# it passes it explicitly. The list is an argument, not a fixed set, because
-# the right applications depend on what the tenant uses.
+# purpose: its delivery events run to thousands a day per mailbox and would
+# eat the page budget, and the application refuses a window over 30 days
+# (``fetch_activities`` reports that as a per-application error).
+# ``gmail_log_search`` is the per-message view; a caller who wants Gmail in
+# the timeline passes it explicitly. The list is an argument, not a fixed
+# set, because the right applications depend on what the tenant uses.
 ACTIVITY_APPLICATIONS = ("login", "token", "user_accounts", "drive", "groups", "calendar", "chat", "meet", "saml")
 # An application name is a path segment of the request URL, so it is validated
 # against a charset before use (same treatment as ``_DOC_ID_RE``: tool inputs

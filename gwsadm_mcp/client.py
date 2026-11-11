@@ -79,6 +79,8 @@ SCOPE_DIRECTORY_SECURITY = "https://www.googleapis.com/auth/admin.directory.user
 # READ stays narrow even though the DWD GRANT is broader than the other
 # three scopes in this file.
 SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.readonly"
+# The Reports API refuses a gmail activity window longer than this.
+GMAIL_MAX_SCAN = datetime.timedelta(days=30)
 # Groups Settings is a distinct API/product from the Directory API scopes
 # below -- it answers "what is this group's own access-control policy"
 # (who_can_post, allow_external_members, moderation), not "who is in it".
@@ -868,10 +870,17 @@ class DomainClient:
         The ``gmail`` application rejects an open-ended window (HTTP 400:
         "Start time and end time should both be provided, and the scan
         duration should not be greater than 30 days"), so for it a missing
-        ``end`` becomes now.
+        ``end`` becomes now, and a window longer than :data:`GMAIL_MAX_SCAN`
+        is refused here with that reason instead of a bare 400.
         """
-        if end is None and application_name == "gmail":
-            end = datetime.datetime.now(datetime.timezone.utc)
+        if application_name == "gmail":
+            if end is None:
+                end = datetime.datetime.now(datetime.timezone.utc)
+            if end - start > GMAIL_MAX_SCAN:
+                raise GwsError(
+                    f"[{self.domain}] reports API error (gmail): the gmail log can be scanned "
+                    f"at most {GMAIL_MAX_SCAN.days} days at a time, asked for {(end - start).days} days"
+                )
         params = {
             "userKey": user_key,
             "applicationName": application_name,
@@ -969,7 +978,9 @@ class DomainClient:
             raise GwsError(f"[{self.domain}] transport error (customerUsageReports, {date}): {type(e).__name__}") from e
         return reports, bool(token)
 
-    def fetch_user_usage(self, user_key: str, *, date: str, parameters: str | None = None) -> list[dict]:
+    def fetch_user_usage(
+        self, user_key: str, *, date: str, parameters: str | None = None
+    ) -> tuple[list[dict], list[str]]:
         """Fetch ONE account's usage report for ONE day (Reports API ``userUsageReport``).
 
         The per-user counterpart of :meth:`fetch_customer_usage`: same
@@ -980,9 +991,11 @@ class DomainClient:
         callers own validating it. One account and one day is a single
         record, so no pagination is followed.
 
-        Returns the ``usageReports`` list as Google returns it -- empty when
-        Google has no report for that account and day (it then answers with
-        ``warnings`` instead, e.g. data not yet available).
+        Returns ``(usage_reports, warning_codes)``: the ``usageReports`` list
+        as Google returns it -- empty when Google has no report for that
+        account and day -- and the ``code`` of each ``warnings`` entry (e.g.
+        ``DATA_NOT_AVAILABLE``, or ``PARTIAL_DATA_AVAILABLE`` beside a report
+        whose counters are not complete yet).
         """
         params: dict = {"userKey": user_key, "date": date, "customerId": self.cfg.customer_id}
         if parameters:
@@ -997,7 +1010,8 @@ class DomainClient:
             raise GwsAuthError(f"[{self.domain}] auth failed: {e}") from e
         except (httplib2.HttpLib2Error, OSError) as e:
             raise GwsError(f"[{self.domain}] transport error (userUsageReport, {date}): {type(e).__name__}") from e
-        return resp.get("usageReports", []) or []
+        warnings = [str(w.get("code")) for w in resp.get("warnings") or [] if isinstance(w, dict) and w.get("code")]
+        return resp.get("usageReports", []) or [], warnings
 
     def list_suspended_users(self, *, max_pages: int = 20) -> tuple[list[dict], bool]:
         """List currently suspended users in this domain (Directory API).
