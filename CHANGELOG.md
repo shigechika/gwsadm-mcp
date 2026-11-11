@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.23.1...v0.24.0) (2026-11-11)
+
+
+### Features
+
+* add gmail_user_usage and gmail_log_search; send endTime for gmail activities ([#112](https://github.com/shigechika/gwsadm-mcp/issues/112)) ([656d63a](https://github.com/shigechika/gwsadm-mcp/commit/656d63a880d18b55ae72da3f99cc7c757feb72c4))
+
 ## [0.23.1](https://github.com/shigechika/gwsadm-mcp/compare/v0.23.0...v0.23.1) (2026-10-26)
 
 
