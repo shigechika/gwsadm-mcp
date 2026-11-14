@@ -30,7 +30,7 @@ uv run ruff format --check .        # format check
 
 This mirrors `.github/workflows/ci.yml`: a `lint` job (`ruff check` +
 `ruff format --check`) and a separate `test` job (`pytest -v`) on Python
-3.10/3.12/3.13 on Linux, plus one Windows 3.12 job specifically to catch
+3.11–3.15 on Linux, plus one Windows job on the latest 3.x specifically to catch
 stdio newline regressions (`modelcontextprotocol/python-sdk#2433`). Both
 lint and test are real CI gates here.
 

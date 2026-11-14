@@ -115,7 +115,7 @@ uv run ruff format --check .        # format check
 ```
 
 This mirrors `.github/workflows/ci.yml` (separate `lint` and `test` jobs;
-`test` runs on Python 3.10/3.12/3.13 on Linux plus one Windows 3.12 smoke job
+`test` runs on Python 3.11–3.15 on Linux plus one Windows smoke job on the latest 3.x
 to guard against stdio newline regressions).
 
 ## Architecture
@@ -243,7 +243,7 @@ to guard against stdio newline regressions).
 
 ## Conventions
 
-- Python 3.10+, `requires-python = ">=3.10"`: native `X | Y` union syntax is
+- Python 3.11+, `requires-python = ">=3.11"`: native `X | Y` union syntax is
   used directly in annotations.
 - `ruff` lint rules: `E, F, I, W, UP`, line length 120.
 - `drive_external_sharing`'s classification logic (self-creation-grant

@@ -343,7 +343,7 @@ def _resolve_user_client(username: str, domain: str | None, strict: bool = False
 
 
 def _window(hours: int) -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+    return datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=hours)
 
 
 def _entry(item: dict, event: dict) -> dict:
@@ -905,7 +905,7 @@ def _log_window_end(end: str | None) -> datetime.datetime:
     hours. A future ``end`` is refused rather than clamped, so the window
     the answer reports is the one that was asked for.
     """
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     if end is None:
         return now
     parsed = _feed_time(end)
@@ -913,7 +913,7 @@ def _log_window_end(end: str | None) -> datetime.datetime:
         raise GwsError(
             f"end must be an ISO 8601 timestamp with an offset (e.g. 2026-10-26T00:00:00+09:00), got {end!r}"
         )
-    parsed = parsed.astimezone(datetime.timezone.utc)
+    parsed = parsed.astimezone(datetime.UTC)
     if parsed > now:
         raise GwsError(f"end must not be in the future, got {end}")
     return parsed
@@ -3726,7 +3726,7 @@ def workspace_status(hours: int = 72, service: str | None = None) -> dict:
         # urllib's messages name only the URL above and the HTTP status; nothing of this server's config.
         return {**head, "error": f"could not read the status dashboard ({type(e).__name__}: {e})"}
     since = _window(hours)
-    epoch = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    epoch = datetime.datetime.min.replace(tzinfo=datetime.UTC)
     open_rows: list[dict] = []
     recent: list[tuple[datetime.datetime, dict]] = []
     for inc in incidents:
@@ -3822,7 +3822,7 @@ def _account_changes(clients: list[DomainClient], hours: int, max_pages: int = 2
     names every probe that failed outright, change or suspicious-login, with
     its error text, so a failure can be told from a page cap.
     """
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     start = now - datetime.timedelta(hours=hours)
     corr_start = start - datetime.timedelta(hours=CORRELATION_LOOKBACK_HOURS)
     table = sites.load()
@@ -4311,7 +4311,7 @@ def sign_out_user(username: str, domain: str | None = None) -> dict:
         found=True,
         user=primary,
         before={k: entry.get(k) for k in ("suspended", "is_enrolled_in_2sv", "last_login")},
-        at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        at=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     try:
         c.sign_out_user(primary, deadline)
