@@ -59,7 +59,7 @@ def _dmarc_reports(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     def _day(s: str) -> datetime.datetime:
-        return datetime.datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+        return datetime.datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=datetime.UTC)
 
     try:
         since, until = _day(args.since), _day(args.until)

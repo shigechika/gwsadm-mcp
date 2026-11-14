@@ -774,7 +774,7 @@ def test_gmail_log_search_groups_events_per_message(inject):
     assert b["destinations"] == ["gmail-ui::s1@example.edu"]
     # one gmail fetch for the account, with an explicit end (the API requires both)
     assert c.scoped_calls == [("gmail", None, "s1@example.edu", None, 5)]
-    assert c.ends == [("gmail", datetime.datetime(2026, 10, 26, tzinfo=datetime.timezone.utc))]
+    assert c.ends == [("gmail", datetime.datetime(2026, 10, 26, tzinfo=datetime.UTC))]
 
 
 def test_gmail_log_search_filters(inject):
@@ -2547,7 +2547,7 @@ def test_parallel_fetch_captures_exceptions_per_task():
             (ok, "drive", "change_user_access", 5),
             (bad, "drive", "change_user_access", 5),
         ],
-        datetime.datetime.now(datetime.timezone.utc),
+        datetime.datetime.now(datetime.UTC),
     )
     assert res[("ok.edu", "drive", "change_user_access")][0][0]["actor"]["email"] == "o@ok.edu"
     assert isinstance(res[("bad.edu", "drive", "change_user_access")], GwsError)
@@ -4203,7 +4203,7 @@ def _incident(iid, service, begin, end, text="**Summary:**\nSomething broke.\n**
 
 
 def test_workspace_status_splits_open_and_recent(monkeypatch):
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     iso = lambda dt: dt.isoformat()  # noqa: E731
     feed = [
         _incident("open1", "Gmail", iso(now - datetime.timedelta(hours=1)), None),
@@ -4267,7 +4267,7 @@ def test_admin_actions_lowercases_the_target_in_the_filter_and_clamps_budgets(in
 
 
 def test_workspace_status_reads_z_timestamps_and_keeps_an_unreadable_end(monkeypatch):
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     z = (now - datetime.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     feed = [_incident("zend", "Gmail", z, z), _incident("weird", "Gmail", z, "not a time")]
     monkeypatch.setattr(server, "_fetch_workspace_incidents", lambda: feed)

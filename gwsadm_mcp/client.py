@@ -506,7 +506,7 @@ class GwsWriteUnknown(GwsError):
 
 
 def _rfc3339(dt: datetime.datetime) -> str:
-    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return dt.astimezone(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def _http_status(e: HttpError) -> int | None:
@@ -875,7 +875,7 @@ class DomainClient:
         """
         if application_name == "gmail":
             if end is None:
-                end = datetime.datetime.now(datetime.timezone.utc)
+                end = datetime.datetime.now(datetime.UTC)
             if end - start > GMAIL_MAX_SCAN:
                 raise GwsError(
                     f"[{self.domain}] reports API error (gmail): the gmail log can be scanned "
@@ -1911,7 +1911,7 @@ class DomainClient:
 
     def check(self) -> dict:
         """Cheap end-to-end probe: one 1-item login query (auth + API + DWD)."""
-        start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+        start = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
         try:
             svc = self._reports_service()
             svc.activities().list(

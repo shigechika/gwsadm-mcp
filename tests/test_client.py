@@ -78,7 +78,7 @@ def test_fetch_activities_paginates_and_passes_params():
             {"items": [{"id": {"time": "t2"}}]},
         ]
     )
-    start = datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
+    start = datetime.datetime(2026, 7, 1, tzinfo=datetime.UTC)
     items, capped = c.fetch_activities("login", start=start, event_name="login_failure")
     assert len(items) == 2 and capped is False
     assert a.calls[0]["eventName"] == "login_failure"
@@ -92,7 +92,7 @@ def test_fetch_activities_gmail_always_sends_an_end_time():
     import datetime
 
     c, a = _client([{"items": []}])
-    start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    start = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)
     c.fetch_activities("gmail", start=start)
     assert "endTime" in a.calls[0]  # the gmail application 400s without it
     c.fetch_activities("login", start=start)
@@ -103,7 +103,7 @@ def test_fetch_activities_gmail_refuses_a_window_over_30_days_without_a_call():
     import datetime
 
     c, a = _client([{"items": []}])
-    end = datetime.datetime(2026, 10, 26, tzinfo=datetime.timezone.utc)
+    end = datetime.datetime(2026, 10, 26, tzinfo=datetime.UTC)
     with pytest.raises(GwsError, match="at most 30 days"):
         c.fetch_activities("gmail", start=end - datetime.timedelta(days=31), end=end)
     assert a.calls == []
@@ -115,7 +115,7 @@ def test_fetch_activities_caps_pages():
     import datetime
 
     c, _ = _client([{"items": [{}], "nextPageToken": "more"}] * 5)
-    items, capped = c.fetch_activities("drive", start=datetime.datetime.now(datetime.timezone.utc), max_pages=2)
+    items, capped = c.fetch_activities("drive", start=datetime.datetime.now(datetime.UTC), max_pages=2)
     assert len(items) == 2 and capped is True  # stopped early with pages remaining
 
 
@@ -191,7 +191,7 @@ def test_reports_http_errors_carry_googles_reason():
     err = HttpError(httplib2.Response({"status": "400"}), body)
     c, _ = _client([], exc=err)
     with pytest.raises(GwsError, match=r"HTTP 400: Start time and end time should both be provided\."):
-        c.fetch_activities("gmail", start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_activities("gmail", start=datetime.datetime.now(datetime.UTC))
     c, _ = _usage_client([], exc=err)
     with pytest.raises(GwsError, match=r"HTTP 400: Start time"):
         c.fetch_customer_usage(date="2026-08-30")
@@ -1202,7 +1202,7 @@ def test_fetch_dmarc_rua_records_happy_path_parses_and_defaults_mailbox():
         attachments_by_id={"att1": _gzip_b64(xml)},
     )
     records, capped, message_errors, mailbox, recipient = c.fetch_dmarc_rua_records(
-        start=datetime.datetime.now(datetime.timezone.utc)
+        start=datetime.datetime.now(datetime.UTC)
     )
     assert records == [
         {
@@ -1227,7 +1227,7 @@ def test_fetch_dmarc_rua_records_honors_explicit_mailbox_override():
 
     c, messages = _dmarc_client(list_pages=[{"messages": []}])
     _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(
-        start=datetime.datetime.now(datetime.timezone.utc), mailbox="dmarc-reports@example.edu"
+        start=datetime.datetime.now(datetime.UTC), mailbox="dmarc-reports@example.edu"
     )
     assert mailbox == "dmarc-reports@example.edu"
     assert recipient == "dmarc-reports@example.edu"  # an overridden inbox is searched on its own address
@@ -1241,7 +1241,7 @@ def test_fetch_dmarc_rua_records_message_with_no_attachment_counts_as_error():
         list_pages=[{"messages": [{"id": "m1"}]}],
         get_by_id={"m1": {"payload": {"body": {}}}},  # no attachmentId anywhere
     )
-    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC))
     assert records == []
     assert message_errors == 1
 
@@ -1254,7 +1254,7 @@ def test_fetch_dmarc_rua_records_malformed_attachment_counts_as_error_not_raise(
         get_by_id={"m1": {"payload": {"body": {"attachmentId": "att1"}}}},
         attachments_by_id={"att1": "not-valid-base64-or-xml!!!"},
     )
-    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC))
     assert records == []
     assert message_errors == 1
 
@@ -1263,7 +1263,7 @@ def test_fetch_dmarc_rua_records_capped_when_more_pages_exist_than_max_pages():
     import datetime
 
     c, _ = _dmarc_client(list_pages=[{"messages": [], "nextPageToken": "tok2"}])
-    _, capped, _, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc), max_pages=1)
+    _, capped, _, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC), max_pages=1)
     assert capped is True
 
 
@@ -1271,7 +1271,7 @@ def test_fetch_dmarc_rua_records_not_capped_when_no_more_pages():
     import datetime
 
     c, _ = _dmarc_client(list_pages=[{"messages": []}])
-    _, capped, _, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc), max_pages=5)
+    _, capped, _, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC), max_pages=5)
     assert capped is False
 
 
@@ -1281,7 +1281,7 @@ def test_fetch_dmarc_rua_records_list_http_error_maps_to_gws_error():
     err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
     c, _ = _dmarc_client(list_pages=[{}], list_exc=err)
     with pytest.raises(GwsError):
-        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC))
 
 
 def test_fetch_dmarc_rua_records_list_auth_error_maps_to_gws_auth_error():
@@ -1293,7 +1293,7 @@ def test_fetch_dmarc_rua_records_list_auth_error_maps_to_gws_auth_error():
 
     c, _ = _dmarc_client(list_pages=[{}], list_exc=RefreshError("unauthorized_client"))
     with pytest.raises(GwsAuthError):
-        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC))
 
 
 def test_fetch_dmarc_rua_records_per_message_auth_error_fails_the_whole_fetch():
@@ -1311,7 +1311,7 @@ def test_fetch_dmarc_rua_records_per_message_auth_error_fails_the_whole_fetch():
         get_exc=RefreshError("unauthorized_client"),
     )
     with pytest.raises(GwsAuthError):
-        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC))
 
 
 def test_fetch_dmarc_rua_records_one_bad_message_does_not_lose_other_records():
@@ -1338,7 +1338,7 @@ def test_fetch_dmarc_rua_records_one_bad_message_does_not_lose_other_records():
         },
         attachments_by_id={"att-good": _gzip_b64(good_xml)},
     )
-    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    records, _, message_errors, _, _ = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC))
     assert len(records) == 1
     assert records[0]["source_ip"] == "9.9.9.9"
     assert message_errors == 1
@@ -1350,7 +1350,7 @@ def test_http_error_maps_to_gws_error():
     err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
     c, _ = _client([], exc=err)
     with pytest.raises(GwsError):
-        c.fetch_activities("login", start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_activities("login", start=datetime.datetime.now(datetime.UTC))
 
 
 def test_check_reports_error_as_structured_result():
@@ -1369,7 +1369,7 @@ def test_google_auth_error_maps_to_gws_auth_error():
 
     c, _ = _client([], exc=RefreshError("unauthorized_client"))
     with pytest.raises(GwsAuthError):
-        c.fetch_activities("login", start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_activities("login", start=datetime.datetime.now(datetime.UTC))
 
 
 def test_transport_error_maps_to_gws_error_without_traceback():
@@ -1377,7 +1377,7 @@ def test_transport_error_maps_to_gws_error_without_traceback():
 
     c, _ = _client([], exc=httplib2.ServerNotFoundError("no dns"))
     with pytest.raises(GwsError):
-        c.fetch_activities("login", start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_activities("login", start=datetime.datetime.now(datetime.UTC))
 
 
 def test_key_load_failure_does_not_leak_path(tmp_path):
@@ -1485,7 +1485,7 @@ def test_rate_limit_is_retried_with_backoff(monkeypatch):
 
     seq = _Seq([err429, {"items": [{"id": {"time": "t"}}]}])  # 429 once, then a page
     c = DomainClient(CFG, reports_service=_Rep(seq))
-    items, capped = c.fetch_activities("login", start=datetime.datetime.now(datetime.timezone.utc))
+    items, capped = c.fetch_activities("login", start=datetime.datetime.now(datetime.UTC))
     assert len(items) == 1 and capped is False
     assert len(slept) == 1 and 1.0 <= slept[0] <= 2.0  # one jittered backoff (base 1.0 + [0,1))
 
@@ -1498,7 +1498,7 @@ def test_permission_403_is_not_retried(monkeypatch):
     err = HttpError(httplib2.Response({"status": "403", "reason": "forbidden"}), b"{}")
     c, _ = _client([], exc=err)
     with pytest.raises(GwsError):
-        c.fetch_activities("login", start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_activities("login", start=datetime.datetime.now(datetime.UTC))
     assert slept == []  # no backoff for a permanent permission error
 
 
@@ -1506,7 +1506,7 @@ def test_fetch_activities_passes_filters_only_when_set():
     import datetime
 
     c, a = _client([{"items": []}, {"items": []}])
-    start = datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
+    start = datetime.datetime(2026, 7, 1, tzinfo=datetime.UTC)
     c.fetch_activities("drive", start=start, filters="doc_id==abc123defg")
     assert a.calls[0]["filters"] == "doc_id==abc123defg"
     c.fetch_activities("drive", start=start)
@@ -1586,7 +1586,7 @@ def test_fetch_dmarc_rua_records_impersonates_mailbox_but_searches_recipient():
         "postmaster+rua@example.edu",
     )
     c, messages, impersonated = _dmarc_client_recording_impersonation(cfg, [{"messages": []}])
-    _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+    _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC))
     assert impersonated == ["dmarc-bot@example.edu"]
     assert mailbox == "dmarc-bot@example.edu"
     assert recipient == "postmaster+rua@example.edu"
@@ -1599,7 +1599,7 @@ def test_fetch_dmarc_rua_records_explicit_recipient_override_wins():
 
     c, messages = _dmarc_client(list_pages=[{"messages": []}])
     _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(
-        start=datetime.datetime.now(datetime.timezone.utc), recipient="postmaster+rua@example.edu"
+        start=datetime.datetime.now(datetime.UTC), recipient="postmaster+rua@example.edu"
     )
     assert mailbox == "postmaster@example.edu"
     assert recipient == "postmaster+rua@example.edu"
@@ -1612,11 +1612,11 @@ def test_fetch_dmarc_rua_records_opted_out_domain_raises_without_override():
     cfg = DomainConfig("example.edu", "/tmp/sa.json", "audit-admin@example.edu", "C0abc", None)
     c, _, impersonated = _dmarc_client_recording_impersonation(cfg, [{"messages": []}])
     with pytest.raises(GwsError, match="disabled"):
-        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.timezone.utc))
+        c.fetch_dmarc_rua_records(start=datetime.datetime.now(datetime.UTC))
     assert impersonated == []  # never touched Gmail
     # ...but an explicit mailbox override re-enables the read for an ad-hoc check.
     _, _, _, mailbox, recipient = c.fetch_dmarc_rua_records(
-        start=datetime.datetime.now(datetime.timezone.utc), mailbox="dmarc-reports@example.edu"
+        start=datetime.datetime.now(datetime.UTC), mailbox="dmarc-reports@example.edu"
     )
     assert (mailbox, recipient) == ("dmarc-reports@example.edu", "dmarc-reports@example.edu")
 
@@ -1729,7 +1729,7 @@ def test_fetch_dmarc_reports_reads_inline_report_parts():
 def _window():
     import datetime
 
-    s = datetime.datetime(2026, 9, 20, tzinfo=datetime.timezone.utc)
+    s = datetime.datetime(2026, 9, 20, tzinfo=datetime.UTC)
     return s, s + datetime.timedelta(days=3)
 
 
@@ -1986,7 +1986,7 @@ def test_gmail_sent_summary_lists_with_spam_trash_and_fetches_metadata_concurren
     import datetime as dt
 
     out = c.gmail_sent_summary(
-        "u@example.edu", start=dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc), max_pages=1, max_messages=2
+        "u@example.edu", start=dt.datetime(2026, 7, 1, tzinfo=dt.UTC), max_pages=1, max_messages=2
     )
     assert out["count"] == 3 and out["capped"] is True and len(out["sampled"]) == 2
     assert (
