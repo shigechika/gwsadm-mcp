@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.24.0...v0.25.0) (2026-11-14)
+
+
+### Features
+
+* drop Python 3.10 (EOL) and add Python 3.15 support ([#114](https://github.com/shigechika/gwsadm-mcp/issues/114)) ([07cd49b](https://github.com/shigechika/gwsadm-mcp/commit/07cd49bc7bd78fe311ad5793415a653c913fe2da))
+
 ## [0.24.0](https://github.com/shigechika/gwsadm-mcp/compare/v0.23.1...v0.24.0) (2026-11-11)
 
 
